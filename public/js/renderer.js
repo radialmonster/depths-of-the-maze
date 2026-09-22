@@ -240,6 +240,12 @@ export class Renderer {
     this._geo.flame.translate(0, 0.5, 0);
     this._geo.blob = new THREE.PlaneGeometry(1, 1);
     this._geo.blob.rotateX(-Math.PI / 2);
+    // Ground-loot shapes: flat pad disc/ring on the floor, half-torus for bows.
+    this._geo.lootDisc = new THREE.CircleGeometry(0.5, 32);
+    this._geo.lootDisc.rotateX(-Math.PI / 2);
+    this._geo.lootRing = new THREE.RingGeometry(0.4, 0.5, 40, 1);
+    this._geo.lootRing.rotateX(-Math.PI / 2);
+    this._geo.bowArc = new THREE.TorusGeometry(0.5, 0.12, 6, 18, Math.PI);
 
     // Procedural textures (generated once; see textures.js).
     const tx = getTextures(this.renderer.capabilities.getMaxAnisotropy());
@@ -1210,52 +1216,197 @@ export class Renderer {
   }
 
   // ---------------------------------------------------------------- ground items
+  // Layout: root (tile position) -> floor pad (rarity-colored ring + glow) + float group (bob)
+  //   -> pivot (tilted toward the camera, gentle sway) -> type-specific model.
   _buildItemVisual(item) {
     const root = new THREE.Group();
     const materials = [];
+    const type = item ? item.type : 'gold';
+
+    let padColor;
+    if (type === 'gold') padColor = new THREE.Color(0xffc93d);
+    else if (type === 'potion') padColor = new THREE.Color(this._isManaPotion(item) ? 0x3aa0ff : 0xff4d4d);
+    else padColor = new THREE.Color(item.rarity === 'common' ? 0xffffff : (RARITY[item.rarity] || RARITY.common).color);
+
+    // Floor pad: soft colored glow, translucent disc, crisp ring.
+    const padMat = (opts) => {
+      const m = new THREE.MeshBasicMaterial(Object.assign({ color: padColor, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 }, opts));
+      materials.push(m);
+      return m;
+    };
+    const glow = new THREE.Mesh(this._geo.blob, padMat({ map: this._tex.glow, opacity: 0.75 }));
+    glow.scale.set(1.25, 1, 1.25); glow.position.y = 0.014;
+    const disc = new THREE.Mesh(this._geo.lootDisc, padMat({ opacity: 0.22 }));
+    disc.scale.setScalar(0.78); disc.position.y = 0.016;
+    const ring = new THREE.Mesh(this._geo.lootRing, padMat({ opacity: 0.95 }));
+    ring.scale.setScalar(0.82); ring.position.y = 0.018;
+    root.add(glow, disc, ring);
+
+    const float = new THREE.Group();
+    const pivot = new THREE.Group();
+    pivot.rotation.x = -0.75; // lean toward the camera so the silhouette reads from above
+    float.add(pivot);
+    root.add(float);
+    pivot.add(this._buildItemModel(item, type, materials));
+
+    // Light beam for rare and better; taller with rarity.
     let beamMat = null;
-    if (!item || item.type === 'gold') {
-      const mat = this._newMat(0xffd24a, { emissive: 0x553800, emissiveIntensity: 0.6, metalness: 0.7, roughness: 0.3 }, materials);
-      for (let i = 0; i < 3; i++) {
-        const coin = new THREE.Mesh(this._geo.cylinder, mat);
-        coin.scale.set(0.16, 0.04, 0.16);
-        coin.position.set((i - 1) * 0.05, 0.02 + i * 0.03, (i % 2) * 0.04);
-        root.add(coin);
-      }
-    } else if (item.type === 'potion') {
-      const isMana = item.potion && item.potion.mana > 0 && !(item.potion.heal > 0);
-      const liquidColor = isMana ? 0x3aa0ff : 0xe23a3a;
-      const glassMat = this._newMat(0xbfe8ff, { transparent: true, opacity: 0.55, roughness: 0.2, metalness: 0.1 }, materials);
-      const liquidMat = this._newMat(liquidColor, { emissive: liquidColor, emissiveIntensity: 0.5 }, materials);
-      const body = new THREE.Mesh(this._geo.sphereLow, liquidMat); body.scale.set(0.14, 0.16, 0.14); body.position.y = 0.14; root.add(body);
-      const neck = new THREE.Mesh(this._geo.cylinder, glassMat); neck.scale.set(0.06, 0.1, 0.06); neck.position.y = 0.28; root.add(neck);
-      const cork = new THREE.Mesh(this._geo.cylinder, this._newMat(0x8a6a3a, { roughness: 0.9 }, materials));
-      cork.scale.set(0.055, 0.04, 0.055); cork.position.y = 0.35; root.add(cork);
-    } else {
-      const rarity = RARITY[item.rarity] || RARITY.common;
-      const color = new THREE.Color(rarity.color);
-      const mat = this._newMat(color, { emissive: color.clone().multiplyScalar(0.4), emissiveIntensity: 0.8, metalness: 0.4, roughness: 0.35 }, materials);
-      const gem = new THREE.Mesh(this._geo.sphereLow, mat);
-      gem.scale.set(0.16, 0.2, 0.16);
-      gem.position.y = 0.22;
-      root.add(gem);
-      if (item.rarity === 'epic' || item.rarity === 'legendary') {
-        const bMat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.35, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false });
-        const beam = new THREE.Mesh(this._geo.cylinder, bMat);
-        beam.scale.set(0.12, 1.6, 0.12);
-        beam.position.y = 0.9;
-        root.add(beam);
-        beamMat = bMat;
-        materials.push(bMat);
-      }
+    const beamHeight = { rare: 1.1, epic: 1.9, legendary: 2.8 }[item && item.rarity];
+    if (beamHeight && type !== 'potion' && type !== 'gold') {
+      beamMat = new THREE.MeshBasicMaterial({ color: padColor, transparent: true, opacity: 0.4, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false });
+      materials.push(beamMat);
+      // Starts above the model so it never covers the item's silhouette.
+      const beam = new THREE.Mesh(this._geo.cylinder, beamMat);
+      beam.scale.set(0.16, beamHeight, 0.16);
+      beam.position.y = 0.8 + beamHeight / 2;
+      root.add(beam);
     }
-    return { root, materials, beamMat, phase: Math.random() * 10 };
+    return { root, materials, float, pivot, ring, glow, beamMat, phase: Math.random() * 10 };
+  }
+
+  _isManaPotion(item) {
+    return !!(item && item.potion && item.potion.mana > 0 && !(item.potion.heal > 0));
+  }
+
+  // Item model, roughly 0.6 tiles tall, centered on the origin, facing +z.
+  _buildItemModel(item, type, materials) {
+    const g = new THREE.Group();
+    const geo = this._geo;
+    const add = (geom, mat, s, p, r) => {
+      const mesh = new THREE.Mesh(geom, mat);
+      mesh.scale.set(s[0], s[1], s[2]);
+      if (p) mesh.position.set(p[0], p[1], p[2]);
+      if (r) mesh.rotation.set(r[0], r[1], r[2]);
+      g.add(mesh);
+      return mesh;
+    };
+    const rarity = item && item.rarity;
+    const accentColor = rarity && rarity !== 'common' ? (RARITY[rarity] || RARITY.common).color : 0x9fb4c8;
+    const accent = this._newMat(accentColor, { emissive: accentColor, emissiveIntensity: 0.45, metalness: 0.3, roughness: 0.3 }, materials);
+    const steel = this._newMat(0xe3e8ef, { metalness: 0.75, roughness: 0.25, emissive: 0x2a2f38, emissiveIntensity: 0.4 }, materials);
+    const dark = this._newMat(0x4a4f5e, { metalness: 0.6, roughness: 0.4 }, materials);
+    const wood = this._newMat(0x8a5a34, { roughness: 0.8 }, materials);
+    const leather = this._newMat(0x9a6233, { roughness: 0.85 }, materials);
+    const gold = this._newMat(0xffd23f, { emissive: 0xb07800, emissiveIntensity: 0.55, metalness: 0.25, roughness: 0.35 }, materials);
+
+    const kind = item && (item.weaponKind || item.offhandKind);
+    switch (kind || type) {
+      case 'gold':
+        for (let i = 0; i < 6; i++) {
+          const a = i * 2.1;
+          const rad = i < 3 ? 0.1 : 0.04;
+          add(geo.cylinder, gold, [0.22, 0.05, 0.22], [Math.cos(a) * rad, -0.14 + i * 0.05, Math.sin(a) * rad], [0.25 * Math.sin(i), 0, 0.2 * Math.cos(i)]);
+        }
+        add(geo.cylinder, gold, [0.24, 0.05, 0.24], [0.05, 0.08, 0.08], [Math.PI / 2 - 0.3, 0, 0.2]); // standing coin, catches the eye
+        break;
+      case 'potion': {
+        const liquid = this._isManaPotion(item) ? 0x3aa0ff : 0xe23a3a;
+        const liquidMat = this._newMat(liquid, { emissive: liquid, emissiveIntensity: 0.55, roughness: 0.25 }, materials);
+        const glass = this._newMat(0xdff4ff, { opacity: 0.5, roughness: 0.1, metalness: 0.1 }, materials);
+        add(geo.sphereLow, liquidMat, [0.3, 0.3, 0.3], [0, -0.06, 0]);
+        add(geo.cylinder, glass, [0.11, 0.16, 0.11], [0, 0.15, 0]);
+        add(geo.cylinder, this._newMat(0x8a6a3a, { roughness: 0.9 }, materials), [0.12, 0.07, 0.12], [0, 0.26, 0]);
+        add(geo.sphereLow, this._newMat(0xffffff, { emissive: 0xffffff, emissiveIntensity: 0.6 }, materials), [0.07, 0.07, 0.04], [-0.07, 0.0, 0.12]);
+        break;
+      }
+      case 'sword':
+      case 'dagger': {
+        const k = kind === 'dagger' ? 0.7 : 1;
+        add(geo.box, steel, [0.1 * k, 0.5 * k, 0.03], [0, 0.12 * k, 0]);
+        add(geo.cone, steel, [0.1 * k, 0.1 * k, 0.03], [0, 0.42 * k, 0]);
+        add(geo.box, gold, [0.3 * k, 0.06, 0.07], [0, -0.14 * k, 0]);
+        add(geo.cylinder, leather, [0.06, 0.16 * k, 0.06], [0, -0.25 * k, 0]);
+        add(geo.sphereLow, accent, [0.1, 0.1, 0.1], [0, -0.35 * k, 0]);
+        g.rotation.z = -Math.PI / 4;
+        break;
+      }
+      case 'axe':
+        add(geo.cylinder, wood, [0.07, 0.72, 0.07]);
+        add(geo.box, steel, [0.28, 0.24, 0.05], [0.12, 0.2, 0]);
+        add(geo.cylinder, steel, [0.3, 0.05, 0.3], [0.24, 0.2, 0], [0, 0, Math.PI / 2]);
+        add(geo.box, accent, [0.09, 0.09, 0.08], [0, 0.2, 0]);
+        g.rotation.z = -Math.PI / 5;
+        break;
+      case 'mace':
+        add(geo.cylinder, wood, [0.07, 0.6, 0.07], [0, -0.08, 0]);
+        add(geo.sphereLow, dark, [0.26, 0.26, 0.26], [0, 0.26, 0]);
+        for (let i = 0; i < 6; i++) {
+          const a = (i / 6) * Math.PI * 2;
+          add(geo.cone, steel, [0.08, 0.14, 0.08], [Math.cos(a) * 0.14, 0.26, Math.sin(a) * 0.14], [0, -a, -Math.PI / 2]);
+        }
+        add(geo.cone, steel, [0.08, 0.14, 0.08], [0, 0.42, 0]);
+        add(geo.torus, accent, [0.2, 0.2, 0.3], [0, 0.12, 0], [Math.PI / 2, 0, 0]);
+        g.rotation.z = -Math.PI / 5;
+        break;
+      case 'staff':
+        add(geo.cylinder, wood, [0.06, 0.8, 0.06], [0, -0.05, 0]);
+        add(geo.torus, gold, [0.2, 0.2, 0.3], [0, 0.36, 0]);
+        add(geo.sphereLow, accent, [0.18, 0.18, 0.18], [0, 0.4, 0]);
+        g.rotation.z = -Math.PI / 6;
+        break;
+      case 'bow':
+        add(geo.bowArc, wood, [0.36, 0.5, 0.5], null, [0, 0, -Math.PI / 2]);
+        add(geo.box, this._newMat(0xf4f1e6, { roughness: 0.6 }, materials), [0.015, 0.72, 0.015]);
+        add(geo.box, accent, [0.08, 0.12, 0.08], [0.18, 0, 0]);
+        g.rotation.z = -Math.PI / 8;
+        break;
+      case 'shield':
+        add(geo.cylinder, wood, [0.56, 0.07, 0.56], null, [Math.PI / 2, 0, 0]);
+        add(geo.torus, steel, [0.56, 0.56, 0.6]);
+        add(geo.sphereLow, accent, [0.16, 0.16, 0.1], [0, 0, 0.05]);
+        break;
+      case 'orb':
+        add(geo.sphereLow, accent, [0.36, 0.36, 0.36], [0, 0.06, 0]);
+        add(geo.cylinder, gold, [0.2, 0.08, 0.2], [0, -0.16, 0]);
+        add(geo.torus, gold, [0.28, 0.28, 0.4], [0, -0.1, 0], [Math.PI / 2, 0, 0]);
+        break;
+      case 'tome':
+        add(geo.box, this._newMat(0x7a2a3a, { roughness: 0.7 }, materials), [0.44, 0.52, 0.12]);
+        add(geo.box, this._newMat(0xfaf3dd, { roughness: 0.9 }, materials), [0.4, 0.48, 0.13], [0.03, 0, 0]);
+        add(geo.box, gold, [0.06, 0.52, 0.13], [-0.2, 0, 0]);
+        add(geo.sphereLow, accent, [0.13, 0.13, 0.06], [0, 0, 0.07]);
+        break;
+      case 'helm':
+        add(geo.sphereLow, steel, [0.44, 0.4, 0.44], [0, 0.02, 0]);
+        add(geo.torus, dark, [0.44, 0.44, 0.5], [0, -0.08, 0], [Math.PI / 2, 0, 0]);
+        add(geo.box, dark, [0.3, 0.07, 0.05], [0, 0.0, 0.2]);
+        add(geo.box, accent, [0.06, 0.24, 0.26], [0, 0.26, -0.02]);
+        break;
+      case 'armor':
+        add(geo.box, steel, [0.42, 0.44, 0.2]);
+        add(geo.sphereLow, steel, [0.2, 0.16, 0.22], [-0.24, 0.18, 0]);
+        add(geo.sphereLow, steel, [0.2, 0.16, 0.22], [0.24, 0.18, 0]);
+        add(geo.box, leather, [0.44, 0.07, 0.22], [0, -0.14, 0]);
+        add(geo.sphereLow, accent, [0.12, 0.12, 0.06], [0, 0.06, 0.1]);
+        break;
+      case 'boots':
+        for (const sx of [-0.12, 0.12]) {
+          add(geo.box, leather, [0.14, 0.3, 0.16], [sx, 0.04, 0]);
+          add(geo.box, leather, [0.14, 0.1, 0.28], [sx, -0.14, 0.07]);
+          add(geo.box, accent, [0.16, 0.05, 0.18], [sx, 0.17, 0]);
+        }
+        break;
+      case 'ring':
+        add(geo.torus, gold, [0.38, 0.38, 0.6]);
+        add(geo.sphereLow, accent, [0.16, 0.16, 0.16], [0, 0.22, 0]);
+        break;
+      case 'amulet':
+        add(geo.torus, gold, [0.44, 0.44, 0.3], [0, 0.08, 0]);
+        add(geo.box, gold, [0.12, 0.14, 0.05], [0, -0.18, 0], [0, 0, Math.PI / 4]);
+        add(geo.sphereLow, accent, [0.16, 0.16, 0.1], [0, -0.18, 0.03]);
+        break;
+      default:
+        add(geo.sphereLow, accent, [0.3, 0.36, 0.3]);
+    }
+    g.scale.setScalar(1.2);
+    return g;
   }
 
   _syncItems(game, dt) {
     const list = game.groundItems || [];
     const seen = new Set();
     const map = game.map;
+    const perTile = new Map();
     for (const gi of list) {
       seen.add(gi.id);
       let entry = this.itemEntries.get(gi.id);
@@ -1264,15 +1415,25 @@ export class Renderer {
         this.scene.add(entry.root);
         this.itemEntries.set(gi.id, entry);
       }
-      entry.root.position.x = gi.x;
-      entry.root.position.z = gi.y;
+      // Fan out items sharing a tile so each stays readable.
+      const key = gi.x + ',' + gi.y;
+      const n = perTile.get(key) || 0;
+      perTile.set(key, n + 1);
+      const fan = n === 0 ? 0 : 0.26;
+      const fanA = n * 2.4;
+      entry.root.position.set(gi.x + Math.cos(fanA) * fan, 0, gi.y + Math.sin(fanA) * fan);
       const visible = this._tileVisible(map, gi.x, gi.y);
       entry.root.visible = visible;
       if (!visible) continue;
       entry.phase += dt;
-      entry.root.rotation.y += dt * 1.4;
-      entry.root.position.y = 0.28 + Math.sin(entry.phase * 2) * 0.06;
-      if (entry.beamMat) entry.beamMat.opacity = 0.3 + 0.15 * Math.sin(entry.phase * 3);
+      const t = entry.phase;
+      entry.float.position.y = 0.42 + Math.sin(t * 2.2) * 0.07;
+      entry.pivot.rotation.y = Math.sin(t * 1.3) * 0.45;
+      const pulse = 0.5 + 0.5 * Math.sin(t * 3);
+      entry.ring.scale.setScalar(0.78 + pulse * 0.08);
+      entry.ring.material.opacity = 0.7 + pulse * 0.3;
+      entry.glow.material.opacity = 0.55 + pulse * 0.3;
+      if (entry.beamMat) entry.beamMat.opacity = 0.3 + 0.15 * Math.sin(t * 3);
     }
     for (const [id, entry] of this.itemEntries) {
       if (!seen.has(id)) { this._removeEntry(entry); this.itemEntries.delete(id); }

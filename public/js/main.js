@@ -292,6 +292,7 @@ function pickupAt(x, y) {
       p.gold += g.item.amount;
       game.stats.goldEarned += g.item.amount;
       game.floatText(x, y, `+${g.item.amount}g`, '#ffd34f');
+      game.log(`Picked up ${g.item.amount} gold.`, '#e8a200');
       game.bus.emit('goldPickedUp', { amount: g.item.amount });
     } else if (addToInventory(p, g.item)) {
       game.log(`Picked up ${g.item.name}.`, rarityColor(g.item));
