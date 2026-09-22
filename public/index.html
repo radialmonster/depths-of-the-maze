@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Depths of the Maze</title>
+  <style>
+    html, body {
+      margin: 0; padding: 0; width: 100%; height: 100%;
+      overflow: hidden; background: #aee3ff; color: #2b2d42;
+      font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+      user-select: none; -webkit-user-select: none;
+    }
+    #game { position: fixed; inset: 0; width: 100vw; height: 100vh; }
+    #game canvas { display: block; width: 100% !important; height: 100% !important; }
+    #ui { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
+    #fade {
+      position: fixed; inset: 0; background: #fff; opacity: 0; pointer-events: none;
+      transition: opacity 0.35s ease; z-index: 50;
+    }
+    #fade.on { opacity: 1; }
+    #fatal {
+      display: none; position: fixed; left: 12px; bottom: 12px; max-width: 60vw; z-index: 100;
+      background: rgba(120, 0, 0, 0.9); color: #fff; font: 12px/1.4 monospace; padding: 8px 12px;
+      border-radius: 6px; white-space: pre-wrap; pointer-events: auto;
+    }
+  </style>
+  <script type="importmap">
+    { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+  </script>
+</head>
+<body>
+  <div id="game"></div>
+  <div id="ui"></div>
+  <div id="fade"></div>
+  <div id="fatal"></div>
+  <script>
+    (function () {
+      const show = (msg) => {
+        const el = document.getElementById('fatal');
+        el.style.display = 'block';
+        el.textContent = (el.textContent ? el.textContent + '\n' : '') + msg;
+      };
+      window.addEventListener('error', (e) => show('Error: ' + (e.message || e) + (e.filename ? ` (${e.filename.split('/').pop()}:${e.lineno})` : '')));
+      window.addEventListener('unhandledrejection', (e) => show('Promise: ' + (e.reason && (e.reason.stack || e.reason.message) || e.reason)));
+    })();
+  </script>
+  <script type="module" src="./js/main.js"></script>
+</body>
+</html>
