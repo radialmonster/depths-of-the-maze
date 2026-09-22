@@ -1527,17 +1527,26 @@ export class Renderer {
 
   _fxSlash(x, y, opts) {
     const dir = opts.dir || { x: 0, y: 1 };
-    const angle = facingAngle(dir.x, dir.y);
     const mat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false });
     const mesh = new THREE.Mesh(this._geo.arc, mat);
+    // The arc's midpoint lies on local +x; after the -90° X tilt, local (a, b) lands on world (a, -b) in x/z,
+    // so rotate local +x onto (dir.x, -dir.y) to point the arc along the facing direction.
     mesh.rotation.x = -Math.PI / 2;
-    mesh.rotation.z = -angle - Math.PI / 2;
-    mesh.position.set(x + dir.x * 0.35, 0.2, y + dir.y * 0.35);
-    mesh.scale.set(0.6, 0.6, 1);
+    mesh.rotation.z = Math.atan2(-dir.y, dir.x);
+    // (x, y) is the tile in front of the player. Center the arc on the player's *rendered* position
+    // so it sweeps outward around the struck tiles and stays attached while the model is still sliding.
+    const fallbackX = x - dir.x, fallbackY = y - dir.y;
+    const place = () => {
+      const pe = this.playerEntry;
+      mesh.position.set(pe ? pe.vx : fallbackX, 0.2, pe ? pe.vy : fallbackY);
+    };
+    place();
+    mesh.scale.set(1.05, 1.05, 1);
     this.scene.add(mesh);
     this.effects.push({
       obj: mesh, mats: [mat], age: 0, duration: 0.22, update: (t) => {
-        const s = 0.6 + 0.5 * t;
+        place();
+        const s = 1.05 + 0.35 * t;
         mesh.scale.set(s, s, 1);
         mat.opacity = 0.9 * (1 - t);
       },

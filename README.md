@@ -27,7 +27,7 @@ npm run preview   # serve the build locally at http://localhost:4321/
 | Cleave · Arcane Bolt · Frost Nova · Shadow Dash | 1 · 2 · 3 · 4 | A · X · Y · B |
 | Character sheet | C | Back / RB |
 | Inventory | I / Tab | LB |
-| Health / Mana potion | H / M | RT / LT |
+| Health / Mana potion | H / M | LT / RT |
 | Pause | Esc / P | Start |
 
 Inventory: click = equip/use, right-click = drop, shift-click = salvage for gold. Walking into an enemy attacks it.

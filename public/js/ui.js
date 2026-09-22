@@ -13,9 +13,26 @@ import { RARITY, clamp, TILE } from './core.js';
 const SKILL_KEY_LABEL = ['1', '2', '3', '4'];
 const SKILL_PAD_LABEL = ['A', 'X', 'Y', 'B'];
 const PAD_COLOR = { A: '#3ecf5a', B: '#e05a4e', X: '#3e8cf0', Y: '#e0c23e' };
-const INV_COLS = 6;
+const INV_COLS = 8;
 
-const ATTR_ICON = { str: '💪', dex: '🎯', int: '🧠', vit: '❤️', def: '🛡️' };
+// Potion flask drawn as SVG (emoji potions render in platform colors — 🧪 is green on Windows).
+const POTION_LIQUID = { heal: '#f03e3e', mana: '#1c7ed6' };
+function potionIconSvg(kind) {
+  const liquid = POTION_LIQUID[kind] || POTION_LIQUID.heal;
+  return `<svg class="dm-potion-svg" viewBox="0 0 32 32" width="1em" height="1em" aria-hidden="true">`
+    + `<path d="M13 6.5h6v5.2a9.5 9.5 0 1 1-6 0z" fill="#eef6ff"/>`
+    + `<path d="M8.4 15H23.6A9.5 9.5 0 1 1 8.4 15z" fill="${liquid}"/>`
+    + `<path d="M13 6.5h6v5.2a9.5 9.5 0 1 1-6 0z" fill="none" stroke="#2b2d42" stroke-width="1.6" stroke-linejoin="round"/>`
+    + `<rect x="12" y="2.3" width="8" height="4.6" rx="1.3" fill="#b07a42" stroke="#2b2d42" stroke-width="1.4"/>`
+    + `<ellipse cx="11.6" cy="20" rx="1.5" ry="3.2" fill="#fff" opacity="0.75"/>`
+    + `<circle cx="19" cy="19" r="1.2" fill="#fff" opacity="0.55"/><circle cx="17" cy="23.5" r="0.8" fill="#fff" opacity="0.45"/>`
+    + `</svg>`;
+}
+function potionKindOf(item) {
+  return item && item.type === 'potion' ? (item.potion && item.potion.mana > 0 && !(item.potion.heal > 0) ? 'mana' : 'heal') : null;
+}
+
+const ATTR_ICON ={ str: '💪', dex: '🎯', int: '🧠', vit: '❤️', def: '🛡️' };
 
 const DERIVED = [
   { k: 'maxHp', label: 'Max HP', icon: '❤️' },
@@ -30,13 +47,15 @@ const DERIVED = [
   { k: 'manaRegen', label: 'Mana Regen', icon: '🔹' },
   { k: 'moveSpeed', label: 'Move Speed', icon: '👟' },
 ];
+// Subset shown under the backpack so gear changes can be judged without switching tabs.
+const GEAR_STATS = ['melee', 'spellPower', 'defense', 'maxHp', 'maxMana', 'critChance', 'dodgeChance', 'moveSpeed'];
 
 // [action, keyboard keys, controller buttons]
 const CONTROLS = [
   ['Move', ['W', 'A', 'S', 'D'], ['L-Stick', 'D-pad']],
   ['Skills', ['1', '2', '3', '4'], ['A', 'X', 'Y', 'B']],
-  ['Health potion', ['H'], ['RT']],
-  ['Mana potion', ['M'], ['LT']],
+  ['Health potion', ['H'], ['LT']],
+  ['Mana potion', ['M'], ['RT']],
   ['Character', ['C'], ['RB']],
   ['Inventory', ['I'], ['LB']],
   ['Pause', ['Esc'], ['Start']],
@@ -183,6 +202,7 @@ export class UI {
     this._buildInventoryPanel(root);
     this._buildTooltip(root);
     this._buildOverlays(root);
+    window.addEventListener('resize', () => { if (this._characterOpen || this._inventoryOpen) this._syncPanelSize(); });
   }
 
   _buildHud(root) {
@@ -284,15 +304,15 @@ export class UI {
     mk('div', 'dm-dock-sep', row);
 
     const potionsWrap = mk('div', 'dm-potions', row);
-    const mkPotion = (cls, icon, key) => {
+    const mkPotion = (cls, kind, key) => {
       const btn = mk('button', `dm-potion-slot ${cls}`, potionsWrap);
-      mk('div', 'dm-potion-icon', btn, icon);
+      mk('div', 'dm-potion-icon', btn).innerHTML = potionIconSvg(kind);
       const count = mk('div', 'dm-potion-count', btn, '0');
       const k = mk('div', 'dm-potion-key', btn, key);
       return { btn, count, key: k };
     };
-    const potHeal = mkPotion('dm-potion-heal', '🧪', 'H');
-    const potMana = mkPotion('dm-potion-mana', '🔮', 'M');
+    const potHeal = mkPotion('dm-potion-heal', 'heal', 'H');
+    const potMana = mkPotion('dm-potion-mana', 'mana', 'M');
     potHeal.btn.addEventListener('click', () => this._useFirstPotion('heal'));
     potMana.btn.addEventListener('click', () => this._useFirstPotion('mana'));
 
@@ -449,9 +469,20 @@ export class UI {
       cellEls.push({ cell, icon, stack });
     }
 
+    mk('div', 'dm-section-title dm-inv-stats-title', right, 'Gear Stats');
+    const statsList = mk('div', 'dm-derived-list dm-inv-stats', right);
+    const gearStatRows = {};
+    for (const k of GEAR_STATS) {
+      const def = DERIVED.find((x) => x.k === k);
+      const row = mk('div', 'dm-derived-row', statsList);
+      mk('div', 'dm-derived-icon', row, def.icon);
+      mk('div', 'dm-derived-name', row, def.label);
+      gearStatRows[k] = mk('div', 'dm-derived-value', row, '-');
+    }
+
     Object.assign(this.dom, {
       invPanel: panel, invShell: shell, invGoldText: goldText, invCapText: capText,
-      eqSlots: slotEls, invCells: cellEls,
+      eqSlots: slotEls, invCells: cellEls, gearStatRows,
     });
   }
 
@@ -522,15 +553,39 @@ export class UI {
   toggleCharacter() {
     if (this._characterOpen) { this._characterOpen = false; }
     else { this._inventoryOpen = false; this._characterOpen = true; this._charCursor = 0; this._lastCharCursor = -1; }
+    if (this._characterOpen) this._syncPanelSize();
     this._applyPanelVisibility();
-    if (this._characterOpen) this._refreshCharacterPanel();
   }
 
   toggleInventory() {
     if (this._inventoryOpen) { this._inventoryOpen = false; }
-    else { this._characterOpen = false; this._inventoryOpen = true; this._invCursor = { area: 'grid', index: 0 }; this._lastInvCursorKey = null; }
+    else {
+      this._characterOpen = false; this._inventoryOpen = true; this._invCursor = { area: 'grid', index: 0 };
+      // Gamepad users get the cursor tooltip immediately; keyboard/mouse users only once they move the cursor.
+      this._lastInvCursorKey = this.input && this.input.lastDevice === 'gamepad' ? null : 'grid:0';
+    }
+    if (this._inventoryOpen) this._syncPanelSize();
     this._applyPanelVisibility();
-    if (this._inventoryOpen) this._refreshInventoryPanel();
+  }
+
+  _cycleTab(dir) {
+    const tabs = [() => this.toggleCharacter(), () => this.toggleInventory()];
+    const cur = this._characterOpen ? 0 : 1;
+    tabs[(cur + dir + tabs.length) % tabs.length]();
+    this._hideTooltip();
+  }
+
+  // Character and Inventory are tabs of one window: give both the taller one's natural height so
+  // switching tabs never resizes it. Hidden panels are still laid out (visibility), so both measure.
+  _syncPanelSize() {
+    const d = this.dom;
+    if (!d.charPanel || !d.invPanel) return;
+    this._refreshCharacterPanel();
+    this._refreshInventoryPanel();
+    const panels = [d.charPanel, d.invPanel];
+    for (const el of panels) el.style.height = '';
+    const h = Math.max(...panels.map((el) => el.offsetHeight));
+    for (const el of panels) el.style.height = `${h}px`;
   }
 
   closeAll() {
@@ -741,8 +796,8 @@ export class UI {
     const d = this.dom;
     d.btnCKey.textContent = gamepad ? 'RB' : 'C';
     d.btnIKey.textContent = gamepad ? 'LB' : 'I';
-    d.potHeal.key.textContent = gamepad ? 'RT' : 'H';
-    d.potMana.key.textContent = gamepad ? 'LT' : 'M';
+    d.potHeal.key.textContent = gamepad ? 'LT' : 'H';
+    d.potMana.key.textContent = gamepad ? 'RT' : 'M';
     for (const shell of [d.charShell, d.invShell]) {
       shell.tabKeys[0].textContent = gamepad ? 'RB' : 'C';
       shell.tabKeys[1].textContent = gamepad ? 'LB' : 'I';
@@ -754,10 +809,10 @@ export class UI {
     }
     const hint = (pairs) => pairs.map(([k, a]) => `<span class="dm-foot-item"><span class="dm-kbd">${k}</span>${a}</span>`).join('');
     d.charShell.foot.innerHTML = gamepad
-      ? hint([['D-pad', 'Navigate'], ['A', 'Spend point'], ['LB', 'Inventory'], ['B', 'Close']])
+      ? hint([['D-pad', 'Navigate'], ['A', 'Spend point'], ['LB / RB', 'Switch tab'], ['B', 'Close']])
       : hint([['Click +', 'Spend point'], ['↑↓', 'Navigate'], ['Enter', 'Spend'], ['I', 'Inventory'], ['Esc', 'Close']]);
     d.invShell.foot.innerHTML = gamepad
-      ? hint([['D-pad', 'Navigate'], ['A', 'Equip / Use'], ['X', 'Drop'], ['RB', 'Character'], ['B', 'Close']])
+      ? hint([['D-pad', 'Navigate'], ['A', 'Equip / Use'], ['X', 'Drop'], ['LB / RB', 'Switch tab'], ['B', 'Close']])
       : hint([['Click', 'Equip / Use'], ['Right-click', 'Drop'], ['Shift+Click', 'Salvage for gold'], ['Esc', 'Close']]);
   }
 
@@ -1037,6 +1092,23 @@ export class UI {
     }
   }
 
+  // Writes formatted derived stats into whichever of `rows` (k -> value element) exist.
+  _fillDerived(rows, s) {
+    s = s || {};
+    const set = (k, v) => { const el = rows[k]; v = String(v); if (el && el.textContent !== v) el.textContent = v; };
+    set('maxHp', Math.round(s.maxHp));
+    set('maxMana', Math.round(s.maxMana));
+    set('melee', `${Math.round(s.meleeMin)}–${Math.round(s.meleeMax)}`);
+    set('spellPower', Math.round(s.spellPower));
+    set('defense', Math.round(s.defense));
+    set('critChance', fmtPct(s.critChance));
+    set('critMult', `×${(s.critMult || 1).toFixed(2)}`);
+    set('moveSpeed', `${(1 / Math.max(0.001, s.moveCooldown)).toFixed(1)}/s`);
+    set('hpRegen', `${(s.hpRegen || 0).toFixed(1)}/s`);
+    set('manaRegen', `${(s.manaRegen || 0).toFixed(1)}/s`);
+    set('dodgeChance', fmtPct(s.dodgeChance));
+  }
+
   _refreshCharacterPanel() {
     const p = this.game && this.game.player;
     if (!p) return;
@@ -1058,19 +1130,7 @@ export class UI {
       row.row.classList.toggle('dm-can-spend', ap > 0);
     }
 
-    const s = p.stats || {};
-    const set = (k, v) => { v = String(v); if (d.derivedRows[k].textContent !== v) d.derivedRows[k].textContent = v; };
-    set('maxHp', Math.round(s.maxHp));
-    set('maxMana', Math.round(s.maxMana));
-    set('melee', `${Math.round(s.meleeMin)}–${Math.round(s.meleeMax)}`);
-    set('spellPower', Math.round(s.spellPower));
-    set('defense', Math.round(s.defense));
-    set('critChance', fmtPct(s.critChance));
-    set('critMult', `×${(s.critMult || 1).toFixed(2)}`);
-    set('moveSpeed', `${(1 / Math.max(0.001, s.moveCooldown)).toFixed(1)}/s`);
-    set('hpRegen', `${(s.hpRegen || 0).toFixed(1)}/s`);
-    set('manaRegen', `${(s.manaRegen || 0).toFixed(1)}/s`);
-    set('dodgeChance', fmtPct(s.dodgeChance));
+    this._fillDerived(d.derivedRows, p.stats);
 
     const skills = p.skills || [];
     for (let i = 0; i < d.charSkillRows.length; i++) {
@@ -1208,14 +1268,20 @@ export class UI {
       const cellDom = d.invCells[i];
       const item = p.inventory[i];
       if (!item) {
-        if (cellDom.icon.textContent) cellDom.icon.textContent = '';
+        if (cellDom.iconKey) { cellDom.icon.textContent = ''; cellDom.iconKey = ''; }
         if (cellDom.stack.textContent) cellDom.stack.textContent = '';
         cellDom.cell.style.borderColor = '';
         cellDom.cell.classList.remove('dm-filled');
         continue;
       }
-      const icon = item.icon || '?';
-      if (cellDom.icon.textContent !== icon) cellDom.icon.textContent = icon;
+      // Potions use the drawn flask (red/blue); everything else keeps its emoji icon.
+      const potionKind = potionKindOf(item);
+      const iconKey = potionKind ? `potion:${potionKind}` : (item.icon || '?');
+      if (cellDom.iconKey !== iconKey) {
+        if (potionKind) cellDom.icon.innerHTML = potionIconSvg(potionKind);
+        else cellDom.icon.textContent = iconKey;
+        cellDom.iconKey = iconKey;
+      }
       const stack = (item.stack && item.stack > 1) ? String(item.stack) : '';
       if (cellDom.stack.textContent !== stack) cellDom.stack.textContent = stack;
       const rc = rarityBorderColor(item);
@@ -1224,6 +1290,7 @@ export class UI {
       cellDom.cell.classList.add('dm-filled');
     }
 
+    this._fillDerived(d.gearStatRows, p.stats);
     this._applyInventoryFocus();
   }
 
@@ -1285,6 +1352,8 @@ export class UI {
     this.input = input;
 
     if (input.pressed('cancel')) { this.closeAll(); return; }
+    // Controller bumpers cycle tabs (checked first: they also map to character/inventory).
+    if (input.pressed('tab_prev') || input.pressed('tab_next')) { this._cycleTab(input.pressed('tab_next') ? 1 : -1); return; }
     if (input.pressed('character')) { if (this._characterOpen) this.closeAll(); else this.toggleCharacter(); return; }
     if (input.pressed('inventory')) { if (this._inventoryOpen) this.closeAll(); else this.toggleInventory(); return; }
 
@@ -1610,11 +1679,12 @@ const CSS_TEXT = `
   transition: transform 0.1s, filter 0.2s;
 }
 .dm-potion-heal { background: radial-gradient(circle at 40% 35%, #fff5f5, #ffc9c9); border: 2px solid #ff8787; box-shadow: 0 3px 0 #ff8787; }
-.dm-potion-mana { background: radial-gradient(circle at 40% 35%, #f3f0ff, #d0bfff); border: 2px solid #9775fa; box-shadow: 0 3px 0 #9775fa; }
+.dm-potion-mana { background: radial-gradient(circle at 40% 35%, #f0f8ff, #bfe0ff); border: 2px solid #4dabf7; box-shadow: 0 3px 0 #4dabf7; }
+.dm-potion-svg { display: block; filter: drop-shadow(0 2px 1px rgba(0,0,0,0.18)); }
 .dm-potion-slot:hover { transform: translateY(-2px); }
 .dm-potion-slot:active { transform: translateY(1px); }
 .dm-potion-slot.dm-empty { filter: grayscale(1); opacity: 0.55; }
-.dm-potion-icon { font-size: clamp(18px, 2.8vmin, 26px); }
+.dm-potion-icon { font-size: clamp(22px, 3.3vmin, 32px); }
 .dm-potion-count {
   position: absolute; bottom: -3px; right: -3px; min-width: 18px; text-align: center; background: var(--dm-ink); border-radius: 999px;
   padding: 0 5px; font-size: 11px; font-weight: 900; color: #fff; border: 2px solid #fff; line-height: 1.35;
@@ -1656,7 +1726,6 @@ const CSS_TEXT = `
   pointer-events: auto; opacity: 1; visibility: visible; transform: translate(-50%, -50%) scale(1);
   transition: opacity 0.16s ease, transform 0.16s ease;
 }
-.dm-inventory { width: fit-content; max-width: calc(100vw - 24px); }
 .dm-panel-header {
   display: flex; align-items: center; gap: 12px; padding: 12px 14px 0 14px;
   background: linear-gradient(180deg, #eef5ff, #f7faff); border-bottom: 2px solid var(--dm-edge); flex-wrap: wrap;
@@ -1677,6 +1746,7 @@ const CSS_TEXT = `
 }
 .dm-panel-close:hover { color: #e03131; border-color: #ffa8a8; }
 .dm-panel-body {
+  flex: 1 1 auto; align-content: flex-start;
   display: flex; flex-wrap: wrap; gap: clamp(14px, 2vmin, 24px); padding: clamp(14px, 2vmin, 22px);
   overflow-y: auto; min-height: 0;
 }
@@ -1765,6 +1835,8 @@ const CSS_TEXT = `
 .dm-inv-body { align-items: flex-start; flex-wrap: nowrap; }
 .dm-inv-col { flex: 0 0 auto; }
 .dm-inv-col-grid { flex: 1 1 auto; min-width: 0; }
+.dm-inv-stats-title { margin-top: clamp(14px, 2vmin, 20px); }
+.dm-inv-stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 .dm-inv-cap { font-family: 'Nunito', sans-serif; letter-spacing: 0; text-transform: none; font-size: 12px; font-weight: 800; color: var(--dm-text-dim); }
 .dm-inv-cap.dm-full { color: #e03131; }
 .dm-paperdoll {
@@ -1802,10 +1874,10 @@ const CSS_TEXT = `
 
 .dm-inv-grid {
   --cell: clamp(46px, 6.6vmin, 64px);
-  display: grid; grid-template-columns: repeat(${INV_COLS}, var(--cell)); grid-auto-rows: var(--cell); gap: 7px;
+  display: grid; grid-template-columns: repeat(${INV_COLS}, minmax(0, 1fr)); gap: 7px;
 }
 .dm-inv-cell {
-  pointer-events: auto; cursor: pointer; position: relative;
+  pointer-events: auto; cursor: pointer; position: relative; aspect-ratio: 1;
   border: 2px solid #dde5f0; border-radius: 12px; background: #f3f6fb;
   display: flex; align-items: center; justify-content: center; transition: transform 0.1s;
   box-shadow: inset 0 2px 3px rgba(35,40,56,0.05);
@@ -1928,8 +2000,11 @@ const CSS_TEXT = `
   .dm-log { display: none; }
 }
 @media (max-width: 720px) {
-  .dm-inv-body { flex-direction: column; align-items: center; flex-wrap: wrap; }
-  .dm-inv-grid { --cell: clamp(40px, 12vw, 56px); }
+  .dm-inv-body { flex-direction: column; align-items: stretch; flex-wrap: wrap; }
+  .dm-inv-col { align-self: center; }
+  .dm-inv-col-grid { align-self: stretch; }
+  .dm-inv-grid { --cell: clamp(34px, 9vw, 56px); gap: 5px; }
+  .dm-inv-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .dm-death-summary { grid-template-columns: repeat(3, 1fr); }
   .dm-mm-legend { display: none; }
   .dm-menubtn-label { display: none; }

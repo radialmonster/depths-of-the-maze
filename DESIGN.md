@@ -200,7 +200,7 @@ export class Input {
 actions: 'skill1'..'skill4' (1-4 / J K L Space? / gamepad A,X,B,Y → 1,2,3,4 respectively: A=skill1 Cleave, X=skill2 Bolt, Y=skill3 Nova, B=skill4 Dash)
          'character' (C / gamepad Back/View or RB), 'inventory' (I / gamepad LB), 'pause' (Esc, P / Start),
          'ui_up','ui_down','ui_left','ui_right' (arrows/WASD/dpad edges), 'confirm' (Enter/E / A), 'cancel' (Esc / B), 'drop' (Q/Delete / X),
-         'potion' (H / R? → use first health potion; gamepad RT), 'mana_potion' (M / gamepad LT)
+         'potion' (H / R? → use first health potion; gamepad LT), 'mana_potion' (M / gamepad RT)
 ```
 
 ## 13. UI (ui.js)

@@ -488,7 +488,18 @@ export function generateDungeon(depth, rng) {
   // faces the camera), then east/west; a south-wall cubby hides behind its own blocks.
   const NICHE_DIRS = [[0, -1, 4], [1, 0, 2], [-1, 0, 2], [0, 1, 0.5]];
   const isWallAt = (x, y) => !inBounds(x, y) || tiles[idx(x, y)] === TILE.WALL;
+  // Tries progressively looser rules (0: strict, 1: closer to doors, 2: corners allowed) before
+  // giving up on a wall cubby for this room.
   function findNiche(room) {
+    for (let relax = 0; relax <= 2; relax++) {
+      const n = findNicheWith(room, relax);
+      if (n) return n;
+    }
+    // Fallback: a free-standing stair tile in the room center.
+    return { x: room.cx, y: room.cy, dir: { x: 0, y: 1 }, front: { x: room.cx, y: room.cy }, freestanding: true };
+  }
+  function findNicheWith(room, relax) {
+    const doorRadius = relax >= 1 ? 1 : 2;
     let best = null, bestScore = -Infinity;
     for (let y = room.y; y < room.y + room.h; y++) {
       for (let x = room.x; x < room.x + room.w; x++) {
@@ -503,11 +514,11 @@ export function generateDungeon(depth, rng) {
           const rock = [[px, py], [-px, -py], [dx, dy], [dx + px, dy + py], [dx - px, dy - py]];
           if (rock.some(([ox, oy]) => !isWallAt(nx + ox, ny + oy))) continue;
           // Not tucked into a room corner: open floor on both sides of the approach tile.
-          if (isWallAt(x + px, y + py) || isWallAt(x - px, y - py)) continue;
+          if (relax < 2 && (isWallAt(x + px, y + py) || isWallAt(x - px, y - py))) continue;
           // Keep clear of doorways.
           let nearDoor = false;
-          for (let oy = -2; oy <= 2 && !nearDoor; oy++) {
-            for (let ox = -2; ox <= 2; ox++) {
+          for (let oy = -doorRadius; oy <= doorRadius && !nearDoor; oy++) {
+            for (let ox = -doorRadius; ox <= doorRadius; ox++) {
               if (inBounds(x + ox, y + oy) && tiles[idx(x + ox, y + oy)] === TILE.DOOR) { nearDoor = true; break; }
             }
           }
@@ -522,8 +533,7 @@ export function generateDungeon(depth, rng) {
         }
       }
     }
-    // Fallback: a free-standing stair tile in the room center.
-    return best || { x: room.cx, y: room.cy, dir: { x: 0, y: 1 }, front: { x: room.cx, y: room.cy }, freestanding: true };
+    return best;
   }
 
   // ---------- 6. Start room / entrance ----------

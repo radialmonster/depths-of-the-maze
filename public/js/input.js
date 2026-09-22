@@ -36,8 +36,10 @@ const ACTION_BUTTONS = {
   confirm: [0],      // A
   cancel: [1],       // B
   drop: [2],         // X
-  potion: [7],       // RT
-  mana_potion: [6],  // LT
+  potion: [6],       // LT
+  mana_potion: [7],  // RT
+  tab_prev: [4],     // LB — cycles panel tabs while a panel is open
+  tab_next: [5],     // RB
 };
 
 // Directional keys used for both orthogonal movement and ui_* navigation.
