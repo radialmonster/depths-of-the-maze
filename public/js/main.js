@@ -136,7 +136,8 @@ const game = {
       let sx = x, sy = y;
       for (let k = 0; k < spots.length; k++) {
         const [ox, oy] = spots[(i + k) % spots.length];
-        if (this.isWalkable(x + ox, y + oy)) { sx = x + ox; sy = y + oy; break; }
+        const t = this.map.get(x + ox, y + oy);
+        if (this.isWalkable(x + ox, y + oy) && t !== TILE.EXIT && t !== TILE.ENTRANCE) { sx = x + ox; sy = y + oy; break; }
       }
       i++;
       this.groundItems.push({ id: uid(), x: sx, y: sy, item, noPickup: false });
@@ -183,10 +184,12 @@ function loadDepth(depth) {
   game.groundItems = [];
 
   const p = game.player;
-  p.x = game.map.entrance.x;
-  p.y = game.map.entrance.y;
+  // Arrive on the floor just in front of the up-stairs, facing into the room.
+  const ent = game.map.entrance;
+  p.x = ent.front ? ent.front.x : ent.x;
+  p.y = ent.front ? ent.front.y : ent.y;
   p.moveTimer = 0;
-  p.facing = { x: 0, y: 1 };
+  p.facing = ent.dir ? { x: ent.dir.x, y: ent.dir.y } : { x: 0, y: 1 };
 
   game.enemies = spawnEnemies(game);
   seedTreasure();
@@ -240,6 +243,7 @@ function playerDied(source) {
       kills: game.stats.kills,
       gold: game.stats.goldEarned,
       timePlayed: Math.floor(game.stats.timePlayed),
+      killedBy: source?.name,
     }, () => {
       ui.closeAll();
       newGame();

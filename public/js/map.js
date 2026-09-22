@@ -23,7 +23,8 @@
 //  5. A BFS safety net force-carves a corridor to any stray component (a no-op in practice),
 //     then the map is cropped to the used area plus a 1-tile WALL border.
 //  6. Start room (entrance) is chosen, BFS distances computed, then 1-3 exit rooms are chosen
-//     from the farthest third of rooms; every 5th depth tags the largest far room 'boss';
+//     from the farthest third of rooms. Each stair tile is a one-tile cubby cut into the
+//     room's wall (findNiche), preferring the camera-facing north wall; every 5th depth tags the largest far room 'boss';
 //     a small room may be tagged 'treasure'.
 
 import { TILE } from './core.js';
@@ -481,11 +482,55 @@ export function generateDungeon(depth, rng) {
     }
   }
 
+  // ---------- Stair cubbies ----------
+  // Stairs sit in a one-tile cubby cut into a room's wall, so they read as a doorway
+  // instead of a marker in the middle of the floor. Weights prefer the north wall (it
+  // faces the camera), then east/west; a south-wall cubby hides behind its own blocks.
+  const NICHE_DIRS = [[0, -1, 4], [1, 0, 2], [-1, 0, 2], [0, 1, 0.5]];
+  const isWallAt = (x, y) => !inBounds(x, y) || tiles[idx(x, y)] === TILE.WALL;
+  function findNiche(room) {
+    let best = null, bestScore = -Infinity;
+    for (let y = room.y; y < room.y + room.h; y++) {
+      for (let x = room.x; x < room.x + room.w; x++) {
+        if (!inBounds(x, y)) continue;
+        const i = idx(x, y);
+        if (tiles[i] !== TILE.FLOOR || roomIdGrid[i] !== room.id) continue;
+        for (const [dx, dy, weight] of NICHE_DIRS) {
+          const nx = x + dx, ny = y + dy;
+          if (!interior(nx, ny) || tiles[idx(nx, ny)] !== TILE.WALL) continue;
+          const px = dy, py = dx; // perpendicular to the cubby's axis
+          // Solid rock on both sides of the cubby and behind it.
+          const rock = [[px, py], [-px, -py], [dx, dy], [dx + px, dy + py], [dx - px, dy - py]];
+          if (rock.some(([ox, oy]) => !isWallAt(nx + ox, ny + oy))) continue;
+          // Not tucked into a room corner: open floor on both sides of the approach tile.
+          if (isWallAt(x + px, y + py) || isWallAt(x - px, y - py)) continue;
+          // Keep clear of doorways.
+          let nearDoor = false;
+          for (let oy = -2; oy <= 2 && !nearDoor; oy++) {
+            for (let ox = -2; ox <= 2; ox++) {
+              if (inBounds(x + ox, y + oy) && tiles[idx(x + ox, y + oy)] === TILE.DOOR) { nearDoor = true; break; }
+            }
+          }
+          if (nearDoor) continue;
+          // Favor the middle of the wall, with a little jitter so layouts vary.
+          const offCenter = dx === 0 ? Math.abs(x - room.cx) : Math.abs(y - room.cy);
+          const score = weight * 10 - offCenter + rng.next() * 1.5;
+          if (score > bestScore) {
+            bestScore = score;
+            best = { x: nx, y: ny, dir: { x: -dx, y: -dy }, front: { x, y } };
+          }
+        }
+      }
+    }
+    // Fallback: a free-standing stair tile in the room center.
+    return best || { x: room.cx, y: room.cy, dir: { x: 0, y: 1 }, front: { x: room.cx, y: room.cy }, freestanding: true };
+  }
+
   // ---------- 6. Start room / entrance ----------
   const startCandidates = rooms.filter(r => r.size !== 'large');
   const startRoom = rng.pick(startCandidates.length ? startCandidates : rooms);
   startRoom.kind = 'start';
-  const entrance = { x: startRoom.cx, y: startRoom.cy };
+  const entrance = findNiche(startRoom);
   tiles[idx(entrance.x, entrance.y)] = TILE.ENTRANCE;
 
   // ---------- 7. BFS distances from entrance ----------
@@ -519,14 +564,16 @@ export function generateDungeon(depth, rng) {
   for (let i = 0; i < numExits && i < exitPool.length; i++) {
     const r = exitPool[i];
     r.kind = 'exit';
-    tiles[idx(r.cx, r.cy)] = TILE.EXIT;
-    exits.push({ x: r.cx, y: r.cy });
+    const ex = findNiche(r);
+    tiles[idx(ex.x, ex.y)] = TILE.EXIT;
+    exits.push(ex);
   }
   if (exits.length === 0 && otherRooms.length) {
     const r = otherRooms[0];
     r.kind = 'exit';
-    tiles[idx(r.cx, r.cy)] = TILE.EXIT;
-    exits.push({ x: r.cx, y: r.cy });
+    const ex = findNiche(r);
+    tiles[idx(ex.x, ex.y)] = TILE.EXIT;
+    exits.push(ex);
   }
 
   // ---------- 9. Boss / treasure tags ----------

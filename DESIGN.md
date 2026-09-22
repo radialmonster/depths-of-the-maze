@@ -96,8 +96,9 @@ map = {
   visible: Uint8Array(width*height),     // 1 = currently in FOV
   explored: Uint8Array(width*height),    // 1 = ever seen
   rooms: [{ id, x, y, w, h, cx, cy, size:'small'|'medium'|'large', doors:[{x,y}], kind:'normal'|'start'|'exit'|'treasure'|'boss' }],
-  entrance: {x, y},            // player start (ENTRANCE tile, inside start room)
-  exits: [{x, y}],             // 1-3 EXIT tiles, far from entrance, in rooms
+  entrance: {x, y, dir, front, freestanding?}, // ENTRANCE tile: a cubby in the start room's wall (up-stairs);
+                               // dir = unit step from the cubby into the room, front = floor tile in front (player spawn)
+  exits: [{x, y, dir, front, freestanding?}],  // 1-3 EXIT cubbies (down-stairs), far from entrance; walking in descends
   idx(x,y), inBounds(x,y), get(x,y), isWalkable(x,y), isOpaque(x,y),
   spawnCandidates(rng, count, minDistFromEntrance) -> [{x,y,roomId}] // floor tiles for enemies/loot
   hasLineOfSight(x0,y0,x1,y1)

@@ -319,7 +319,11 @@ export class Renderer {
     obj.traverse((child) => {
       if (child.material) {
         const mats = Array.isArray(child.material) ? child.material : [child.material];
-        for (const mm of mats) if (!mm.userData.shared) mm.dispose();
+        for (const mm of mats) {
+          if (mm.userData.shared) continue;
+          if (mm.userData.disposeMap && mm.map) mm.map.dispose();
+          mm.dispose();
+        }
       }
     });
   }
@@ -389,6 +393,7 @@ export class Renderer {
       ], i * 4);
       return {
         x: f.x, y: f.y, t: f.t, index: i, state: -1,
+        hidden: f.t === TILE.EXIT, // down-stairs pit replaces the floor slab
         rot: Math.floor(tileHash(f.x, f.y, seed + 2) * 4) * Math.PI / 2,
         shade: 0.94 + tileHash(f.x, f.y, seed + 3) * 0.1,
       };
@@ -436,8 +441,8 @@ export class Renderer {
       if (f.t === TILE.DOOR) this._buildDoorDecor(map, f.x, f.y);
     }
 
-    if (map.entrance) this._entranceMarker = this._buildEntranceMarker(map.entrance.x, map.entrance.y);
-    if (map.exits) for (const e of map.exits) this._exitMarkers.push(this._buildExitMarker(e.x, e.y));
+    if (map.entrance) this._entranceMarker = this._buildStairs(map.entrance, false);
+    if (map.exits) for (const e of map.exits) this._exitMarkers.push(this._buildStairs(e, true));
 
     this._placeTorches(map, wallList);
   }
@@ -491,46 +496,119 @@ export class Renderer {
     this._doorDecor.push(group);
   }
 
-  _buildEntranceMarker(x, y) {
-    const root = new THREE.Group();
-    root.position.set(x, 0, y);
-    const ringMat = new THREE.MeshBasicMaterial({ color: 0x66ffcc, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false });
-    const ring = new THREE.Mesh(this._geo.ring, ringMat);
-    ring.rotation.x = -Math.PI / 2;
-    ring.position.y = 0.05;
-    ring.scale.set(0.55, 0.55, 1);
-    root.add(ring);
-    const coreMat = new THREE.MeshStandardMaterial({ color: 0x224433, emissive: 0x55ffcc, emissiveIntensity: 1.2, roughness: 0.4 });
-    const core = new THREE.Mesh(this._geo.cylinder, coreMat);
-    core.scale.set(0.3, 0.06, 0.3);
-    core.position.y = 0.05;
-    root.add(core);
-    const light = new THREE.PointLight(0x66ffcc, 6, 4, 2);
-    light.position.y = 0.6;
-    root.add(light);
-    this._levelGroup.add(root);
-    return { root, ring, light, phase: Math.random() * Math.PI * 2 };
+  // Round sign with a white chevron (up/down) on a colored disc, drawn per marker.
+  _makeStairSignTexture(color, down) {
+    const S = 128, c = document.createElement('canvas');
+    c.width = c.height = S;
+    const g = c.getContext('2d');
+    const col = '#' + new THREE.Color(color).getHexString();
+    g.fillStyle = 'rgba(0,0,0,0.25)';
+    g.beginPath(); g.arc(S / 2, S / 2 + 5, 52, 0, Math.PI * 2); g.fill();
+    g.fillStyle = '#ffffff';
+    g.beginPath(); g.arc(S / 2, S / 2, 54, 0, Math.PI * 2); g.fill();
+    g.fillStyle = col;
+    g.beginPath(); g.arc(S / 2, S / 2, 45, 0, Math.PI * 2); g.fill();
+    g.save();
+    g.translate(S / 2, S / 2);
+    if (down) g.rotate(Math.PI);
+    g.fillStyle = '#ffffff';
+    g.lineJoin = 'round';
+    g.beginPath();
+    g.moveTo(0, -30); g.lineTo(26, -2); g.lineTo(11, -2); g.lineTo(11, 28);
+    g.lineTo(-11, 28); g.lineTo(-11, -2); g.lineTo(-26, -2); g.closePath();
+    g.fill();
+    g.restore();
+    const tex = new THREE.CanvasTexture(c);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
   }
 
-  _buildExitMarker(x, y) {
+  // Stairs sit in a one-tile cubby cut into a wall (map.js findNiche): up-stairs for the
+  // entrance, stairs sinking into a dark pit for exits. Local frame: +z points out of
+  // the cubby into the room; the cubby spans x,z in [-0.5, 0.5].
+  _buildStairs(stair, down) {
     const root = new THREE.Group();
-    root.position.set(x, 0, y);
-    const accent = this._theme.accent;
-    const ring1Mat = new THREE.MeshBasicMaterial({ color: accent, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false });
-    const ring2Mat = ring1Mat.clone();
-    const ring1 = new THREE.Mesh(this._geo.torus, ring1Mat); ring1.rotation.x = Math.PI / 2; ring1.scale.set(0.65, 0.65, 0.65); ring1.position.y = 0.35;
-    const ring2 = new THREE.Mesh(this._geo.torus, ring2Mat); ring2.rotation.x = Math.PI / 2; ring2.scale.set(0.45, 0.45, 0.45); ring2.position.y = 0.55;
-    root.add(ring1, ring2);
-    const coreMat = new THREE.MeshStandardMaterial({ color: 0x111122, emissive: accent, emissiveIntensity: 1.6, roughness: 0.3 });
-    const core = new THREE.Mesh(this._geo.sphereLow, coreMat);
-    core.scale.setScalar(0.32);
-    core.position.y = 0.4;
-    root.add(core);
-    const light = new THREE.PointLight(accent, 14, 6.5, 2);
-    light.position.y = 0.6;
+    root.position.set(stair.x, 0, stair.y);
+    const dir = stair.dir || { x: 0, y: 1 };
+    root.rotation.y = Math.atan2(dir.x, dir.y);
+    const box = (m, sx, sy, sz, x, y, z) => {
+      const b = new THREE.Mesh(this._geo.box, m);
+      b.scale.set(sx, sy, sz); b.position.set(x, y, z);
+      root.add(b);
+      return b;
+    };
+    const mat = (color, extra) => new THREE.MeshStandardMaterial(Object.assign({ color, roughness: 0.9, metalness: 0.02 }, extra || {}));
+
+    const stone = new THREE.Color(this._theme.wall).multiplyScalar(0.82);
+    const white = new THREE.Color(0xffffff);
+    const dark = new THREE.Color(0x120f1a);
+    const signColor = down ? this._theme.accent : 0x12b886;
+    const STEPS = 6;
+    let light, glow;
+
+    if (!down) {
+      // Steps climbing toward the back wall, brightening as they rise toward daylight.
+      const depth = 1 / STEPS;
+      for (let i = 0; i < STEPS; i++) {
+        const top = (i + 1) * 0.17;
+        const z = 0.5 - depth * (i + 0.5);
+        const c = stone.clone().lerp(white, 0.05 + i * 0.07);
+        box(mat(c), 0.88, top, depth, 0, top / 2, z);
+        box(mat(c.clone().lerp(white, 0.35)), 0.88, 0.035, 0.05, 0, top + 0.012, z + depth / 2 - 0.025);
+      }
+      glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: this._tex.glow, color: 0xfff4c8, transparent: true, opacity: 0.7, blending: THREE.AdditiveBlending, depthWrite: false }));
+      glow.position.set(0, 1.15, -0.3);
+      glow.scale.setScalar(1.3);
+      root.add(glow);
+      light = new THREE.PointLight(0xfff0c0, 3, 3.5, 2);
+      light.position.set(0, 1.1, 0.1);
+    } else {
+      // A pit below floor level: side/back walls and a floor so the sky never shows through.
+      const BOTTOM = -1.35;
+      const pitMat = mat(stone.clone().lerp(dark, 0.7));
+      for (const s of [-1, 1]) box(pitMat, 0.06, -BOTTOM, 1.0, s * 0.47, BOTTOM / 2, 0);
+      box(new THREE.MeshBasicMaterial({ color: 0x0b0910 }), 1.0, -BOTTOM, 0.06, 0, BOTTOM / 2, -0.47);
+      box(mat(dark), 1.0, 0.05, 1.0, 0, BOTTOM, 0);
+      // Unlit black lining on the rock face behind: the doorway reads as a tunnel mouth,
+      // with the top steps visibly dropping away into it.
+      box(new THREE.MeshBasicMaterial({ color: 0x0b0910 }), 0.9, 1.22, 0.04, 0, 0.61, -0.46);
+      // Steps sinking toward the back, fading into darkness.
+      // Pale treads over dark risers so each step reads as a band, fading with depth.
+      const depth = 0.94 / STEPS;
+      for (let i = 0; i < STEPS; i++) {
+        const top = -(i + 1) * 0.12 - i * i * 0.012; // shallow first steps stay in view
+        const z = 0.5 - depth * (i + 0.5);
+        const fade = i / (STEPS - 1);
+        const riser = stone.clone().lerp(dark, 0.75 + fade * 0.2);
+        const tread = stone.clone().lerp(white, 0.55).lerp(dark, fade * 0.4);
+        box(mat(riser), 0.88, top - BOTTOM, depth, 0, (top + BOTTOM) / 2, z);
+        box(mat(tread), 0.88, 0.03, depth - 0.03, 0, top + 0.015, z + 0.015);
+      }
+      // Soft neutral fill so the treads stay readable below floor level.
+      light = new THREE.PointLight(0xfff2dd, 1.1, 1.2, 2);
+      light.position.set(0, 0.1, 0.2);
+    }
     root.add(light);
+
+    // Timber arch across the mouth of the cubby, with a colored keystone.
+    const frame = this._woodMat, iron = this._ironMat;
+    for (const s of [-1, 1]) {
+      box(frame, 0.14, 1.3, 0.22, s * 0.45, 0.65, 0.42);
+      for (const hy of [0.25, 0.85]) box(iron, 0.16, 0.05, 0.24, s * 0.45, hy, 0.42);
+    }
+    box(frame, 1.06, 0.16, 0.26, 0, 1.3, 0.42);
+    box(mat(signColor, { emissive: signColor, emissiveIntensity: 0.35 }), 0.2, 0.22, 0.28, 0, 1.3, 0.43);
+
+    // Floating sign so the purpose reads at a glance, even from across a room.
+    const signMat = new THREE.SpriteMaterial({ map: this._makeStairSignTexture(signColor, down), transparent: true, depthWrite: false });
+    signMat.userData.disposeMap = true;
+    const sign = new THREE.Sprite(signMat);
+    sign.position.set(0, 1.85, 0.45);
+    sign.scale.setScalar(down ? 0.62 : 0.5);
+    root.add(sign);
+
     this._levelGroup.add(root);
-    return { root, ring1, ring2, core, light, phase: Math.random() * Math.PI * 2 };
+    return { root, sign, light, glow, down, baseLight: light.intensity, phase: Math.random() * Math.PI * 2 };
   }
 
   _placeTorches(map, wallList) {
@@ -544,7 +622,8 @@ export class Renderer {
       for (const [dx, dy] of dirs) {
         if (map.inBounds(wt.x + dx, wt.y + dy)) {
           const nt = map.get(wt.x + dx, wt.y + dy);
-          if (nt === TILE.FLOOR || nt === TILE.DOOR || nt === TILE.ENTRANCE || nt === TILE.EXIT) { nx = dx; ny = dy; break; }
+          // Never hang a torch inside a stair cubby.
+          if (nt === TILE.FLOOR || nt === TILE.DOOR) { nx = dx; ny = dy; break; }
         }
       }
       if (!nx && !ny) continue;
@@ -609,7 +688,7 @@ export class Renderer {
       if (state === f.state) continue;
       f.state = state;
       floorChanged = true;
-      this._floorMesh.setMatrixAt(f.index, state === FLOOR_STATE.HIDDEN ? TMP_MATRIX.makeScale(0, 0, 0) : this._tileMatrix(f));
+      this._floorMesh.setMatrixAt(f.index, state === FLOOR_STATE.HIDDEN || f.hidden ? TMP_MATRIX.makeScale(0, 0, 0) : this._tileMatrix(f));
       TMP_COLOR.copy(floorColor).multiplyScalar(f.shade * (((f.x + f.y) & 1) ? 1.0 : 0.96));
       if (state !== FLOOR_STATE.LIT) TMP_COLOR.lerp(this._skyColor, 0.55);
       this._floorMesh.setColorAt(f.index, TMP_COLOR);
@@ -641,19 +720,13 @@ export class Renderer {
     const seen = (root) => !!map && !!map.explored[map.idx(Math.round(root.position.x), Math.round(root.position.z))];
     if (this._entranceMarker) this._entranceMarker.root.visible = seen(this._entranceMarker.root);
     for (const m of this._exitMarkers) m.root.visible = seen(m.root);
-    if (this._entranceMarker) {
-      const m = this._entranceMarker;
-      m.ring.rotation.z += dt * 0.6;
-      const pulse = 0.9 + 0.3 * Math.sin(this._time * 2 + m.phase);
-      m.light.intensity = 6 * pulse;
-    }
-    for (const m of this._exitMarkers) {
-      m.ring1.rotation.z += dt * 1.1;
-      m.ring2.rotation.z -= dt * 1.6;
-      const pulse = 1.1 + 0.5 * Math.sin(this._time * 3 + m.phase);
-      m.light.intensity = 12 * pulse;
-      m.core.material.emissiveIntensity = 1.3 * pulse;
-      m.core.position.y = 0.4 + Math.sin(this._time * 2 + m.phase) * 0.05;
+    const markers = this._entranceMarker ? [this._entranceMarker, ...this._exitMarkers] : this._exitMarkers;
+    for (const m of markers) {
+      const s = Math.sin(this._time * (m.down ? 3 : 1.6) + m.phase);
+      m.sign.position.y = 1.85 + s * (m.down ? 0.08 : 0.04);
+      const pulse = m.down ? 1 + 0.35 * s : 1 + 0.1 * s;
+      m.light.intensity = m.baseLight * pulse;
+      if (m.glow) m.glow.material.opacity = 0.7 * (0.85 + 0.15 * s);
     }
   }
 
@@ -1432,7 +1505,7 @@ export class Renderer {
     const el = document.createElement('div');
     el.textContent = str;
     const size = crit ? 22 : 15;
-    el.style.cssText = `position:absolute;left:0;top:0;transform:translate(-50%,-50%);font-family:Arial,Helvetica,sans-serif;font-weight:800;white-space:nowrap;pointer-events:none;color:${color || '#ffffff'};text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000,0 2px 4px rgba(0,0,0,0.7);font-size:${size}px;`;
+    el.style.cssText = `position:absolute;left:0;top:0;transform:translate(-50%,-50%);font-family:Fredoka,Nunito,Arial,sans-serif;font-weight:700;white-space:nowrap;pointer-events:none;color:${color || '#ffffff'};text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000,0 2px 4px rgba(0,0,0,0.7);font-size:${size}px;`;
     this.overlay.appendChild(el);
     this._floatTexts.push({ el, wx: x, wy: y, wz: 0.9, age: 0, duration: crit ? 1.2 : 0.9, rise: crit ? 1.4 : 1.0 });
   }
