@@ -1956,10 +1956,13 @@ export class UI {
       r.row.classList.toggle('dm-focused', cur.col === 'list' && k === cur.index);
     });
 
+    // "Choose your X attack" (not "X skills") — this list always shows every KNOWN attack skill across every
+    // weapon class (dimmed + "Requires Y" when ineligible for the class being edited), so a label implying it's
+    // filtered to one class's skills reads as wrong/confusing even though the eligibility logic itself is correct.
     const catName = CATEGORY_LABEL[model.cat];
     setText(d.skillListTitle, model.slot === 0
-      ? `Attack skills · ${weaponClassName(model.ctxCls)}${model.ctxCls !== model.equippedCls ? ' (not equipped)' : ''}`
-      : `${catName} skills`);
+      ? `Choose your ${weaponClassName(model.ctxCls)} attack${model.ctxCls !== model.equippedCls ? ' (not equipped)' : ''}`
+      : `Choose your ${catName} skill`);
     setText(d.skillListNote, model.entries.length <= 1 ? `You don't know any other ${catName.toLowerCase()} skills yet.` : '');
   }
 
