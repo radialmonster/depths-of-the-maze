@@ -2,7 +2,7 @@
 // Only imports from core.js (per contract); everything else comes through the `game` API (§6)
 // and the map API (§7) passed in at call time.
 
-import { DIR_LIST, RNG, uid, clamp, lerp, manhattan, dist } from './core.js';
+import { DIR_LIST, uid, clamp, lerp, manhattan, dist } from './core.js';
 
 // ---------------------------------------------------------------------------
 // Tuning constants

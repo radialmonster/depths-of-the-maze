@@ -59,7 +59,6 @@ const TMP_COLOR = new THREE.Color();
 const TMP_COLOR2 = new THREE.Color();
 const TMP_MATRIX = new THREE.Matrix4();
 const TMP_VEC = new THREE.Vector3();
-const ZERO_SCALE = new THREE.Vector3(0, 0, 0);
 
 // ---------------------------------------------------------------- material shader patches
 // Atlas textures are 2x2 cells; per-instance `aCell` (0 or 0.5 per axis) picks a cell.

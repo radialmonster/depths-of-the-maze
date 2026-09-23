@@ -1,6 +1,8 @@
 // Player creation, stats, XP/levels, damage formulas. Owned by the Character agent — see DESIGN.md §8.
 // Pure module: no DOM, no three.js. Only touches `game.bus`, `game.effect`, `game.log` (guarded) via gainXP.
 
+import { clamp } from './core.js';
+
 // ---------------------------------------------------------------------------
 // Attribute metadata for the Character (C) panel.
 // ---------------------------------------------------------------------------
@@ -177,17 +179,17 @@ export function recalcStats(player) {
 
   const defense = Math.max(0, Math.round(def * DEFENSE_PER_DEF_ATTR + armor + buffDefenseFlat));
 
-  const critChance = clampNum(CRIT_CHANCE_BASE + dex * CRIT_CHANCE_PER_DEX + critChanceBonus + buffCritChance, 0, 0.75);
+  const critChance = clamp(CRIT_CHANCE_BASE + dex * CRIT_CHANCE_PER_DEX + critChanceBonus + buffCritChance, 0, 0.75);
   const critMult = CRIT_MULT_BASE;
 
-  const dodgeChance = clampNum(DODGE_CHANCE_BASE + dex * DODGE_CHANCE_PER_DEX, 0, DODGE_CHANCE_MAX);
-  const autoAimAssist = clampNum(dex * AUTO_AIM_PER_DEX, 0, AUTO_AIM_MAX);
+  const dodgeChance = clamp(DODGE_CHANCE_BASE + dex * DODGE_CHANCE_PER_DEX, 0, DODGE_CHANCE_MAX);
+  const autoAimAssist = clamp(dex * AUTO_AIM_PER_DEX, 0, AUTO_AIM_MAX);
 
   const hpRegen = HP_REGEN_BASE + vit * HP_REGEN_PER_VIT + hpRegenBonus;
   const manaRegen = MANA_REGEN_BASE + int_ * MANA_REGEN_PER_INT + manaRegenBonus;
 
   const moveCooldownRaw = BASE_MOVE_COOLDOWN - dex * MOVE_SPEED_PER_DEX - (moveSpeedBonus + buffMoveSpeed) * MOVE_COOLDOWN_PER_SPEED;
-  const moveCooldown = clampNum(moveCooldownRaw, MIN_MOVE_COOLDOWN, 0.4);
+  const moveCooldown = clamp(moveCooldownRaw, MIN_MOVE_COOLDOWN, 0.4);
 
   player.stats = {
     maxHp, maxMana,
@@ -210,8 +212,6 @@ export function recalcStats(player) {
 
   return player.stats;
 }
-
-function clampNum(v, a, b) { return v < a ? a : v > b ? b : v; }
 
 // ---------------------------------------------------------------------------
 // XP / leveling

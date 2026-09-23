@@ -39,16 +39,6 @@ function seg(g, c, a, b, rad) {
   const sy = g === 'capsule' ? len / 2 : len;
   return [g, c, [rad * 2, sy, rad * 2], va.add(vb).multiplyScalar(0.5).toArray(), q];
 }
-function mirrorX(parts) {
-  return parts.map(([g, c, s, p, r]) => {
-    const pp = p ? [-p[0], p[1], p[2]] : p;
-    let rr = r;
-    if (Array.isArray(r)) rr = [r[0], -r[1], -r[2]];
-    else if (r && r.isQuaternion) rr = new THREE.Quaternion(r.x, -r.y, -r.z, r.w);
-    return [g, c, s, pp, rr];
-  });
-}
-
 export const SWING_DURATION = 0.26;
 
 export class Models {

@@ -9,6 +9,8 @@
 // pulse bass), merchant (music-box arpeggio), boss (own drums/ostinato/pads), drone (death screen).
 // Music states: title · explore · boss · death. Combat/merchant are intensity layers on explore.
 
+import { mulberry32, clamp } from './core.js';
+
 // ---------------------------------------------------------------------------------------------
 // Tunables — everything a listener might want to tweak lives here.
 // ---------------------------------------------------------------------------------------------
@@ -85,18 +87,7 @@ const DEGREE_WEIGHTS = [4, 1, 2, 3, 2, 3, 2];
 // ---------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return function () {
-    a = (a + 0x6D2B79F5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
 const mtof = (m) => 440 * Math.pow(2, (m - 69) / 12);
-const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const pick = (rng, arr) => arr[Math.floor(rng() * arr.length) % arr.length];
 const nowMs = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
 

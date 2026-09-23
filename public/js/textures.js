@@ -1,17 +1,9 @@
 // Procedural canvas textures for the renderer (no image files). Generated once, cached.
 // Colour maps are light/neutral so per-instance theme colours still tint them.
 import * as THREE from 'three';
+import { mulberry32 } from './core.js';
 
 // ------------------------------------------------------------------ noise helpers
-function mulberry32(a) {
-  return function () {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
 function hash2(ix, iy, seed) {
   let h = Math.imul(ix, 374761393) ^ Math.imul(iy, 668265263) ^ Math.imul(seed, 2147483647);
   h = Math.imul(h ^ (h >>> 13), 1274126177);

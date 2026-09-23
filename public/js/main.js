@@ -1,6 +1,6 @@
 // Game glue: owns the game object, main loop, projectiles, pickups and depth transitions.
 // See DESIGN.md §6 for the API exposed to other modules.
-import { RNG, EventBus, uid, bumpUid, TILE, dist, clamp, ELEMENTS } from './core.js';
+import { RNG, EventBus, uid, bumpUid, TILE, dist, clamp, ELEMENTS, RARITY } from './core.js';
 import { generateDungeon, computeFOV } from './map.js';
 import { Renderer } from './renderer.js';
 import { createPlayer, recalcStats, gainXP, mitigate, updatePlayer } from './character.js';
@@ -655,8 +655,8 @@ function pickupAt(x, y) {
 }
 
 function rarityColor(item) {
-  const colors = { common: '#c8c8c8', magic: '#4f8cff', rare: '#ffd34f', epic: '#b44fff', legendary: '#ff8c1a' };
-  return colors[item.rarity] || '#ddd';
+  const r = RARITY[item.rarity];
+  return (r && r.color) || '#ddd';
 }
 
 function clearNoPickupFlags() {

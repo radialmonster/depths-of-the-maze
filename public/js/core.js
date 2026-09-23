@@ -33,7 +33,10 @@ export const ELEMENTS = Object.freeze({
 });
 export const ELEMENT_ORDER = ['physical', 'arcane', 'frost', 'fire', 'poison', 'lightning'];
 
-function mulberry32(a) {
+// Seeded PRNG (deterministic across a given seed). Exported so any module that needs a raw
+// seeded generator function — not the full RNG class below — can share this one implementation
+// (music.js and textures.js both used to keep their own identical copy of this).
+export function mulberry32(a) {
   return function () {
     a |= 0; a = (a + 0x6D2B79F5) | 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);

@@ -55,10 +55,6 @@ export function loadRun() {
   return data;
 }
 
-export function hasSave() {
-  try { return !!localStorage.getItem(SAVE_KEY); } catch (e) { return false; }
-}
-
 export function clearSave() {
   try { localStorage.removeItem(SAVE_KEY); } catch (e) { /* ignore */ }
 }

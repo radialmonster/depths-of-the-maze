@@ -157,6 +157,21 @@ function fmtTime(s) {
 
 function fmtPct(x) { return `${Math.round((x || 0) * 100)}%`; }
 
+// Damage-bar "trail": a value that follows a falling stat down, but only after holding briefly
+// (so a hit reads clearly before the bar catches up), then drains toward it at `decay` frac/sec.
+// Shared by the player HP bar and the boss HP bar (§13); rises instantly, only lags on drops.
+// `state` is {trail, hold, prev} — `prev` is the pct value from the last call, used to detect a drop.
+function stepHpTrail(state, pct, dt, decay) {
+  if (state.prev != null && pct < state.prev) state.hold = 0.45;
+  state.prev = pct;
+  if (state.trail < pct) state.trail = pct;
+  else if (state.trail > pct) {
+    if (state.hold > 0) state.hold -= dt;
+    else state.trail = Math.max(pct, state.trail - dt * decay);
+  }
+  return state.trail;
+}
+
 function now() { return (typeof performance !== 'undefined' ? performance.now() : Date.now()); }
 
 function mk(tag, cls, parent, text) {
@@ -262,14 +277,11 @@ export class UI {
     this._lastMapRef = null;
 
     this._lowHpActive = false;
-    this._hpTrail = 1;
-    this._hpTrailHold = 0;
+    this._hpTrailState = { trail: 1, hold: 0, prev: null };
 
     this._bossId = null;       // id of the boss the top HUD bar is currently tracking, or null
     this._bossBarShown = false;
-    this._bossHpTrail = 1;
-    this._bossHpTrailHold = 0;
-    this._prevBossHpPct = null;
+    this._bossHpTrailState = { trail: 1, hold: 0, prev: null };
 
     this._hitFlashTimer = 0; // counts down HIT_VIGNETTE_DURATION after a pulseHit() call
     this._hitFlashPeak = 0;  // damage-fraction (0..1) driving this pulse's peak opacity
@@ -450,6 +462,9 @@ export class UI {
       });
       slot.addEventListener('mouseleave', () => this._hideTooltip());
       slot.addEventListener('animationend', () => slot.classList.remove('dm-ready-flash'));
+      // Click activates the skill exactly like pressing its bound key (1-4): queued through
+      // Input so main.js's normal per-skill handling (facing/aim, dash position-sync) still runs.
+      slot.addEventListener('click', () => this.input && this.input.queueAction(`skill${i + 1}`));
       skillSlots.push({ slot, sweep, icon, cdText, key, cost });
     }
 
@@ -995,7 +1010,7 @@ export class UI {
     this._deathFired = true;
     this._deathActive = false;
     this.dom.death.classList.remove('dm-open');
-    this._hpTrail = 1;
+    this._hpTrailState.trail = 1;
     this._bossId = null;
     this._bossBarShown = false;
     this.dom.bossBar.classList.remove('dm-show');
@@ -1072,9 +1087,9 @@ export class UI {
     if (this._bossId !== boss.id) {
       this._bossId = boss.id;
       const startPct = clamp(boss.hp / Math.max(1, boss.maxHp), 0, 1);
-      this._bossHpTrail = startPct;
-      this._prevBossHpPct = startPct;
-      this._bossHpTrailHold = 0;
+      this._bossHpTrailState.trail = startPct;
+      this._bossHpTrailState.prev = startPct;
+      this._bossHpTrailState.hold = 0;
       d.bossName.textContent = boss.name;
       d.bossResist.innerHTML = describeResistHTML(boss.type);
       flash(d.bossBar, 'dm-bossbar-in');
@@ -1083,14 +1098,8 @@ export class UI {
 
     const hpPct = clamp(boss.hp / Math.max(1, boss.maxHp), 0, 1);
     d.bossFill.style.width = `${hpPct * 100}%`;
-    if (this._prevBossHpPct != null && hpPct < this._prevBossHpPct) this._bossHpTrailHold = 0.45;
-    this._prevBossHpPct = hpPct;
-    if (this._bossHpTrail < hpPct) this._bossHpTrail = hpPct;
-    else if (this._bossHpTrail > hpPct) {
-      if (this._bossHpTrailHold > 0) this._bossHpTrailHold -= dt;
-      else this._bossHpTrail = Math.max(hpPct, this._bossHpTrail - dt * 0.5);
-    }
-    d.bossTrail.style.width = `${this._bossHpTrail * 100}%`;
+    const bossTrail = stepHpTrail(this._bossHpTrailState, hpPct, dt, 0.5);
+    d.bossTrail.style.width = `${bossTrail * 100}%`;
     d.bossPhase.textContent = (boss._phase || 1) >= 2 ? 'PHASE 2' : '';
   }
 
@@ -1286,18 +1295,13 @@ export class UI {
     const hpPct = clamp(p.hp / Math.max(1, p.stats.maxHp), 0, 1);
     const hpStr = `${Math.max(0, Math.ceil(p.hp))} / ${Math.round(p.stats.maxHp)}`;
     if (c.hpPct !== hpPct) {
-      if (c.hpPct != null && hpPct < c.hpPct) this._hpTrailHold = 0.45;
       if (c.hpPct != null && hpPct > c.hpPct + 0.02) flash(d.hp.bar, 'dm-heal-flash');
       d.hp.fill.style.width = `${hpPct * 100}%`;
       c.hpPct = hpPct;
     }
-    if (this._hpTrail < hpPct) this._hpTrail = hpPct;
-    else if (this._hpTrail > hpPct) {
-      if (this._hpTrailHold > 0) this._hpTrailHold -= dt;
-      else this._hpTrail = Math.max(hpPct, this._hpTrail - dt * 0.6);
-    }
-    const trailKey = this._hpTrail.toFixed(3);
-    if (c.hpTrail !== trailKey) { d.hp.trail.style.width = `${this._hpTrail * 100}%`; c.hpTrail = trailKey; }
+    const hpTrail = stepHpTrail(this._hpTrailState, hpPct, dt, 0.6);
+    const trailKey = hpTrail.toFixed(3);
+    if (c.hpTrail !== trailKey) { d.hp.trail.style.width = `${hpTrail * 100}%`; c.hpTrail = trailKey; }
     if (c.hpStr !== hpStr) { d.hp.text.textContent = hpStr; c.hpStr = hpStr; }
 
     const manaPct = clamp(p.mana / Math.max(1, p.stats.maxMana), 0, 1);
@@ -1453,13 +1457,14 @@ export class UI {
     const W = this.dom.canvas.width, H = this.dom.canvas.height;
     ctx.clearRect(0, 0, W, H);
     if (!map) return;
+    const idxOf = (x, y) => (map.idx ? map.idx(x, y) : y * map.width + x);
     // Fit the view to the explored region (at least MIN_SPAN tiles across) so
     // the map stays readable early in a level instead of a tiny speck.
     const MIN_SPAN = 28;
     let x0 = map.width, y0 = map.height, x1 = -1, y1 = -1;
     for (let y = 0; y < map.height; y++) {
       for (let x = 0; x < map.width; x++) {
-        if (!map.explored[map.idx ? map.idx(x, y) : y * map.width + x]) continue;
+        if (!map.explored[idxOf(x, y)]) continue;
         if (x < x0) x0 = x; if (x > x1) x1 = x;
         if (y < y0) y0 = y; if (y > y1) y1 = y;
       }
@@ -1475,7 +1480,7 @@ export class UI {
 
     for (let y = 0; y < map.height; y++) {
       for (let x = 0; x < map.width; x++) {
-        const idx = map.idx ? map.idx(x, y) : y * map.width + x;
+        const idx = idxOf(x, y);
         if (!map.explored[idx]) continue;
         const visible = !!map.visible[idx];
         const tile = map.tiles[idx];
@@ -1499,7 +1504,7 @@ export class UI {
     if (Array.isArray(map.exits)) {
       const [er, eg, eb] = exitRGB(game.depth);
       for (const ex of map.exits) {
-        const exIdx = map.idx ? map.idx(ex.x, ex.y) : ex.y * map.width + ex.x;
+        const exIdx = idxOf(ex.x, ex.y);
         if (!map.explored[exIdx]) continue;
         const cx = offX + ex.x * scale + cell / 2, cy = offY + ex.y * scale + cell / 2;
         ctx.strokeStyle = `rgba(${er},${eg},${eb},${0.35 + 0.4 * pulse})`;
@@ -1513,7 +1518,7 @@ export class UI {
     // Merchant (once its tile has been explored).
     for (const n of (game.npcs || [])) {
       if (!n || n.type !== 'merchant') continue;
-      const nIdx = map.idx ? map.idx(n.x, n.y) : n.y * map.width + n.x;
+      const nIdx = idxOf(n.x, n.y);
       if (!map.explored[nIdx]) continue;
       const nx = offX + n.x * scale + cell / 2, ny = offY + n.y * scale + cell / 2;
       const nr = Math.max(2.2, cell * 0.75);
@@ -1530,7 +1535,7 @@ export class UI {
     // Enemies (visible & living only).
     for (const e of (game.enemies || [])) {
       if (!e || e.dead) continue;
-      const eIdx = map.idx ? map.idx(e.x, e.y) : e.y * map.width + e.x;
+      const eIdx = idxOf(e.x, e.y);
       if (!map.visible[eIdx]) continue;
       const ex = offX + e.x * scale + cell / 2, ey = offY + e.y * scale + cell / 2;
       const er = Math.max(1.8, cell * (e.behavior === 'boss' ? 1.1 : 0.6));
@@ -1922,10 +1927,13 @@ export class UI {
     else this._buybackShopEntry(entry);
   }
 
-  _buybackShopEntry(entry) {
-    const res = buybackFromMerchant(this.game, this._shopMerchant, entry.index);
+  // Shared by Buy and Buyback: both call a merchant transaction function and, on success, log
+  // "<verb> <item> for <price>g." and emit 'itemBought'; on failure they show the same denial
+  // float-text/reason mapping and emit 'denied'. Only the transaction call and the log verb differ.
+  _purchaseShopEntry(fn, verb) {
+    const res = fn();
     if (res.ok) {
-      this.log(`Bought back ${res.item.name} for ${res.price}g.`, '#2f9e44');
+      this.log(`${verb} ${res.item.name} for ${res.price}g.`, '#2f9e44');
       this.game.bus.emit('itemBought', { item: res.item, price: res.price });
     } else {
       const p = this.game.player;
@@ -1937,19 +1945,12 @@ export class UI {
     this._refreshShopPanel();
   }
 
+  _buybackShopEntry(entry) {
+    this._purchaseShopEntry(() => buybackFromMerchant(this.game, this._shopMerchant, entry.index), 'Bought back');
+  }
+
   _buyShopEntry(entry) {
-    const res = buyFromMerchant(this.game, this._shopMerchant, entry.kind, entry.index);
-    if (res.ok) {
-      this.log(`Bought ${res.item.name} for ${res.price}g.`, '#2f9e44');
-      this.game.bus.emit('itemBought', { item: res.item, price: res.price });
-    } else {
-      const p = this.game.player;
-      const msg = res.reason === 'full' ? 'Your bag is full' : res.reason === 'gold' ? 'Not enough gold' : 'Sold out';
-      this.game.floatText(p.x, p.y, msg, '#ff9955');
-      this.game.bus.emit('denied');
-    }
-    this._hideTooltip();
-    this._refreshShopPanel();
+    this._purchaseShopEntry(() => buyFromMerchant(this.game, this._shopMerchant, entry.kind, entry.index), 'Bought');
   }
 
   _sellShopEntry(entry) {
@@ -2525,7 +2526,7 @@ const CSS_TEXT = `
 
 .dm-skills { display: flex; gap: clamp(6px, 1vmin, 10px); }
 .dm-skill-slot {
-  position: relative; pointer-events: auto; cursor: help;
+  position: relative; pointer-events: auto; cursor: pointer;
   width: clamp(46px, 7vmin, 66px); height: clamp(46px, 7vmin, 66px);
   border-radius: 14px; background: linear-gradient(180deg, #ffffff, #eef4fc);
   border: 2px solid #c5d6ea; box-shadow: 0 3px 0 #c5d6ea;
@@ -2533,6 +2534,7 @@ const CSS_TEXT = `
   transition: transform 0.1s, filter 0.2s;
 }
 .dm-skill-slot:hover { transform: translateY(-2px); }
+.dm-skill-slot:active { transform: translateY(1px); }
 .dm-skill-icon { font-size: clamp(20px, 3.2vmin, 30px); filter: drop-shadow(0 2px 1px rgba(0,0,0,0.15)); }
 .dm-skill-sweep { position: absolute; inset: 0; pointer-events: none; }
 .dm-skill-cd {
