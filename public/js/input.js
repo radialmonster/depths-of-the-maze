@@ -23,6 +23,7 @@ const ACTION_KEYS = {
   potion: ['KeyH'],
   mana_potion: ['KeyM'],
   mute: ['KeyU'], // 'M' is already bound to mana_potion, so mute uses U instead
+  quick_equip: ['KeyR'], // Bag: equip every upgrade
 };
 
 // Gamepad action -> array of standard-mapping button indices.
@@ -41,6 +42,7 @@ const ACTION_BUTTONS = {
   mana_potion: [7],  // RT
   tab_prev: [4],     // LB — cycles panel tabs while a panel is open
   tab_next: [5],     // RB
+  quick_equip: [3],  // Y — Bag: equip every upgrade
 };
 
 // Directional keys used for both orthogonal movement and ui_* navigation.

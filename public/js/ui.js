@@ -7,7 +7,7 @@
 
 import { ATTRIBUTES, xpForLevel, spendAttribute } from './character.js';
 import { upgradeSkill, skillDescription } from './skills.js';
-import { equipItem, unequipItem, useItem, dropItem, sellValue, itemTooltip, SLOTS, INVENTORY_SIZE } from './items.js';
+import { equipItem, unequipItem, useItem, dropItem, sellValue, itemTooltip, compareGear, equipUpgrades, SLOTS, INVENTORY_SIZE } from './items.js';
 import { buyFromMerchant, sellToMerchant, nearbyMerchant, shopPrice } from './shop.js';
 import { RARITY, clamp, TILE, ELEMENTS, ELEMENT_ORDER } from './core.js';
 import { ENEMY_TYPES } from './enemies.js';
@@ -89,6 +89,40 @@ const CONTROLS = [
   ['Pause', ['Esc'], ['Start']],
   ['Drop item', ['Q'], ['X']],
 ];
+
+// Derived-stat display text/value, shared by the Character panel, Gear Stats and the gear preview.
+function derivedText(k, s) {
+  s = s || {};
+  switch (k) {
+    case 'maxHp': return String(Math.round(s.maxHp));
+    case 'maxMana': return String(Math.round(s.maxMana));
+    case 'melee': return `${Math.round(s.meleeMin)}–${Math.round(s.meleeMax)}`;
+    case 'spellPower': return String(Math.round(s.spellPower));
+    case 'defense': return String(Math.round(s.defense));
+    case 'critChance': return fmtPct(s.critChance);
+    case 'critMult': return `×${(s.critMult || 1).toFixed(2)}`;
+    case 'moveSpeed': return `${(1 / Math.max(0.001, s.moveCooldown)).toFixed(1)}/s`;
+    case 'hpRegen': return `${(s.hpRegen || 0).toFixed(1)}/s`;
+    case 'manaRegen': return `${(s.manaRegen || 0).toFixed(1)}/s`;
+    case 'dodgeChance': return fmtPct(s.dodgeChance);
+    default: return '-';
+  }
+}
+function derivedValue(k, s) {
+  if (k === 'melee') return s.meleeMin + s.meleeMax;
+  if (k === 'moveSpeed') return -s.moveCooldown;
+  return s[k] || 0;
+}
+
+// Corner badge on bag/shop cells: ▲ upgrade, ▼ downgrade, ↕ trade-off; hidden for potions / no change.
+const CMP_GLYPH = { up: '▲', down: '▼', mixed: '↕' };
+function setCmpBadge(el, gc) {
+  const v = gc && CMP_GLYPH[gc.verdict] ? gc.verdict : '';
+  if (el.dataset.v === v) return;
+  el.dataset.v = v;
+  el.textContent = v ? CMP_GLYPH[v] : '';
+  el.className = v ? `dm-cmp dm-cmp-${v}` : 'dm-cmp';
+}
 
 function fmtTime(s) {
   s = Math.max(0, Math.round(s || 0));
@@ -173,6 +207,7 @@ export class UI {
     this._inventoryOpen = false;
     this._charCursor = 0;
     this._lastCharCursor = -1;
+    this._charColSwitchArmed = true;
     this._invCursor = { area: 'grid', index: 0 };
     this._lastInvCursorKey = null;
 
@@ -250,7 +285,19 @@ export class UI {
     this._buildShopPanel(root);
     this._buildTooltip(root);
     this._buildOverlays(root);
-    window.addEventListener('resize', () => { if (this._characterOpen || this._inventoryOpen) this._syncPanelSize(); });
+    this._updatePanelScale();
+    window.addEventListener('resize', () => {
+      this._updatePanelScale();
+      if (this._characterOpen || this._inventoryOpen) this._syncPanelSize();
+    });
+  }
+
+  // Panels are laid out ~1000px wide and scaled up (never down) to fill big windows. Height uses the
+  // Character/Bag window's measured unscaled height (offsetHeight ignores the transform).
+  _updatePanelScale() {
+    const h = Math.max(520, this._panelNaturalH || 640);
+    const z = Math.min((window.innerWidth - 48) / 1000, (window.innerHeight - 64) / h);
+    this.root.style.setProperty('--dm-panel-scale', clamp(z, 1, 1.75).toFixed(3));
   }
 
   _buildHud(root) {
@@ -522,6 +569,10 @@ export class UI {
     const gridHead = mk('div', 'dm-section-title', right);
     mk('span', '', gridHead, 'Backpack');
     const capText = mk('span', 'dm-inv-cap', gridHead, `0 / ${INVENTORY_SIZE}`);
+    const upBtn = mk('button', 'dm-inv-upbtn', gridHead);
+    mk('span', '', upBtn, '▲ Equip upgrades');
+    const upBtnKey = mk('span', 'dm-kbd', upBtn, 'R');
+    upBtn.addEventListener('click', () => this._quickEquip());
     const grid = mk('div', 'dm-inv-grid', right);
     const cellEls = [];
     for (let i = 0; i < INVENTORY_SIZE; i++) {
@@ -529,12 +580,13 @@ export class UI {
       cell.dataset.index = String(i);
       const icon = mk('div', 'dm-inv-icon', cell, '');
       const stack = mk('div', 'dm-inv-stack', cell, '');
+      const cmp = mk('div', 'dm-cmp', cell, '');
       cell.addEventListener('click', (e) => this._clickInvCell(i, e));
       cell.addEventListener('contextmenu', (e) => { e.preventDefault(); this._dropInvCell(i); });
       cell.addEventListener('mouseenter', (e) => this._hoverInvCell(i, e));
       cell.addEventListener('mousemove', (e) => this._positionTooltip(e.clientX, e.clientY));
-      cell.addEventListener('mouseleave', () => this._hideTooltip());
-      cellEls.push({ cell, icon, stack });
+      cell.addEventListener('mouseleave', () => { this._hideTooltip(); this._previewGear(null); });
+      cellEls.push({ cell, icon, stack, cmp });
     }
 
     mk('div', 'dm-section-title dm-inv-stats-title', right, 'Gear Stats');
@@ -550,7 +602,7 @@ export class UI {
 
     Object.assign(this.dom, {
       invPanel: panel, invShell: shell, invGoldText: goldText, invCapText: capText,
-      eqSlots: slotEls, invCells: cellEls, gearStatRows,
+      eqSlots: slotEls, invCells: cellEls, gearStatRows, invUpBtn: upBtn, invUpBtnKey: upBtnKey,
     });
   }
 
@@ -585,11 +637,12 @@ export class UI {
       const icon = mk('div', 'dm-inv-icon', cell, '');
       const stack = mk('div', 'dm-inv-stack', cell, '');
       const price = mk('div', 'dm-shop-price', cell, '');
+      const cmp = mk('div', 'dm-cmp', cell, '');
       cell.addEventListener('click', () => this._clickShopCell(i));
       cell.addEventListener('mouseenter', (e) => this._hoverShopCell(i, e));
       cell.addEventListener('mousemove', (e) => this._positionTooltip(e.clientX, e.clientY));
       cell.addEventListener('mouseleave', () => this._hideTooltip());
-      cellEls.push({ cell, icon, stack, price, badge });
+      cellEls.push({ cell, icon, stack, price, badge, cmp });
     }
 
     const foot = mk('div', 'dm-panel-foot', panel);
@@ -679,7 +732,7 @@ export class UI {
   // =====================================================================
   toggleCharacter() {
     if (this._characterOpen) { this._characterOpen = false; sfx.uiClick(); }
-    else { this._inventoryOpen = false; this._characterOpen = true; this._charCursor = 0; this._lastCharCursor = -1; sfx.uiOpen(); }
+    else { this._inventoryOpen = false; this._characterOpen = true; this._charCursor = 0; this._lastCharCursor = -1; this._charColSwitchArmed = true; sfx.uiOpen(); }
     if (this._characterOpen) this._syncPanelSize();
     this._applyPanelVisibility();
   }
@@ -727,8 +780,11 @@ export class UI {
     this._refreshInventoryPanel();
     const panels = [d.charPanel, d.invPanel];
     for (const el of panels) el.style.height = '';
+    this.root.style.setProperty('--dm-panel-scale', '1'); // measure at 1x so max-height can't clip
     const h = Math.max(...panels.map((el) => el.offsetHeight));
     for (const el of panels) el.style.height = `${h}px`;
+    this._panelNaturalH = h;
+    this._updatePanelScale();
   }
 
   closeAll() {
@@ -1073,8 +1129,9 @@ export class UI {
       ? hint([['D-pad ↑↓', 'Navigate'], ['D-pad ←→', 'Attributes / Skills'], ['A', 'Spend point'], ['LB / RB', 'Switch tab'], ['B', 'Close']])
       : hint([['Click +', 'Spend point'], ['↑↓', 'Navigate'], ['←→', 'Attributes / Skills'], ['Enter', 'Spend'], ['I', 'Inventory'], ['Esc', 'Close']]);
     d.invShell.foot.innerHTML = gamepad
-      ? hint([['D-pad', 'Navigate'], ['A', 'Equip / Use'], ['X', 'Drop'], ['LB / RB', 'Switch tab'], ['B', 'Close']])
-      : hint([['Click', 'Equip / Use'], ['Right-click', 'Drop'], ['Shift+Click', 'Salvage for gold'], ['Esc', 'Close']]);
+      ? hint([['D-pad', 'Navigate'], ['A', 'Equip / Use'], ['Y', 'Equip upgrades'], ['X', 'Drop'], ['LB / RB', 'Switch tab'], ['B', 'Close']])
+      : hint([['Click', 'Equip / Use'], ['R', 'Equip upgrades'], ['Q / Right-click', 'Drop'], ['Shift+Click', 'Salvage for gold'], ['Esc', 'Close']]);
+    d.invUpBtnKey.textContent = gamepad ? 'Y' : 'R';
   }
 
   // ---------------------------------------------------------------------
@@ -1380,19 +1437,11 @@ export class UI {
 
   // Writes formatted derived stats into whichever of `rows` (k -> value element) exist.
   _fillDerived(rows, s) {
-    s = s || {};
-    const set = (k, v) => { const el = rows[k]; v = String(v); if (el && el.textContent !== v) el.textContent = v; };
-    set('maxHp', Math.round(s.maxHp));
-    set('maxMana', Math.round(s.maxMana));
-    set('melee', `${Math.round(s.meleeMin)}–${Math.round(s.meleeMax)}`);
-    set('spellPower', Math.round(s.spellPower));
-    set('defense', Math.round(s.defense));
-    set('critChance', fmtPct(s.critChance));
-    set('critMult', `×${(s.critMult || 1).toFixed(2)}`);
-    set('moveSpeed', `${(1 / Math.max(0.001, s.moveCooldown)).toFixed(1)}/s`);
-    set('hpRegen', `${(s.hpRegen || 0).toFixed(1)}/s`);
-    set('manaRegen', `${(s.manaRegen || 0).toFixed(1)}/s`);
-    set('dodgeChance', fmtPct(s.dodgeChance));
+    for (const k in rows) {
+      const el = rows[k], v = derivedText(k, s);
+      if (el.textContent !== v) el.textContent = v;
+      el.classList.remove('dm-up', 'dm-down');
+    }
   }
 
   _refreshCharacterPanel() {
@@ -1505,6 +1554,7 @@ export class UI {
       if (slot) flash(slot.el, 'dm-bump');
     }
     this._hideTooltip();
+    this._previewItem = null;
     this._refreshInventoryPanel();
   }
 
@@ -1527,6 +1577,44 @@ export class UI {
       this._showTooltip(null, itemTooltip(item, p) + `<div class="tt-action">${action} · Right-click to drop · Shift+click to salvage</div>`);
       this._positionTooltip(e.clientX, e.clientY);
     }
+    this._previewGear(item || null);
+  }
+
+  // Gear Stats list under the backpack: show "now → with item" for the hovered/focused bag item.
+  _previewGear(item) {
+    const p = this.game && this.game.player;
+    if (!p) return;
+    this._previewItem = item;
+    const gc = item ? compareGear(item, p) : null;
+    const rows = this.dom.gearStatRows;
+    for (const k of GEAR_STATS) {
+      const el = rows[k];
+      const now = derivedText(k, p.stats);
+      const next = gc ? derivedText(k, gc.after) : now;
+      const dir = next === now ? 0 : Math.sign(derivedValue(k, gc.after) - derivedValue(k, p.stats));
+      const txt = dir ? `${now} → ${next}` : now;
+      if (el.textContent !== txt) el.textContent = txt;
+      el.classList.toggle('dm-up', dir > 0);
+      el.classList.toggle('dm-down', dir < 0);
+    }
+  }
+
+  _quickEquip() {
+    const p = this.game && this.game.player;
+    if (!p) return;
+    const done = equipUpgrades(p);
+    this._hideTooltip();
+    this._previewItem = null;
+    if (done.length) {
+      for (const item of done) {
+        const slot = this.dom.eqSlots.find((s) => s.slotDef.id === item.slot);
+        if (slot) flash(slot.el, 'dm-bump');
+      }
+      this.log(done.length === 1 ? `Equipped ${done[0].name}.` : `Equipped ${done.length} upgrades.`, '#51cf66');
+    } else {
+      this.log('No upgrades in your bag.', '#9aa3bd');
+    }
+    this._refreshInventoryPanel();
   }
 
   _refreshInventoryPanel() {
@@ -1550,6 +1638,7 @@ export class UI {
       s.el.classList.toggle('dm-filled', !!item);
     }
 
+    let upgrades = 0;
     for (let i = 0; i < d.invCells.length; i++) {
       const cellDom = d.invCells[i];
       const item = p.inventory[i];
@@ -1558,6 +1647,7 @@ export class UI {
         if (cellDom.stack.textContent) cellDom.stack.textContent = '';
         cellDom.cell.style.borderColor = '';
         cellDom.cell.classList.remove('dm-filled');
+        setCmpBadge(cellDom.cmp, null);
         continue;
       }
       // Potions use the drawn flask (red/blue); everything else keeps its emoji icon.
@@ -1574,9 +1664,14 @@ export class UI {
       cellDom.cell.style.borderColor = rc;
       cellDom.cell.style.setProperty('--item-glow', rc);
       cellDom.cell.classList.add('dm-filled');
+      const gc = compareGear(item, p);
+      setCmpBadge(cellDom.cmp, gc);
+      if (gc && gc.verdict === 'up') upgrades++;
     }
+    d.invUpBtn.disabled = upgrades === 0;
 
     this._fillDerived(d.gearStatRows, p.stats);
+    this._previewGear(this._previewItem && p.inventory.includes(this._previewItem) ? this._previewItem : null);
     this._applyInventoryFocus();
   }
 
@@ -1704,6 +1799,7 @@ export class UI {
       cellDom.stack.textContent = stack;
       const price = this._shopEntryPrice(entry);
       cellDom.price.textContent = `${price}g`;
+      setCmpBadge(cellDom.cmp, this._shopTab === 'buy' ? compareGear(item, p) : null);
       const noAfford = this._shopTab === 'buy' && gold < price;
       cellDom.cell.classList.toggle('dm-shop-noafford', noAfford);
     }
@@ -1817,6 +1913,10 @@ export class UI {
 
     if (input.pressed('cancel')) { this.closeAll(); return; }
 
+    // Start/P should still pause even while a panel is open (Esc is handled above via
+    // 'cancel' and never reaches here, so this never double-fires close+pause on Esc).
+    if (input.pressed('pause')) { this.closeAll(); return 'pause'; }
+
     // The shop is a standalone modal: while it's open, LB/RB/I/Tab switch its own Buy/Sell
     // tabs instead of opening Character/Inventory on top of it.
     if (this._shopOpen) { this._handleShopInput(input); return; }
@@ -1842,7 +1942,12 @@ export class UI {
     let next = this._charCursor;
     if (input.pressed('ui_up')) next = col[(row - 1 + col.length) % col.length];
     if (input.pressed('ui_down')) next = col[(row + 1) % col.length];
-    if (input.pressed('ui_left') || input.pressed('ui_right')) {
+    // Column jump is a single toggle, not a scroll — ui_left/ui_right auto-repeat while held
+    // (same as up/down) would otherwise flip it back and forth every ~120ms on a held press.
+    // Only react to the first edge of a hold; re-arm once both directions are released.
+    if (!input.held('ui_left') && !input.held('ui_right')) this._charColSwitchArmed = true;
+    else if ((input.pressed('ui_left') || input.pressed('ui_right')) && this._charColSwitchArmed) {
+      this._charColSwitchArmed = false;
       const other = column(cur.kind === 'attr' ? 'skill' : 'attr');
       if (other.length) next = other[Math.min(row, other.length - 1)];
     }
@@ -1896,6 +2001,11 @@ export class UI {
         const el = this.dom.invCells[cur.index] && this.dom.invCells[cur.index].cell;
         if (item && el) this._showTooltip(el, itemTooltip(item, p)); else this._hideTooltip();
       }
+      this._previewGear(cur.area === 'grid' ? (p.inventory[cur.index] || null) : null);
+    }
+    if (input.pressed('quick_equip')) {
+      this._quickEquip();
+      this._lastInvCursorKey = null;
     }
 
     if (input.pressed('confirm')) {
@@ -2266,8 +2376,9 @@ const CSS_TEXT = `
 .dm-scrim.dm-open { opacity: 1; visibility: visible; pointer-events: auto; transition: opacity 0.18s; }
 
 .dm-panel {
-  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -48%) scale(0.98);
-  width: min(980px, calc(100vw - 24px)); max-height: calc(100vh - 32px);
+  --z: var(--dm-panel-scale, 1);
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -48%) scale(calc(var(--z) * 0.98));
+  width: min(980px, calc((100vw - 24px) / var(--z))); max-height: calc((100vh - 32px) / var(--z));
   display: flex; flex-direction: column;
   background: var(--dm-card-solid); border: 2px solid var(--dm-edge); border-radius: 22px;
   box-shadow: 0 4px 0 rgba(35,40,56,0.12), 0 30px 80px rgba(20,26,50,0.35);
@@ -2275,7 +2386,7 @@ const CSS_TEXT = `
   transition: opacity 0.16s ease, transform 0.16s ease, visibility 0s linear 0.16s;
 }
 .dm-panel.dm-open {
-  pointer-events: auto; opacity: 1; visibility: visible; transform: translate(-50%, -50%) scale(1);
+  pointer-events: auto; opacity: 1; visibility: visible; transform: translate(-50%, -50%) scale(var(--z));
   transition: opacity 0.16s ease, transform 0.16s ease;
 }
 .dm-panel-header {
@@ -2447,6 +2558,25 @@ const CSS_TEXT = `
   background: var(--dm-ink); border-radius: 5px; padding: 0 4px; line-height: 1.45;
 }
 .dm-inv-stack:empty { display: none; }
+.dm-cmp {
+  position: absolute; top: 2px; left: 3px; min-width: 15px; height: 15px; border-radius: 5px;
+  font-size: 10px; font-weight: 900; line-height: 15px; text-align: center; color: #fff; pointer-events: none;
+  box-shadow: 0 1px 0 rgba(0,0,0,0.2);
+}
+.dm-cmp:empty { display: none; }
+.dm-cmp-up { background: #2f9e44; }
+.dm-cmp-down { background: #e03131; }
+.dm-cmp-mixed { background: #f08c00; }
+.dm-derived-value.dm-up { color: #2f9e44; }
+.dm-derived-value.dm-down { color: #e03131; }
+.dm-inv-upbtn {
+  pointer-events: auto; cursor: pointer; margin-left: auto; display: inline-flex; align-items: center; gap: 6px;
+  font: 800 11px 'Nunito', sans-serif; color: #fff; background: #2f9e44; border: 0; border-radius: 999px;
+  padding: 3px 5px 3px 10px; text-transform: none; letter-spacing: 0;
+}
+.dm-inv-upbtn:hover { filter: brightness(1.08); }
+.dm-inv-upbtn:disabled { background: #adb5bd; cursor: default; filter: none; }
+.dm-inv-upbtn .dm-kbd { font-size: 10px; height: 1.7em; }
 
 /* ---------- shop ---------- */
 .dm-shop-title { font-family: 'Fredoka', sans-serif; font-weight: 700; font-size: clamp(15px, 2vmin, 19px); color: var(--dm-ink); }
@@ -2489,6 +2619,8 @@ const CSS_TEXT = `
 .dm-tooltip .tt-value { color: #ffd43b; font-weight: 800; }
 .dm-tooltip .tt-compare { margin-top: 6px; padding-top: 6px; border-top: 1px dashed rgba(255,255,255,0.18); }
 .dm-tooltip .tt-cmp-line { font-weight: 800; }
+.dm-tooltip .tt-verdict { font-weight: 900; margin-bottom: 3px; }
+.dm-tooltip .tt-verdict-note { font-weight: 700; font-size: 11px; opacity: 0.8; }
 .dm-tooltip .tt-compare-empty { color: #9aa3bd !important; font-weight: 600; }
 .dm-tooltip .tt-action { margin-top: 7px; padding-top: 6px; border-top: 1px solid rgba(255,255,255,0.12); color: #9aa3bd; font-size: 10.5px; font-weight: 700; }
 .dm-tooltip .tt-title { font-family: 'Fredoka', sans-serif; font-weight: 600; font-size: 15px; color: #fff; display: flex; align-items: center; gap: 6px; }

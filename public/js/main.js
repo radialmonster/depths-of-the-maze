@@ -786,7 +786,9 @@ function frame(now) {
 
   if (mode === 'playing') {
     if (ui.isModalOpen()) {
-      ui.handleInput(game, input); // game is paused while panels are open
+      // game is paused while panels are open; handleInput() returns 'pause' if Start/P was
+      // pressed, so it still opens the pause menu (closing the panel first).
+      if (ui.handleInput(game, input) === 'pause') pauseGame();
     } else {
       // Hit-stop: crits/kills/boss hits throttle the whole sim (player movement included, so the
       // player mesh doesn't rubber-band) to a crawl for a beat. Input polling and rendering never

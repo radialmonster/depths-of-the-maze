@@ -568,6 +568,78 @@ function compareLines(item, equipped) {
   return lines;
 }
 
+// ---------------------------------------------------------------------------
+// Gear comparison: simulate wearing `item` and diff the stats the player actually plays with.
+// ---------------------------------------------------------------------------
+
+// Derived stats that decide better/worse. `floor` keeps tiny bases (e.g. 0 regen) from turning a small gain
+// into a huge relative change. Crit/dodge are compared in absolute points against a 20% floor.
+const CMP_METRICS = [
+  { k: 'melee', get: (s) => (s.meleeMin + s.meleeMax) / 2, floor: 6 },
+  { k: 'spellPower', get: (s) => s.spellPower, floor: 6 },
+  { k: 'defense', get: (s) => s.defense, floor: 6 },
+  { k: 'maxHp', get: (s) => s.maxHp, floor: 60 },
+  { k: 'maxMana', get: (s) => s.maxMana, floor: 40 },
+  { k: 'critChance', get: (s) => s.critChance, floor: 0.2 },
+  { k: 'dodgeChance', get: (s) => s.dodgeChance, floor: 0.2 },
+  { k: 'moveSpeed', get: (s) => 1 / Math.max(0.001, s.moveCooldown), floor: 5 },
+  { k: 'hpRegen', get: (s) => s.hpRegen, floor: 3 },
+  { k: 'manaRegen', get: (s) => s.manaRegen, floor: 3 },
+];
+const CMP_TIE = 0.03; // net relative change below this on a mixed item = no clear winner
+
+function simStats(player, slot, item) {
+  const sim = { ...player, equipment: { ...player.equipment, [slot]: item }, hp: player.hp, mana: player.mana };
+  return recalcStats(sim);
+}
+
+// -> null for potions/unequippable, else { verdict:'up'|'down'|'mixed'|'same', tradeoff, score, before, after }
+// `before`/`after` are full player.stats objects (current gear vs. wearing `item`).
+export function compareGear(item, player) {
+  if (!item || item.type === 'potion' || !player?.equipment) return null;
+  if (!Object.prototype.hasOwnProperty.call(player.equipment, item.slot)) return null;
+  const current = player.equipment[item.slot] || null;
+  if (current && current.id === item.id) return null;
+  const before = simStats(player, item.slot, current);
+  const after = simStats(player, item.slot, item);
+  let score = 0, gains = 0, losses = 0;
+  for (const m of CMP_METRICS) {
+    const a = m.get(before), b = m.get(after);
+    const rel = (b - a) / Math.max(Math.abs(a), m.floor);
+    if (Math.abs(rel) < 0.005) continue;
+    score += rel;
+    if (rel > 0) gains++; else losses++;
+  }
+  let verdict;
+  if (!gains && !losses) verdict = 'same';
+  else if (!losses) verdict = 'up';
+  else if (!gains) verdict = 'down';
+  else verdict = score > CMP_TIE ? 'up' : score < -CMP_TIE ? 'down' : 'mixed';
+  return { verdict, tradeoff: gains > 0 && losses > 0, score, before, after };
+}
+
+// Quick-equip: for each slot, wear the bag item that is the biggest upgrade. Returns the items equipped.
+export function equipUpgrades(player) {
+  const equipped = [];
+  for (const { id: slot } of SLOTS) {
+    let best = null, bestScore = 0;
+    for (const item of player.inventory) {
+      if (!item || item.slot !== slot) continue;
+      const gc = compareGear(item, player);
+      if (gc && gc.verdict === 'up' && gc.score > bestScore) { best = item; bestScore = gc.score; }
+    }
+    if (best && equipItem(player, best)) equipped.push(best);
+  }
+  return equipped;
+}
+
+const VERDICT_LINE = {
+  up: ['#51cf66', '▲ Upgrade'],
+  down: ['#ff6b6b', '▼ Downgrade'],
+  mixed: ['#fcc419', '↕ Trade-off'],
+  same: ['#9aa3bd', '= No change'],
+};
+
 export function itemTooltip(item, player) {
   const rc = RARITY[item.rarity]?.color || '#ffffff';
   const parts = [];
@@ -591,11 +663,16 @@ export function itemTooltip(item, player) {
 
   if (item.type !== 'potion' && player?.equipment) {
     const equipped = player.equipment[item.slot];
+    const gc = compareGear(item, player);
+    const verdict = gc ? VERDICT_LINE[gc.verdict] : null;
+    const verdictHtml = verdict
+      ? `<div class="tt-verdict" style="color:${verdict[0]};">${verdict[1]}${gc.tradeoff && gc.verdict !== 'mixed' ? ' <span class="tt-verdict-note">(with trade-offs)</span>' : ''}</div>`
+      : '';
     if (equipped && equipped.id !== item.id) {
       const cmp = compareLines(item, equipped);
-      if (cmp.length) parts.push(`<div class="tt-compare">${cmp.join('')}</div>`);
+      parts.push(`<div class="tt-compare">${verdictHtml}${cmp.join('')}</div>`);
     } else if (!equipped) {
-      parts.push('<div class="tt-compare tt-compare-empty" style="color:#888;">(Nothing equipped)</div>');
+      parts.push(`<div class="tt-compare">${verdictHtml}<div class="tt-compare-empty" style="color:#888;">(Nothing equipped)</div></div>`);
     }
   }
 

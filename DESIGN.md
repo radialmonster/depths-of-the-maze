@@ -295,6 +295,8 @@ Decisions made with the user while building. Keep this section current — when 
 - Keys: 1-4 skills · H / LT health potion · M / RT mana potion · C / LB character · I, Tab / RB bag · E, Enter, Space / A
   confirm & **Trade** (near a merchant A trades instead of Cleaving) · U mute · Esc, P / Start pause.
   In the shop, Tab / I or LB / RB switch Buy / Sell.
+- Character panel: D-pad / arrow left-right jumps between Attributes and Skills once per press (no auto-repeat).
+  Start / P while any panel is open closes it and pauses; Esc / B only closes. Bag: Q / X drops, R / Y equips upgrades.
 
 ### 17.2 Audio (audio.js)
 - All sound is procedural Web Audio — no audio files. `sfx` singleton; `wireAudio(game)` maps bus events to sounds.
@@ -351,3 +353,16 @@ Decisions made with the user while building. Keep this section current — when 
   for 1s), Spiral + skeletons in phase 2. Resist `{ arcane: 0.3, physical: -0.25, fire: -0.2, freeze: 0.6, slow: 0.5 }`.
 - Boss HP bar lists weaknesses/resists in element colours, e.g. "Weak: Frost · Resists: Physical".
 - Guaranteed loot: at least one rare-or-better item (epic ~25-35%, legendary ~5-10%, rising with depth) plus a health potion.
+
+### 17.8 Item compare & quick-equip (Bag)
+- `compareGear(item, player)` (items.js) simulates wearing the item via `recalcStats` on a copy of the player and diffs the
+  stats you actually play with (melee avg, spell power, defense, max HP/mana, crit, dodge, move speed, regen) — not raw
+  affixes. Each stat's change is relative to its current value (with a floor so tiny bases don't explode).
+- Verdict: **▲ Upgrade** (all gains, or mixed with net > +3%), **▼ Downgrade** (mirror), **↕ Trade-off** (mixed, within ±3%).
+  Mixed-but-clear verdicts say "(with trade-offs)" in the tooltip.
+- Shown as a corner badge on Bag cells and on shop **Buy** cells (not Sell), a verdict line in the item tooltip, and a
+  live `now → after` preview (green/red) in the Bag's Gear Stats list for the hovered / gamepad-focused item.
+- **Quick-equip**: R / gamepad Y in the Bag, or the "▲ Equip upgrades" button, equips the single best ▲ item per slot.
+  Click / A still equips one item.
+- Character/Bag/Shop panels are laid out ~1000px wide and scaled up (never down, max 1.75×) to fit the window
+  (`--dm-panel-scale`, measured from the panel's natural height).
