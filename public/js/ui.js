@@ -15,7 +15,22 @@ import { sfx } from './audio.js';
 
 const SKILL_KEY_LABEL = ['1', '2', '3', '4'];
 const SKILL_PAD_LABEL = ['A', 'X', 'Y', 'B'];
-const PAD_COLOR = { A: '#3ecf5a', B: '#e05a4e', X: '#3e8cf0', Y: '#e0c23e' };
+const PAD_COLOR = {
+  A: '#3ecf5a', B: '#e05a4e', X: '#3e8cf0', Y: '#e0c23e',
+  // PlayStation face-button colors, keyed by the glyph padLabel() produces.
+  '✕': '#7ea6e0', '○': '#e0525b', '□': '#d884c0', '△': '#3fbfa0',
+};
+
+// Xbox-style canonical button name -> PlayStation label. Button MAPPING never changes,
+// only what's shown (DESIGN.md §17.1). 'D-pad' and 'L-Stick' are intentionally absent —
+// they read the same on every pad.
+const PS_PAD_LABEL = { A: '✕', B: '○', X: '□', Y: '△', LB: 'L1', RB: 'R1', LT: 'L2', RT: 'R2', Start: 'Options', Back: 'Create' };
+
+// Translate a canonical (Xbox-style) button name for display, given the active pad style.
+// Exported so other modules (main.js banners, etc.) can label controller buttons consistently.
+export function padLabel(name, style) {
+  return (style === 'playstation' && PS_PAD_LABEL[name]) || name;
+}
 const INV_COLS = 8;
 
 const HIT_VIGNETTE_DURATION = 0.35;   // seconds the on-hit red pulse takes to fade out
@@ -167,7 +182,9 @@ function rarityBorderColor(item) {
   return RARITY_BORDER_FIX[r.id] || r.color;
 }
 
-function buildControlsTable(parent) {
+// `padEls`, if given, collects {el, name} for every controller-button cell so the caller
+// can re-label the (once-built) table when the active pad's style changes.
+function buildControlsTable(parent, padEls) {
   const table = mk('div', 'dm-controls', parent);
   const head = mk('div', 'dm-controls-row dm-controls-head', table);
   mk('div', '', head, '');
@@ -182,9 +199,19 @@ function buildControlsTable(parent) {
     for (const b of pad) {
       const el = kbd(g, b, 'dm-kbd-pad');
       if (PAD_COLOR[b]) el.style.color = PAD_COLOR[b];
+      if (padEls) padEls.push({ el, name: b });
     }
   }
   return table;
+}
+
+// Re-label a set of {el, name} pad-button cells (from buildControlsTable) for the given style.
+function relabelPadEls(padEls, style) {
+  for (const { el, name } of padEls) {
+    const label = padLabel(name, style);
+    if (el.textContent !== label) el.textContent = label;
+    el.style.color = PAD_COLOR[label] || '';
+  }
 }
 
 let stylesInjected = false;
@@ -252,6 +279,7 @@ export class UI {
     this._deathFired = false;
 
     this._cache = {};
+    this._padEls = []; // {el, name} for once-built controller-button cells (controls tables) — see relabelPadEls
 
     this._injectStyles();
     this._buildDom();
@@ -673,7 +701,7 @@ export class UI {
     const startHint = mk('div', 'dm-hint dm-start-hide', startCard, '');
     // Browsers only allow audio after a click/key press, and gamepad buttons don't count.
     const startSound = mk('div', 'dm-start-sound', startCard, '🎮 Playing with a controller? Click anywhere once to turn on sound.');
-    buildControlsTable(startCard);
+    buildControlsTable(startCard, this._padEls);
     mk('div', 'dm-hint', startCard, 'Walk into enemies to attack · Find the glowing stairs to descend · Every 5th depth hides a boss');
     // Backdrop click only starts a fresh run when there's nothing to accidentally overwrite.
     start.addEventListener('click', () => { if (!this._startSave) this._fireStart('new'); });
@@ -686,9 +714,17 @@ export class UI {
     mk('div', 'dm-title dm-title-sm', pauseCard, 'Paused');
     const pauseStats = mk('div', 'dm-pause-stats', pauseCard, '');
     const resumeBtn = mk('button', 'dm-btn dm-btn-primary', pauseCard, 'Resume');
-    mk('div', 'dm-hint', pauseCard, 'Esc / P / Start to resume · U to mute sound');
+    // Music on/off (persisted by audio.js in localStorage `dotm.music`); U still mutes everything.
+    const musicBtn = mk('button', 'dm-btn dm-btn-secondary dm-music-btn', pauseCard, '');
+    musicBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      sfx.toggleMusic();
+      this._syncMusicBtn();
+      sfx.uiClick();
+    });
+    const pauseResumeHint = mk('div', 'dm-hint', pauseCard, 'Esc / P / Start to resume · U to mute sound');
     mk('div', 'dm-hint', pauseCard, 'Progress saves automatically at each new depth');
-    buildControlsTable(pauseCard);
+    buildControlsTable(pauseCard, this._padEls);
     resumeBtn.addEventListener('click', () => { if (this._pauseCallback) this._pauseCallback(); });
 
     // Death screen.
@@ -711,7 +747,7 @@ export class UI {
     const sGold = tile('🪙', 'Gold');
     const sTime = tile('⏱️', 'Time');
     const retryBtn = mk('button', 'dm-btn dm-btn-primary', deathCard, 'Try Again');
-    mk('div', 'dm-hint', deathCard, 'Press Enter / A to try again');
+    const deathRetryHint = mk('div', 'dm-hint', deathCard, 'Press Enter / A to try again');
     retryBtn.addEventListener('click', () => this._fireDeath());
 
     this.dom.start = start;
@@ -722,8 +758,11 @@ export class UI {
     this.dom.startSound = startSound;
     this.dom.pause = pause;
     this.dom.pauseStats = pauseStats;
+    this.dom.pauseResumeHint = pauseResumeHint;
+    this.dom.musicBtn = musicBtn;
     this.dom.death = death;
     this.dom.deathCause = deathCause;
+    this.dom.deathRetryHint = deathRetryHint;
     this.dom.deathRows = { sDepth, sLevel, sKills, sGold, sTime };
   }
 
@@ -868,7 +907,12 @@ export class UI {
     this.dom.pauseStats.textContent = p
       ? `Depth ${g.depth} · Level ${p.level} · ${(g.stats && g.stats.kills) || 0} kills · ${fmtTime(g.stats && g.stats.timePlayed)}`
       : '';
+    this._syncMusicBtn();
     this.dom.pause.classList.add('dm-open');
+  }
+
+  _syncMusicBtn() {
+    if (this.dom.musicBtn) this.dom.musicBtn.textContent = sfx.musicEnabled() ? '♪ Music: On' : '♪ Music: Off';
   }
 
   hidePause() {
@@ -941,6 +985,7 @@ export class UI {
   // =====================================================================
   update(game, dt) {
     this.game = game;
+    this._updateControllerLabels();
     this._tickOverlayInput();
     this._tickBanner();
     this._tickLog();
@@ -981,7 +1026,8 @@ export class UI {
     }
     if (near) {
       const gamepad = !!(this.input && this.input.lastDevice === 'gamepad');
-      const text = gamepad ? 'Trade — A' : 'Trade — E';
+      const style = (this.input && this.input.padStyle) || 'xbox';
+      const text = gamepad ? `Trade — ${padLabel('A', style)}` : 'Trade — E';
       if (this._cache.tradePromptText !== text) {
         this.dom.tradePrompt.textContent = text;
         this._cache.tradePromptText = text;
@@ -1104,34 +1150,55 @@ export class UI {
   }
 
   // ---------------------------------------------------------------------
+  // Controller-style-dependent labels: the once-built controls tables (title/pause)
+  // and the always-visible death/pause hints show both keyboard AND pad instructions
+  // regardless of lastDevice, so they only need to re-label when padStyle itself changes.
+  // ---------------------------------------------------------------------
+  _updateControllerLabels() {
+    const style = (this.input && this.input.padStyle) || 'xbox';
+    if (this._cache.padStyle === style) return;
+    this._cache.padStyle = style;
+    relabelPadEls(this._padEls, style);
+    const d = this.dom;
+    if (d.pauseResumeHint) d.pauseResumeHint.textContent = `Esc / P / ${padLabel('Start', style)} to resume · U to mute sound`;
+    if (d.deathRetryHint) d.deathRetryHint.textContent = `Press Enter / ${padLabel('A', style)} to try again`;
+    // The gamepad-only hints below cache on `gamepad` alone (see _updateDeviceHints); force
+    // them to recompute now that the style under that cached gamepad state has changed.
+    this._cache.gamepad = undefined;
+  }
+
+  // ---------------------------------------------------------------------
   // Device-dependent key hints
   // ---------------------------------------------------------------------
   _updateDeviceHints() {
     const gamepad = !!(this.input && this.input.lastDevice === 'gamepad');
     if (this._cache.gamepad === gamepad) return;
     this._cache.gamepad = gamepad;
+    const style = (this.input && this.input.padStyle) || 'xbox';
     const d = this.dom;
-    d.btnCKey.textContent = gamepad ? 'LB' : 'C';
-    d.btnIKey.textContent = gamepad ? 'RB' : 'I';
-    d.potHeal.key.textContent = gamepad ? 'LT' : 'H';
-    d.potMana.key.textContent = gamepad ? 'RT' : 'M';
+    d.btnCKey.textContent = gamepad ? padLabel('LB', style) : 'C';
+    d.btnIKey.textContent = gamepad ? padLabel('RB', style) : 'I';
+    d.potHeal.key.textContent = gamepad ? padLabel('LT', style) : 'H';
+    d.potMana.key.textContent = gamepad ? padLabel('RT', style) : 'M';
     for (const shell of [d.charShell, d.invShell]) {
-      shell.tabKeys[0].textContent = gamepad ? 'LB' : 'C';
-      shell.tabKeys[1].textContent = gamepad ? 'RB' : 'I';
+      shell.tabKeys[0].textContent = gamepad ? padLabel('LB', style) : 'C';
+      shell.tabKeys[1].textContent = gamepad ? padLabel('RB', style) : 'I';
     }
     for (let i = 0; i < 4; i++) {
       const k = d.charSkillRows[i].key;
-      k.textContent = gamepad ? SKILL_PAD_LABEL[i] : SKILL_KEY_LABEL[i];
-      k.style.color = gamepad ? PAD_COLOR[SKILL_PAD_LABEL[i]] : '';
+      const key = gamepad ? padLabel(SKILL_PAD_LABEL[i], style) : SKILL_KEY_LABEL[i];
+      k.textContent = key;
+      k.style.color = gamepad ? (PAD_COLOR[key] || '') : '';
     }
     const hint = (pairs) => pairs.map(([k, a]) => `<span class="dm-foot-item"><span class="dm-kbd">${k}</span>${a}</span>`).join('');
+    const lbrb = `${padLabel('LB', style)} / ${padLabel('RB', style)}`;
     d.charShell.foot.innerHTML = gamepad
-      ? hint([['D-pad ↑↓', 'Navigate'], ['D-pad ←→', 'Attributes / Skills'], ['A', 'Spend point'], ['LB / RB', 'Switch tab'], ['B', 'Close']])
+      ? hint([['D-pad ↑↓', 'Navigate'], ['D-pad ←→', 'Attributes / Skills'], [padLabel('A', style), 'Spend point'], [lbrb, 'Switch tab'], [padLabel('B', style), 'Close']])
       : hint([['Click +', 'Spend point'], ['↑↓', 'Navigate'], ['←→', 'Attributes / Skills'], ['Enter', 'Spend'], ['I', 'Inventory'], ['Esc', 'Close']]);
     d.invShell.foot.innerHTML = gamepad
-      ? hint([['D-pad', 'Navigate'], ['A', 'Equip / Use'], ['Y', 'Equip upgrades'], ['X', 'Drop'], ['LB / RB', 'Switch tab'], ['B', 'Close']])
+      ? hint([['D-pad', 'Navigate'], [padLabel('A', style), 'Equip / Use'], [padLabel('Y', style), 'Equip upgrades'], [padLabel('X', style), 'Drop'], [lbrb, 'Switch tab'], [padLabel('B', style), 'Close']])
       : hint([['Click', 'Equip / Use'], ['R', 'Equip upgrades'], ['Q / Right-click', 'Drop'], ['Shift+Click', 'Salvage for gold'], ['Esc', 'Close']]);
-    d.invUpBtnKey.textContent = gamepad ? 'Y' : 'R';
+    d.invUpBtnKey.textContent = gamepad ? padLabel('Y', style) : 'R';
   }
 
   // ---------------------------------------------------------------------
@@ -1216,7 +1283,8 @@ export class UI {
     // Unspent points.
     const totalPts = (p.attrPoints || 0) + (p.skillPoints || 0);
     const gamepad = !!(this.input && this.input.lastDevice === 'gamepad');
-    const ptsStr = totalPts > 0 ? `✦ ${totalPts} point${totalPts === 1 ? '' : 's'} to spend · ${gamepad ? 'LB' : 'C'}` : '';
+    const style = (this.input && this.input.padStyle) || 'xbox';
+    const ptsStr = totalPts > 0 ? `✦ ${totalPts} point${totalPts === 1 ? '' : 's'} to spend · ${gamepad ? padLabel('LB', style) : 'C'}` : '';
     if (c.ptsStr !== ptsStr) {
       d.pointsPill.textContent = ptsStr;
       d.pointsPill.classList.toggle('dm-show', totalPts > 0);
@@ -1238,11 +1306,11 @@ export class UI {
     for (let i = 0; i < 4; i++) {
       const dom = d.skillSlots[i];
       const sk = skills[i];
-      const key = gamepad ? SKILL_PAD_LABEL[i] : SKILL_KEY_LABEL[i];
+      const key = gamepad ? padLabel(SKILL_PAD_LABEL[i], style) : SKILL_KEY_LABEL[i];
       const ck = `skill${i}`;
       if (c[ck + 'key'] !== key) {
         dom.key.textContent = key;
-        dom.key.style.color = gamepad ? PAD_COLOR[key] : '';
+        dom.key.style.color = gamepad ? (PAD_COLOR[key] || '') : '';
         c[ck + 'key'] = key;
       }
       if (!sk) { if (c[ck + 'icon'] !== '') { dom.icon.textContent = ''; c[ck + 'icon'] = ''; } continue; }
@@ -1809,9 +1877,10 @@ export class UI {
 
   _updateShopFoot() {
     const gamepad = !!(this.input && this.input.lastDevice === 'gamepad');
+    const style = (this.input && this.input.padStyle) || 'xbox';
     const hint = (pairs) => pairs.map(([k, a]) => `<span class="dm-foot-item"><span class="dm-kbd">${k}</span>${a}</span>`).join('');
     const text = gamepad
-      ? hint([['D-pad', 'Navigate'], ['A', this._shopTab === 'buy' ? 'Buy' : 'Sell'], ['LB / RB', 'Switch tab'], ['B', 'Close']])
+      ? hint([['D-pad', 'Navigate'], [padLabel('A', style), this._shopTab === 'buy' ? 'Buy' : 'Sell'], [`${padLabel('LB', style)} / ${padLabel('RB', style)}`, 'Switch tab'], [padLabel('B', style), 'Close']])
       : hint([['Click', this._shopTab === 'buy' ? 'Buy' : 'Sell'], ['Arrows', 'Navigate'], ['Enter', this._shopTab === 'buy' ? 'Buy' : 'Sell'], ['Tab', 'Switch tab'], ['Esc', 'Close']]);
     if (this.dom.shopFoot.innerHTML !== text) this.dom.shopFoot.innerHTML = text;
   }
@@ -2698,6 +2767,7 @@ const CSS_TEXT = `
 }
 .dm-btn:hover { transform: translateY(-2px); filter: brightness(1.05); box-shadow: 0 7px 0 #2f9e44, 0 14px 26px rgba(64,192,87,0.4); }
 .dm-btn:active { transform: translateY(3px); box-shadow: 0 2px 0 #2f9e44, 0 4px 10px rgba(64,192,87,0.3); }
+.dm-music-btn { margin-left: 10px; padding-left: 24px; padding-right: 24px; }
 .dm-btn-secondary {
   background: linear-gradient(180deg, #dee2e6, #ced4da); color: var(--dm-ink); text-shadow: none;
   box-shadow: 0 5px 0 #adb5bd, 0 10px 22px rgba(33,37,41,0.15);

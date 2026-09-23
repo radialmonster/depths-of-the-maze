@@ -8,7 +8,7 @@ import { createSkillLoadout, useSkill, updateSkills } from './skills.js';
 import { spawnEnemies, updateEnemies, createEnemy, getResist } from './enemies.js';
 import { rollLoot, startingGear, addToInventory, useItem, generateItem } from './items.js';
 import { Input } from './input.js';
-import { UI } from './ui.js';
+import { UI, padLabel } from './ui.js';
 import { sfx, wireAudio } from './audio.js';
 import { saveRun, loadRun, clearSave } from './save.js';
 import { isMerchantDepth, placeMerchant, nearbyMerchant, MERCHANT_ENEMY_CLEARANCE } from './shop.js';
@@ -110,7 +110,7 @@ const game = {
     }
     this.floatText(enemy.x, enemy.y, floatText, floatColor);
     this.effect('hit', enemy.x, enemy.y, { color: opts.crit ? '#ffd34f' : '#ffffff', crit: !!opts.crit });
-    sfx.hit(!!opts.crit);
+    sfx.hit(!!opts.crit, opts.element);
 
     const isBoss = enemy.behavior === 'boss';
     if (opts.crit) { renderer.shake(CRIT_SHAKE); triggerHitStop(CRIT_HITSTOP); }
@@ -214,6 +214,12 @@ game.shake = (amount) => renderer.shake(amount);
 
 window.__dbg = {
   renderer, ui, input,
+  // Live music/audio state: music state, layer gains, scheduler stats, live node counts.
+  get music() {
+    const m = sfx.music ? sfx.music.debugInfo() : null;
+    if (m) m.sfxNodes = sfx.liveNodes;
+    return m;
+  },
   // Places a merchant next to the player on the current depth via the same placement/stock
   // code path as a real merchant depth, regardless of game.depth % MERCHANT_DEPTH_INTERVAL.
   spawnMerchant() {
@@ -308,7 +314,7 @@ window.__dbg = {
 wireAudio(game);
 
 game.bus.on('levelUp', ({ level }) => {
-  const charKey = input.lastDevice === 'gamepad' ? 'LB' : 'C';
+  const charKey = input.lastDevice === 'gamepad' ? padLabel('LB', input.padStyle) : 'C';
   ui.banner('Level Up!', `You reached level ${level} — press ${charKey} to spend points`);
 });
 // Checkpoint the run every time a new depth is entered, so refreshing/closing mid-level
@@ -614,6 +620,7 @@ function updateFreeMovement(stick, dt) {
 
 function onPlayerMoved() {
   const p = game.player;
+  sfx.footstep(); // one soft step per tile moved (throttled), so it follows movement speed
   computeFOV(game.map, p.x, p.y, FOV_RADIUS);
   pickupAt(p.x, p.y);
   if (game.map.get(p.x, p.y) === TILE.EXIT) descend();
@@ -713,6 +720,7 @@ function drinkPotion(kind) {
   useItem(game, potion);
 }
 
+let lastNearMerchant = null; // merchant greeting plays when one first comes into trade range
 function handleGameplayInput(dt) {
   if (input.pressed('pause')) { pauseGame(); return; }
   if (input.pressed('character')) { ui.toggleCharacter(); return; }
@@ -721,6 +729,8 @@ function handleGameplayInput(dt) {
   // In range of a merchant, confirm opens the shop instead of attacking. On gamepad, A is both
   // confirm and skill1 — suppress skill1 this frame so trading never also swings a weapon.
   const merchant = nearbyMerchant(game);
+  if (merchant && merchant !== lastNearMerchant) sfx.merchantGreet();
+  lastNearMerchant = merchant;
   let suppressSkill1 = false;
   if (merchant && input.pressed('confirm')) {
     ui.openShop(merchant);
@@ -817,6 +827,7 @@ function frame(now) {
   if (game.map) renderer.update(game, simDt);
   renderer.render();
   ui.update(game, dt);
+  sfx.musicObserve(game, mode, ui.isModalOpen()); // music picks its state (throttled internally)
   if (pauseOverlayPending) {
     pauseOverlayPending = false;
     if (mode === 'paused') ui.showPause(() => resumeGame());

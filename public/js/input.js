@@ -6,6 +6,13 @@ import { DIRS } from './core.js';
 // Mapping tables (see DESIGN.md §12 for the authoritative action list).
 // ---------------------------------------------------------------------------
 
+// Gamepad id substrings that identify a PlayStation pad (DualSense/DualShock,
+// Sony vendor id 054c). Everything else is labeled as an Xbox-style pad.
+// NOTE: deliberately does NOT match the bare phrase "wireless controller" —
+// the Xbox pad's own id ("Xbox Wireless Controller...") contains that phrase
+// too, which would misclassify it as PlayStation.
+const PS_PAD_ID_RE = /dualsense|dualshock|playstation|054c/i;
+
 // Keyboard action -> array of e.code values. Movement/ui-direction codes are
 // handled separately via the held-state system (see DIR_KEYS below) so they
 // are deliberately NOT listed here.
@@ -83,6 +90,7 @@ for (const action in ACTION_BUTTONS) {
 export class Input {
   constructor() {
     this.lastDevice = 'keyboard';
+    this.padStyle = 'xbox'; // 'xbox'|'playstation' — set from the id of the gamepad producing input
 
     // Keyboard state.
     this._heldKeys = new Set();       // codes currently down
@@ -211,7 +219,10 @@ export class Input {
         if (Math.abs(ay) > GAMEPAD_DEADZONE) { padDir[ay < 0 ? 'up' : 'down'] = true; padActive = true; }
       }
 
-      if (padActive) this.lastDevice = 'gamepad';
+      if (padActive) {
+        this.lastDevice = 'gamepad';
+        this.padStyle = PS_PAD_ID_RE.test(pad.id || '') ? 'playstation' : 'xbox';
+      }
     }
 
     // --- Combine directional sources ---

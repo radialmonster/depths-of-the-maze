@@ -1022,6 +1022,7 @@ function updateBoss(game, e, type, dt) {
   e._activeAttack = chosen.id;
   e._atkSub = null;
   chosen.begin(game, e, type);
+  game.bus?.emit('bossTelegraph', { enemy: e, attack: chosen.id }); // audio: wind-up warning tone
 }
 
 // ---------------------------------------------------------------------------

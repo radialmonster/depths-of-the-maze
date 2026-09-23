@@ -30,6 +30,7 @@ level up, spend attribute + skill points (C), manage gear (I). Die → run summa
 | `js/input.js` | UI agent | Keyboard + Gamepad abstraction |
 | `js/ui.js` | UI agent | HUD, Character panel (C), Inventory panel (I), Shop panel, boss HP bar, messages, death/menu screens. Injects its own CSS. |
 | `js/audio.js` | Producer | Procedural Web Audio sound effects, mute, `wireAudio(game)` bus wiring (§17.2) |
+| `js/music.js` | Producer | Procedural adaptive music, owned by audio.js as `sfx.music` (§17.2) |
 | `js/save.js` | Producer | localStorage save/continue (§17.3) |
 | `js/shop.js` | Producer | Merchant placement, stock, pricing, buy/sell transactions (§17.4) |
 
@@ -205,6 +206,10 @@ export class Input {
   pressed(action) -> bool        // true only on the frame the action went down
   held(action) -> bool
   lastDevice: 'keyboard'|'gamepad'
+  padStyle: 'xbox'|'playstation'  // set from the id of the gamepad producing input, whenever lastDevice
+                                   // becomes 'gamepad'; PlayStation if id matches /dualsense|dualshock|playstation|054c/i
+                                   // (the DualSense reports "DualSense Wireless Controller (STANDARD GAMEPAD Vendor: 054c Product: 0ce6)").
+                                   // Button MAPPING never changes — only ui.js label glyphs (see §17.1).
 }
 actions: 'skill1'..'skill4' (1-4 / J K L Space? / gamepad A,X,B,Y → 1,2,3,4 respectively: A=skill1 Cleave, X=skill2 Bolt, Y=skill3 Nova, B=skill4 Dash)
          'character' (C / gamepad Back/View or LB), 'inventory' (I / gamepad RB), 'pause' (Esc, P / Start),
@@ -271,7 +276,8 @@ reserved for attack telegraphs, so no model uses red floor decals. Debug: `__dbg
 `enemyKilled {enemy}` · `playerDamaged {amount, source}` · `playerDodged` · `playerDied` · `levelUp {level}` ·
 `itemPickedUp {item}` · `goldPickedUp {amount}` · `depthChanged {depth}` · `skillUsed {skill}` · `statsChanged` ·
 `potionUsed {kind:'heal'|'mana'}` · `denied` (no mana / no potion / bag full / can't afford) · `bossSlam` ·
-`itemBought {item, price}` · `itemSold {item, price}`
+`itemBought {item, price}` · `itemSold {item, price}` · `bossIntro {enemy}` · `bossPhase2 {enemy}` ·
+`bossTelegraph {enemy, attack}` (a boss begins a telegraphed attack)
 
 ## 16. Balance targets
 - Depth 1 enemies die in 2–3 Cleaves; player survives ~8–10 hits from depth-appropriate enemies.
@@ -297,6 +303,9 @@ Decisions made with the user while building. Keep this section current — when 
   In the shop, Tab / I or LB / RB switch Buy / Sell.
 - Character panel: D-pad / arrow left-right jumps between Attributes and Skills once per press (no auto-repeat).
   Start / P while any panel is open closes it and pauses; Esc / B only closes. Bag: Q / X drops, R / Y equips upgrades.
+- Controller labels follow the pad in use: a PlayStation pad (id matches DualSense/DualShock/Sony vendor 054c) shows
+  ✕ ○ □ △, L1/R1, L2/R2, Options, Create; anything else shows Xbox labels (A B X Y, LB/RB, LT/RT, Start). Same buttons,
+  only the labels change.
 
 ### 17.2 Audio (audio.js)
 - All sound is procedural Web Audio — no audio files. `sfx` singleton; `wireAudio(game)` maps bus events to sounds.
@@ -306,6 +315,33 @@ Decisions made with the user while building. Keep this section current — when 
   shows a controller note (only if a gamepad is present) and the HUD shows "🔇 Click or press any key to turn on sound".
   Mute (U) persists in localStorage `dotm.muted`.
 - Per-sound throttles and a voice cap keep multi-hits (Frost Nova on a crowd, 16-shot sprays) from stacking into one loud blast.
+- Mix: SFX bus (0.8) → gentle compressor; music bus (0.42) sits well under it; both plus a shared procedural reverb go
+  through a final limiter (−3 dB), then a mute gain. U mutes everything (music too).
+- SFX are layered (transient + body + element colour: arcane shimmer, frost crystal pings, physical thud) with random
+  pitch and noise offsets so repeats differ. Extras: soft footstep per tile moved (throttled), boss wind-up tone on every
+  telegraphed attack (`bossTelegraph` bus event), shop-bell greeting when a merchant comes into trade range. Gold clinks
+  scale with pile size; pickup chimes scale with rarity.
+- **Music** (music.js, owned by `sfx.music`): procedural, scheduled ahead on the AudioContext clock by a setTimeout
+  lookahead scheduler (0.3 s visible, 1.6 s hidden tab). A late timer skips the missed steps instead of piling them up.
+  main.js calls `sfx.musicObserve(game, mode, modalOpen)` each frame (throttled to 150 ms). It starts by itself whenever
+  the context is running, including when it's already unlocked at page load.
+  - States: **title** (bright dorian) · **explore** (pads, bass drone, sparse bell motif with echo) · **boss** (own
+    96 bpm drums + phrygian ostinato + dark pads; 110 bpm, denser drums and brass stabs in phase 2) · **death** (dissonant
+    sting, then a low drone under the death screen). Boss kill plays a bright resolving sting, then explore returns.
+    State crossfades take ~1-2.5 s.
+  - Layers over explore: **combat** (soft kick/tom/shaker and a pulse bass) fades in while an aggro'd enemy (chase /
+    attack / flee) is within 11 tiles, or on any hit / player damage / kill, and fades out 4 s after the last signal.
+    **merchant** (music-box arpeggio, slightly warmer pads) plays within 6 tiles of a merchant when not in combat.
+  - Depth: each depth number seeds its key, progression weights, motifs and tempo. Deeper = darker: dorian (1-3) →
+    aeolian → aeolian/phrygian → phrygian (16+), root drops ~7 semitones, tempo 68 → ~56 bpm, pad low-pass 2300 → 850 Hz,
+    fewer melody phrases, by depth 22 (same curve as §17.4b).
+  - Long form: chords change every 2-3 bars along a weighted Markov walk that returns home every 4-6 chords. Every 2 bars
+    the melody plays a motif, a variation (inversion, dropped notes, shifted rhythm), a wander over chord tones, or rests.
+  - Ducking: music dips under the boss roar, level up, boss death and player death. Pause or any open panel low-passes
+    (650 Hz) and dips the music.
+  - Pause screen has a **♪ Music: On/Off** button (mouse only), persisted in localStorage `dotm.music`.
+  - All tunables are named constants at the top of music.js / audio.js. `__dbg.music` shows the state, layer gains,
+    scheduler stats, output RMS/peak and live node counts (music `nodes`, `sfxNodes`).
 
 ### 17.3 Save / continue (save.js)
 - localStorage `dotm.save.v1` (versioned). Saves on entering every depth and on `pagehide` / tab hidden while playing.
@@ -326,6 +362,7 @@ Decisions made with the user while building. Keep this section current — when 
 - The background/fog behind the map is each depth theme's sky colour blended (in sRGB) toward a deep dusk tone
   (`themeSky` in renderer.js), and it gets darker the deeper you go: slate blue at depth 1, charcoal around 15,
   near-black from ~22. Explored-but-not-visible tiles fade toward that colour too.
+- Changing depth (stairs) fades the screen to **black** and back (`#fade` in index.html), never white.
 
 ### 17.5 Combat feel
 - Every hit: white flash, visual recoil + squash away from the attacker. Knockback is an eased shove.
