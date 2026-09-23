@@ -6,7 +6,7 @@
 // ---------------------------------------------------------------------------
 export const ATTRIBUTES = [
   { id: 'str', name: 'Strength', description: 'Increases melee damage and adds a small amount of max HP.' },
-  { id: 'dex', name: 'Dexterity', description: 'Increases crit chance, dodge chance, and move speed slightly.' },
+  { id: 'dex', name: 'Dexterity', description: 'Increases crit chance, dodge chance, and move speed slightly. Arcane Bolt aim assist (max 20%).' },
   { id: 'int', name: 'Intelligence', description: 'Increases max mana, spell power, and mana regen.' },
   { id: 'vit', name: 'Vitality', description: 'Increases max HP and HP regen.' },
   { id: 'def', name: 'Defense', description: 'Reduces incoming damage (diminishing returns).' },
@@ -40,6 +40,10 @@ const CRIT_CHANCE_PER_DEX = 0.002;
 const DODGE_CHANCE_BASE = 0.0;
 const DODGE_CHANCE_PER_DEX = 0.0015;
 const DODGE_CHANCE_MAX = 0.35;
+// Arcane Bolt auto-aim assist: fraction the fired direction is blended toward the nearest enemy ahead
+// (skills.js castArcaneBolt). Linear per dex, capped small: 0.5% at base 5 dex, hits 20% at 200 dex.
+const AUTO_AIM_PER_DEX = 0.001;
+const AUTO_AIM_MAX = 0.20;
 
 const HP_REGEN_BASE = 0.4; // per second
 const HP_REGEN_PER_VIT = 0.06;
@@ -78,6 +82,7 @@ export function createPlayer() {
       hpRegen: HP_REGEN_BASE,
       manaRegen: MANA_REGEN_BASE,
       dodgeChance: DODGE_CHANCE_BASE,
+      autoAimAssist: 0,
     },
     equipment: { weapon: null, offhand: null, helm: null, armor: null, boots: null, ring: null, amulet: null },
     inventory: [],
@@ -176,6 +181,7 @@ export function recalcStats(player) {
   const critMult = CRIT_MULT_BASE;
 
   const dodgeChance = clampNum(DODGE_CHANCE_BASE + dex * DODGE_CHANCE_PER_DEX, 0, DODGE_CHANCE_MAX);
+  const autoAimAssist = clampNum(dex * AUTO_AIM_PER_DEX, 0, AUTO_AIM_MAX);
 
   const hpRegen = HP_REGEN_BASE + vit * HP_REGEN_PER_VIT + hpRegenBonus;
   const manaRegen = MANA_REGEN_BASE + int_ * MANA_REGEN_PER_INT + manaRegenBonus;
@@ -193,6 +199,7 @@ export function recalcStats(player) {
     moveCooldown,
     hpRegen, manaRegen,
     dodgeChance,
+    autoAimAssist,
   };
 
   // Clamp current hp/mana to new caps without healing.

@@ -95,6 +95,7 @@ const DERIVED = [
   { k: 'dodgeChance', label: 'Dodge', icon: '🌀' },
   { k: 'critChance', label: 'Crit Chance', icon: '🎯' },
   { k: 'critMult', label: 'Crit Damage', icon: '💥' },
+  { k: 'autoAimAssist', label: 'Aim Assist', icon: '🏹' },
   { k: 'hpRegen', label: 'HP Regen', icon: '🩹' },
   { k: 'manaRegen', label: 'Mana Regen', icon: '🔹' },
   { k: 'moveSpeed', label: 'Move Speed', icon: '👟' },
@@ -124,6 +125,7 @@ function derivedText(k, s) {
     case 'defense': return String(Math.round(s.defense));
     case 'critChance': return fmtPct(s.critChance);
     case 'critMult': return `×${(s.critMult || 1).toFixed(2)}`;
+    case 'autoAimAssist': return fmtPct(s.autoAimAssist);
     case 'moveSpeed': return `${(1 / Math.max(0.001, s.moveCooldown)).toFixed(1)}/s`;
     case 'hpRegen': return `${(s.hpRegen || 0).toFixed(1)}/s`;
     case 'manaRegen': return `${(s.manaRegen || 0).toFixed(1)}/s`;

@@ -18,6 +18,9 @@ const BOLT_BASE_CD = 0.6;
 const BOLT_MANA = 6;
 const BOLT_SPEED = 14;
 const BOLT_RANGE = 10;
+// Dex auto-aim assist (player.stats.autoAimAssist, 0..0.20): at cast time only, blend the fire direction toward
+// the closest visible enemy inside this forward cone and BOLT_RANGE. The bolt still flies straight (no homing).
+const BOLT_ASSIST_CONE_COS = Math.cos(40 * Math.PI / 180); // 40deg half-angle, like main.js BUMP_CONE; max nudge ~8deg
 
 const NOVA_BASE_CD = 6.0;
 const NOVA_MANA = 20;
@@ -231,11 +234,12 @@ function castArcaneBolt(game, player, skill) {
 
   const pierce = skill.rank >= 5 ? 2 : skill.rank >= 3 ? 1 : 0;
   // Analog stick play aims freely (player.aim) from the free-movement position (fx/fy).
-  const aim = player.aim || facing;
+  const ox = player.fx ?? player.x, oy = player.fy ?? player.y;
+  const aim = assistAim(game, player, player.aim || facing, ox, oy);
 
   if (typeof game.spawnProjectile === 'function') {
     game.spawnProjectile({
-      x: player.fx ?? player.x, y: player.fy ?? player.y,
+      x: ox, y: oy,
       dx: aim.x, dy: aim.y,
       speed: BOLT_SPEED,
       range: BOLT_RANGE,
@@ -251,6 +255,30 @@ function castArcaneBolt(game, player, skill) {
     });
   }
   return true;
+}
+
+// Nudge the initial bolt direction toward the closest enemy that is in range, inside the forward cone, and in
+// line of sight, by player.stats.autoAimAssist. Returns `aim` unchanged when there is no assist or no target.
+function assistAim(game, player, aim, ox, oy) {
+  const assist = (player.stats && player.stats.autoAimAssist) || 0;
+  const alen = Math.hypot(aim.x, aim.y);
+  if (assist <= 0 || alen === 0 || typeof game.enemiesInRadius !== 'function') return aim;
+  const ax = aim.x / alen, ay = aim.y / alen;
+  const canSee = typeof game.hasLineOfSight === 'function';
+  let best = null, bestD = Infinity;
+  for (const e of game.enemiesInRadius(ox, oy, BOLT_RANGE)) {
+    const ex = e.x - ox, ey = e.y - oy;
+    const d = Math.hypot(ex, ey);
+    if (d === 0 || d >= bestD) continue;
+    if ((ex * ax + ey * ay) / d < BOLT_ASSIST_CONE_COS) continue;
+    if (canSee && !game.hasLineOfSight(player.x, player.y, e.x, e.y)) continue;
+    best = { x: ex / d, y: ey / d };
+    bestD = d;
+  }
+  if (!best) return aim;
+  const bx = ax + (best.x - ax) * assist, by = ay + (best.y - ay) * assist;
+  const blen = Math.hypot(bx, by) || 1;
+  return { x: bx / blen, y: by / blen };
 }
 
 function castFrostNova(game, player, skill) {
