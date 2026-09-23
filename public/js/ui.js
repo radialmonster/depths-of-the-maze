@@ -617,7 +617,7 @@ export class UI {
     mk('span', '', attrHead, 'Attributes');
     const attrPoints = mk('span', 'dm-points-badge', attrHead, '');
     const attrList = mk('div', 'dm-attr-list', attrSection);
-    const attrRows = ATTRIBUTES.map((attr) => {
+    const attrRows = ATTRIBUTES.map((attr, i) => {
       const row = mk('div', 'dm-attr-row', attrList);
       row.dataset.attr = attr.id;
       mk('div', 'dm-attr-icon', row, ATTR_ICON[attr.id] || '◆');
@@ -628,6 +628,13 @@ export class UI {
       const plusBtn = mk('button', 'dm-plus', row, '+');
       plusBtn.title = `Spend a point on ${attr.name}`;
       plusBtn.addEventListener('click', () => this._spendAttr(attr.id));
+      // Clicking anywhere on the row (not just +) mouse-focuses it, matching keyboard/gamepad
+      // navigation's blue highlight — mirrors the Skills tab's row click behavior.
+      row.addEventListener('click', (ev) => {
+        if (ev.target === plusBtn) return;
+        this._charCursor = i;
+        this._applyCharacterFocus();
+      });
       return { attr, row, value, plusBtn };
     });
 
