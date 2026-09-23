@@ -279,11 +279,31 @@ export function computeDamage(power, targetDefense, rng, critChance = 0, critMul
   const crit = rng ? rng.chance(critChance) : false;
   if (crit) amount *= critMult;
 
-  const def = Math.max(0, targetDefense || 0);
-  const mitigated = amount * (100 / (100 + def * DEFENSE_K));
-
-  amount = Math.max(1, Math.round(mitigated));
+  amount = reduceByDefense(amount, targetDefense);
   return { amount, crit };
+}
+
+// reduceByDefense(amount, defense) -> int >= 1. The one armor formula (`× 100/(100+def)`) shared by melee
+// hits (computeDamage), incoming player damage (mitigate) and weapon-role projectiles at impact (§17.12).
+export function reduceByDefense(amount, defense) {
+  const def = Math.max(0, defense || 0);
+  return Math.max(1, Math.round(amount * (100 / (100 + def * DEFENSE_K))));
+}
+
+// Point-blank penalty for weapon-role projectiles (DESIGN §6.1, §17.12): a hit within this many tiles of the
+// projectile's origin (ox,oy) uses its pointBlankDamage instead of its rolled damage.
+export const POINT_BLANK_RANGE = 1.5;
+
+// projectileHitDamage(pr, hitX, hitY, targetDefense) -> {amount:int, pointBlank:bool}
+// Damage/crit were rolled at release; this resolves the hit-time parts. Projectiles without applyDefense (spells
+// like Arcane Bolt, enemy shots) return pr.damage unchanged. With applyDefense: the point-blank check (distance
+// from ox,oy to the hit point) picks pointBlankDamage when set, then the target's defense reduces the result.
+export function projectileHitDamage(pr, hitX, hitY, targetDefense) {
+  if (!pr.applyDefense) return { amount: pr.damage, pointBlank: false };
+  const ox = pr.ox ?? hitX, oy = pr.oy ?? hitY;
+  const pointBlank = pr.pointBlankDamage != null && Math.hypot(hitX - ox, hitY - oy) <= POINT_BLANK_RANGE;
+  const raw = pointBlank ? pr.pointBlankDamage : pr.damage;
+  return { amount: reduceByDefense(raw, targetDefense), pointBlank };
 }
 
 // mitigate(player, rawAmount) -> number. Applies player's own defense + dodge to incoming damage.
@@ -296,9 +316,7 @@ export function mitigate(player, rawAmount) {
   if (stats.dodgeChance > 0 && Math.random() < stats.dodgeChance) {
     return 0; // dodged
   }
-  const def = Math.max(0, stats.defense || 0);
-  const mitigated = rawAmount * (100 / (100 + def * DEFENSE_K));
-  return Math.max(1, Math.round(mitigated));
+  return reduceByDefense(rawAmount, stats.defense);
 }
 
 // ---------------------------------------------------------------------------

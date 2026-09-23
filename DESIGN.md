@@ -675,3 +675,11 @@ No random enemy drops. Three sources, all via the `skillbook` item type (§11):
   (`applyResist`), not strength. Frost Nova stays 50% (unchanged); Bow Shot's rank-3 perk applies ~20-25% for ~0.6s —
   deliberately much weaker than Nova, with room left above the bow for a possible future "Cripple" skill. Global cap
   75% (§17.6's "nothing is ever fully immune").
+- Implementation notes (Phase 3): `applySlow` / `MAX_SLOW_PCT` live in enemies.js and apply the `'slow'` resist to the
+  duration *before* the stronger/longer comparison; the timer running out resets `slowPct` to 0. The armor formula is
+  one shared helper, `reduceByDefense()` in character.js (used by `computeDamage`, `mitigate`, and projectile hits);
+  `projectileHitDamage(pr, hitX, hitY, def)` + `POINT_BLANK_RANGE` (1.5, inclusive, straight-line from `ox,oy`) resolve
+  a projectile hit. A weapon shot with no `pointBlankDamage` just uses `damage` up close. main.js passes
+  `opts.pointBlank` to `damageEnemy`, but the duller sound / smaller grey number is not built yet (bow phase).
+  "Fully stuck" (§17.1) uses the 4-way `facing`, so in a diagonal wedge it only attacks when the push is at least as
+  much toward the enemy's axis as toward the wall (push mostly into the wall = facing the wall = no attack).

@@ -3,9 +3,9 @@
 import { RNG, EventBus, uid, bumpUid, TILE, dist, clamp, ELEMENTS, RARITY } from './core.js';
 import { generateDungeon, computeFOV } from './map.js';
 import { Renderer } from './renderer.js';
-import { createPlayer, recalcStats, gainXP, mitigate, updatePlayer } from './character.js';
+import { createPlayer, recalcStats, gainXP, mitigate, updatePlayer, projectileHitDamage } from './character.js';
 import { createSkillState, normalizeSkillState, useSkill, updateSkills } from './skills.js';
-import { spawnEnemies, updateEnemies, createEnemy, getResist } from './enemies.js';
+import { spawnEnemies, updateEnemies, createEnemy, getResist, applySlow } from './enemies.js';
 import { rollLoot, startingGear, addToInventory, useItem, generateItem, activePotion } from './items.js';
 import { Input } from './input.js';
 import { UI, padLabel } from './ui.js';
@@ -174,7 +174,11 @@ const game = {
     const len = Math.hypot(p.dx, p.dy) || 1;
     this.projectiles.push({
       pierce: 0, size: 0.2, color: '#ffffff', kind: 'bolt', crit: false,
+      // §6.1 / §17.12: weapon-role shots set applyDefense (armor applies at impact) and pointBlankDamage;
+      // spells and enemy shots leave the defaults (bypass armor, no point-blank penalty, no slow).
+      applyDefense: false, pointBlankDamage: null, slow: null,
       ...p,
+      ox: p.ox ?? p.x, oy: p.oy ?? p.y, // origin, for the point-blank distance check
       id: p.id ?? uid(),
       dx: p.dx / len, dy: p.dy / len,
       traveled: 0,
@@ -526,6 +530,7 @@ const FREE_SUBSTEP = 0.2;   // max tiles moved per collision substep
 const CORNER_ASSIST = 0.75; // how far off a doorway's lane you can be and still get eased into it
 const BUMP_RANGE = 1.1;     // centre distance at which pushing toward an enemy attacks it
 const BUMP_CONE = 0.77;     // cos(~40deg): how directly you must push toward it
+const STUCK_EPS = 1e-6;     // below this, a frame's free-movement progress counts as "fully stuck" (§17.1)
 
 // Anything that moved the player by whole tiles (dash, depth load, keyboard step) wins.
 function syncFreePos(p) {
@@ -607,18 +612,20 @@ function updateFreeMovement(stick, dt) {
   const total = speed * dt;
   const steps = Math.max(1, Math.ceil(total / FREE_SUBSTEP));
   const startX = p.x, startY = p.y;
-  let blockedAhead = false;
+  const startFx = p.fx, startFy = p.fy;
   for (let i = 0; i < steps; i++) {
     const d = total / steps;
     const bx = moveAxis(p, 'x', stick.x * d);
     const by = moveAxis(p, 'y', stick.y * d);
     if (bx && Math.abs(stick.x) >= Math.abs(stick.y)) cornerAssist(p, 'x', Math.sign(stick.x), d);
     if (by && Math.abs(stick.y) > Math.abs(stick.x)) cornerAssist(p, 'y', Math.sign(stick.y), d);
-    blockedAhead = p.facing.x ? bx : by;
   }
 
-  // Brushing past an enemy while sliding still swings at it.
-  if (blockedAhead && game.enemyAt(p.x + p.facing.x, p.y + p.facing.y)) useSkill(game, 0);
+  // "Fully stuck" (§17.1): zero progress on both axes (nothing to slide along — e.g. a diagonal push in a 1-wide
+  // corridor with an enemy blocking one axis and a wall the other) with an enemy on the facing tile counts as an
+  // aimed push. Any movement at all — sliding past an enemy, even slowly — never attacks.
+  if (total > STUCK_EPS && Math.abs(p.fx - startFx) < STUCK_EPS && Math.abs(p.fy - startFy) < STUCK_EPS
+      && game.enemyAt(p.x + p.facing.x, p.y + p.facing.y)) useSkill(game, 0);
 
   if (p.x !== startX || p.y !== startY) onPlayerMoved();
 }
@@ -690,7 +697,10 @@ function updateProjectiles(dt) {
         const e = game.enemyAt(tx, ty);
         if (e && !pr.hit.has(e.id)) {
           pr.hit.add(e.id);
-          game.damageEnemy(e, pr.damage, { crit: pr.crit, source: 'ranged', element: pr.element, knockback: null });
+          // Hit-time resolution (§17.12): point-blank + target defense for applyDefense shots; others unchanged.
+          const { amount, pointBlank } = projectileHitDamage(pr, pr.x, pr.y, e.defense);
+          game.damageEnemy(e, amount, { crit: pr.crit, source: 'ranged', element: pr.element, knockback: null, pointBlank });
+          if (pr.slow && !e.dead) applySlow(e, pr.slow.pct, pr.slow.dur);
           if (pr.pierce > 0) pr.pierce--;
           else alive = false;
         }

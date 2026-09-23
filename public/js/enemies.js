@@ -154,6 +154,25 @@ export function applyResist(enemy, key, value) {
   return Math.max(0, value * (1 - getResist(enemy, key)));
 }
 
+// Slow has a strength (DESIGN §10, §17.12): enemy.slowPct (0..MAX_SLOW_PCT) alongside the enemy.slow timer.
+// applySlow(enemy, pct, dur) only replaces the current slow if the new one is stronger, or equally strong and
+// lasts longer — a weaker/shorter slow never interrupts or shortens a stronger one already active. Resist to
+// 'slow' shortens the *duration* only (applyResist), never the strength. Returns true if the slow took effect.
+export const MAX_SLOW_PCT = 0.75; // nothing is ever fully immobilized (§17.6)
+export function applySlow(enemy, pct, dur) {
+  if (!enemy) return false;
+  pct = clamp(Number(pct) || 0, 0, MAX_SLOW_PCT);
+  dur = applyResist(enemy, 'slow', Number(dur) || 0);
+  if (pct <= 0 || dur <= 0) return false;
+  const active = enemy.slow > 0;
+  const curPct = active ? (enemy.slowPct || 0) : 0;
+  const curDur = active ? enemy.slow : 0;
+  if (active && (pct < curPct || (pct === curPct && dur <= curDur))) return false;
+  enemy.slowPct = pct;
+  enemy.slow = dur;
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Enemy factory
 // ---------------------------------------------------------------------------
@@ -203,7 +222,8 @@ export function createEnemy(typeId, x, y, depth, rng, opts = {}) {
       color: type.visual.color,
       scale: type.visual.scale * scaleMult,
     },
-    slow: 0,
+    slow: 0,     // slow timer (s); strength is slowPct — set via applySlow()
+    slowPct: 0,  // 0..MAX_SLOW_PCT
     frozen: 0,
     hitFlash: 0,
     _kbTime: 0, // cosmetic: renderer.js eases the tile-knockback slide over this window
@@ -404,9 +424,11 @@ function facePlayer(e, p) {
   else e.facing = { x: 0, y: dy >= 0 ? 1 : -1 };
 }
 
-function effMoveCooldown(e, type, useChase) {
+export function effMoveCooldown(e, type, useChase) {
   const base = (useChase && type.chaseMoveCooldown) ? type.chaseMoveCooldown : e.moveCooldown;
-  return e.slow > 0 ? base * 2 : base;
+  if (!(e.slow > 0)) return base;
+  const pct = clamp(e.slowPct || 0, 0, MAX_SLOW_PCT);
+  return base / (1 - pct);
 }
 
 // Moves e one step along a cached path toward (gx,gy). Recomputes at most ~every 0.3s.
@@ -1041,7 +1063,10 @@ export function updateEnemies(game, dt) {
 
     // Cosmetic/status timers always tick.
     if (e.hitFlash > 0) e.hitFlash = Math.max(0, e.hitFlash - dt);
-    if (e.slow > 0) e.slow = Math.max(0, e.slow - dt);
+    if (e.slow > 0) {
+      e.slow = Math.max(0, e.slow - dt);
+      if (e.slow <= 0) e.slowPct = 0;
+    }
     if (e._kbTime > 0) e._kbTime = Math.max(0, e._kbTime - dt);
     if (e._hopTime > 0) e._hopTime = Math.max(0, e._hopTime - dt); // renderer.js arcs the leap over this
     if (e._dazedTime > 0) {

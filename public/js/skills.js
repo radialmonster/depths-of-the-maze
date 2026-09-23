@@ -11,7 +11,7 @@
 // activeSkill(player, slotIndex) resolves what's in a slot right now; nothing else indexes slots directly.
 
 import { computeDamage } from './character.js';
-import { applyResist } from './enemies.js';
+import { applyResist, applySlow } from './enemies.js';
 
 // ---------------------------------------------------------------------------
 // Tuning constants
@@ -39,7 +39,8 @@ const NOVA_BASE_RADIUS = 2.5;
 const NOVA_RADIUS_PER_RANK = 0.25;
 const NOVA_FROZEN_BASE = 1.2;
 const NOVA_FROZEN_PER_RANK = 0.15;
-const NOVA_SLOW = 3.0;
+const NOVA_SLOW = 3.0;       // slow duration (s)
+const NOVA_SLOW_PCT = 0.5;   // slow strength: 50% => moves at half speed (DESIGN §17.12)
 
 const DASH_BASE_CD = 2.5;
 const DASH_MANA = 5;
@@ -555,7 +556,7 @@ function castFrostNova(game, player, skill, rank) {
     // ENEMY_TYPES.resist) — e.g. Bone Tyrant shrugs off most of the freeze/slow, Slime King
     // barely resists either. Regular enemies have no resist table, so this is a no-op for them.
     enemy.frozen = applyResist(enemy, 'freeze', frozen);
-    enemy.slow = applyResist(enemy, 'slow', NOVA_SLOW);
+    applySlow(enemy, NOVA_SLOW_PCT, NOVA_SLOW); // resist shortens the duration inside applySlow (§17.12)
   }
 
   if (typeof game.effect === 'function') game.effect('nova', player.x, player.y, { radius });
