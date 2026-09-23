@@ -8,10 +8,11 @@ import { RNG } from '../public/js/core.js';
 import {
   WEAPON_KIND_INFO, FALLBACK_WEAPON_INFO, weaponKindInfo, weaponClassOf, isTwoHanded, weaponTier, computeValue,
   TWO_HAND_STAT_MULT, TWO_HAND_VALUE_MULT, generateItem, equipItem, equipCheck, compareGear, equipUpgrades,
-  enforceTwoHanded, INVENTORY_SIZE,
+  enforceTwoHanded, INVENTORY_SIZE, baseStatsFor,
 } from '../public/js/items.js';
 import { createPlayer, recalcStats } from '../public/js/character.js';
-import { createSkillState, useSkill, SKILL_DEFS, boltDamageRange, skillCooldown, effectiveCooldown } from '../public/js/skills.js';
+import { createSkillState, useSkill, SKILL_DEFS, boltDamageRange, skillCooldown, effectiveCooldown, SWEEP_OFFSETS } from '../public/js/skills.js';
+import { projectileHitDamage, reduceByDefense } from '../public/js/character.js';
 
 let failed = 0, passed = 0;
 function test(name, fn) {
@@ -38,18 +39,21 @@ function player(equip = {}, inventory = []) {
 }
 
 console.log('WEAPON_KIND_INFO');
-test('melee1h kinds and bow have real entries; staff is deliberately absent (Phase 5)', () => {
+test('melee1h kinds, bow, wand and staff have real entries', () => {
   for (const k of ['sword', 'axe', 'mace', 'dagger']) {
     assert.deepEqual({ ...WEAPON_KIND_INFO[k] }, { hands: 1, cls: 'melee1h', role: 'melee', scale: 'str', defaultAttack: 'cleave' });
   }
   assert.deepEqual({ ...WEAPON_KIND_INFO.bow }, { hands: 2, cls: 'bow', role: 'ranged', scale: 'dex', defaultAttack: 'bowShot' });
-  assert.ok(!('staff' in WEAPON_KIND_INFO));
+  assert.deepEqual({ ...WEAPON_KIND_INFO.wand }, { hands: 1, cls: 'wand', role: 'ranged', scale: 'int', defaultAttack: 'spark' });
+  assert.deepEqual({ ...WEAPON_KIND_INFO.staff }, { hands: 2, cls: 'staff', role: 'melee', scale: 'int', defaultAttack: 'staffSweep' });
 });
-test('unlisted kinds (staff), unknown kinds and unarmed use the melee1h fallback', () => {
-  for (const k of ['staff', 'someFutureKind', undefined, null, 'toString']) assert.equal(weaponKindInfo(k), FALLBACK_WEAPON_INFO, String(k));
+test('unknown kinds and unarmed use the melee1h fallback', () => {
+  for (const k of ['someFutureKind', undefined, null, 'toString']) assert.equal(weaponKindInfo(k), FALLBACK_WEAPON_INFO, String(k));
   assert.equal(weaponClassOf(null), 'melee1h');
-  assert.equal(weaponClassOf(weapon('staff', 1, 2)), 'melee1h');
-  assert.equal(isTwoHanded(weapon('staff', 1, 2)), false);
+  assert.equal(weaponClassOf(weapon('staff', 1, 2)), 'staff');
+  assert.equal(weaponClassOf(weapon('wand', 1, 2)), 'wand');
+  assert.equal(isTwoHanded(weapon('staff', 1, 2)), true);
+  assert.equal(isTwoHanded(weapon('wand', 1, 2)), false);
   assert.equal(isTwoHanded(null), false);
   assert.equal(isTwoHanded(weapon('bow', 1, 2)), true);
 });
@@ -58,7 +62,8 @@ console.log('Two-handed itemization');
 test('weaponTier: 2H = x1.5 stats, +1 affix; 1H and fallback = none', () => {
   assert.deepEqual(weaponTier('bow'), { statMult: 1.5, extraAffixes: 1 });
   assert.deepEqual(weaponTier('sword'), { statMult: 1, extraAffixes: 0 });
-  assert.deepEqual(weaponTier('staff'), { statMult: 1, extraAffixes: 0 });
+  assert.deepEqual(weaponTier('staff'), { statMult: 1.5, extraAffixes: 1 });
+  assert.deepEqual(weaponTier('wand'), { statMult: 1, extraAffixes: 0 });
 });
 test('computeValue: 2H weapons x1.4, everything else unchanged', () => {
   const base = computeValue('weapon', 7, 'rare', 'sword');
@@ -82,6 +87,38 @@ test('+1 affix at every rarity for bows (common bows get an affix, common swords
   assert.notEqual(bow.name, bow.baseName);
   const magicBow = generateItem(5, orderRng, { type: 'weapon', weaponKind: 'bow', rarity: 'magic', itemLevel: 5 });
   assert.equal(magicBow.name, `Vicious Piercing ${magicBow.baseName}`, '2 affixes = magic 1 + 1');
+});
+
+test('generated wand: 1H caster base stats (spell power + int), no 2H multiplier', () => {
+  const L = 10;
+  const w = generateItem(5, orderRng, { type: 'weapon', weaponKind: 'wand', rarity: 'common', itemLevel: L });
+  assert.equal(w.name, w.baseName, 'common 1H: no affix');
+  assert.equal(w.stats.spellPower, Math.round(1.5 + L * 0.7));
+  assert.equal(w.stats.int, Math.round((1 + L * 0.4) * 10) / 10);
+  assert.equal(w.stats.damageMin, Math.round(1 + L * 0.6));
+  assert.equal(w.value, computeValue('weapon', L, 'common', 'wand'));
+  assert.equal(w.icon, '🪄');
+});
+test('generated staff: 2H tier (x1.5 stats, +1 affix, x1.4 value) and keeps baseline spell power', () => {
+  const L = 10;
+  const st = generateItem(5, orderRng, { type: 'weapon', weaponKind: 'staff', rarity: 'common', itemLevel: L });
+  assert.notEqual(st.name, st.baseName, 'common 2H gets an affix');
+  assert.equal(st.stats.spellPower, Math.round((3 + L * 1.35) * TWO_HAND_STAT_MULT));
+  assert.equal(st.value, computeValue('weapon', L, 'common', 'staff'));
+});
+test('staff spell power >= 1.1x a same-level wand + orb (and wand + tome) at every item level', () => {
+  const sp = (s) => s.spellPower || 0;
+  const eff = (s) => sp(s) + (s.int || 0) * 0.8; // what the Spell Power stat row shows (recalcStats: +int*0.8)
+  for (let L = 1; L <= 60; L++) {
+    const staff = baseStatsFor('weapon', 'staff', L);
+    for (const k in staff) staff[k] *= TWO_HAND_STAT_MULT;
+    const wand = baseStatsFor('weapon', 'wand', L);
+    for (const off of ['orb', 'tome']) {
+      const o = baseStatsFor('offhand', off, L);
+      assert.ok(sp(staff) >= 1.1 * (sp(wand) + sp(o)), `L${L} raw spell power vs wand+${off}: ${sp(staff)} < 1.1x ${sp(wand) + sp(o)}`);
+      assert.ok(eff(staff) >= 1.1 * (eff(wand) + eff(o)), `L${L} spell power incl. int vs wand+${off}`);
+    }
+  }
 });
 
 console.log('Piercing affix');
@@ -119,11 +156,23 @@ test('bow: rangedMin/Max = weapon + dex*0.8, melee null (bow damage no longer fe
   assert.equal(p.stats.meleeMin, null);
   assert.equal(p.stats.meleeMax, null);
 });
-test('unarmed and staff stay melee (fallback)', () => {
+test('unarmed stays melee (fallback, str)', () => {
   const u = player({ weapon: null });
   assert.ok(u.stats.meleeMin >= 1); assert.equal(u.stats.rangedMin, null);
-  const s = player({ weapon: weapon('staff', 3, 5) });
-  assert.equal(s.stats.meleeMin, Math.round(3 + 4)); assert.equal(s.stats.rangedMin, null);
+});
+test('wand: rangedMin/Max = weapon + int*0.8, melee null', () => {
+  const p = player({ weapon: weapon('wand', 3, 5) });
+  p.base.int = 20; p.base.str = 50; p.base.dex = 50; recalcStats(p);
+  assert.equal(p.stats.rangedMin, 3 + 16);
+  assert.equal(p.stats.rangedMax, 5 + 16);
+  assert.equal(p.stats.meleeMin, null);
+});
+test('staff: meleeMin/Max = weapon + int*0.8 (not str), ranged null', () => {
+  const p = player({ weapon: weapon('staff', 3, 5) });
+  p.base.int = 20; p.base.str = 50; recalcStats(p);
+  assert.equal(p.stats.meleeMin, 3 + 16);
+  assert.equal(p.stats.meleeMax, 5 + 16);
+  assert.equal(p.stats.rangedMin, null);
 });
 test('Arcane Bolt damage comes from spell power only (no dex)', () => {
   const p = player();
@@ -274,6 +323,123 @@ test('Piercing gear adds to the arrow\'s pierce', () => {
   const { game, shots } = bowGame(1, { pierce: 1 });
   useSkill(game, 0);
   assert.equal(shots[0].pierce, 1);
+});
+
+console.log('Staff / wand equip rules');
+test('equipping a staff evicts the off-hand into the bag; an off-hand is refused while a staff is held', () => {
+  const sh = shield(), st = weapon('staff', 5, 9), sword = weapon('sword', 3, 5);
+  const p = player({ weapon: sword, offhand: sh }, [st]);
+  const logs = [];
+  assert.ok(equipItem(p, st, (t) => logs.push(t)));
+  assert.equal(p.equipment.offhand, null);
+  assert.ok(p.inventory.includes(sh));
+  assert.deepEqual(logs, ['Test Shield unequipped (two-handed weapon)']);
+  assert.equal(equipCheck(p, sh).ok, false);
+});
+test('a wand keeps the off-hand (1H)', () => {
+  const sh = shield(), w = weapon('wand', 2, 4), sword = weapon('sword', 3, 5);
+  const p = player({ weapon: sword, offhand: sh }, [w]);
+  assert.ok(equipItem(p, w));
+  assert.equal(p.equipment.offhand, sh);
+});
+test('sword -> wand / staff is a class swap (⇄)', () => {
+  const p = player({ weapon: weapon('sword', 3, 5) });
+  assert.equal(compareGear(weapon('wand', 50, 90), p).verdict, 'swap');
+  assert.equal(compareGear(weapon('staff', 50, 90), p).verdict, 'swap');
+});
+
+console.log('Spark');
+function wandGame(rank = 1) {
+  const p = player({ weapon: weapon('wand', 6, 10) });
+  p.skillState.known.spark = rank;
+  p.fx = p.x = 3; p.fy = p.y = 3; p.facing = { x: 0, y: 1 };
+  const shots = [];
+  const game = {
+    player: p, rng: new RNG(11), bus: { emit() {} },
+    spawnProjectile: (pr) => shots.push(pr), enemiesInRadius: () => [], hasLineOfSight: () => true,
+  };
+  return { p, game, shots };
+}
+test('slot 1 with a wand casts Spark: short, free, armor-reduced, point-blank floor from the ranged row', () => {
+  const { p, game, shots } = wandGame();
+  p.mana = 0; // free: works with an empty mana pool
+  assert.ok(useSkill(game, 0));
+  assert.equal(shots.length, 1);
+  const s = shots[0];
+  assert.equal(s.kind, 'spark');
+  assert.equal(s.applyDefense, true);
+  assert.equal(s.element, 'arcane');
+  assert.equal(s.range, 4);
+  assert.equal(s.pierce, 0);
+  assert.deepEqual([s.ox, s.oy, s.dx, s.dy], [3, 3, 0, 1]);
+  assert.equal(s.pointBlankDamage, Math.min(s.damage, p.stats.rangedMin));
+  assert.ok(s.damage >= Math.floor(p.stats.rangedMin * 0.85) && s.damage <= Math.ceil(p.stats.rangedMax * 1.15 * p.stats.critMult));
+  assert.equal(p.mana, 0);
+  close(skillCooldown(p, 'spark').max, 0.45);
+});
+test('Spark resolves at impact like Bow Shot: point-blank floor within 1.5 tiles, then armor', () => {
+  const { game, shots } = wandGame();
+  useSkill(game, 0);
+  const s = shots[0];
+  assert.deepEqual(projectileHitDamage(s, 3, 4, 20), { amount: reduceByDefense(s.pointBlankDamage, 20), pointBlank: true });
+  assert.deepEqual(projectileHitDamage(s, 3, 6, 20), { amount: reduceByDefense(s.damage, 20), pointBlank: false });
+});
+test('Spark rank 3 reaches 1 tile further', () => {
+  const { game, shots } = wandGame(3);
+  useSkill(game, 0);
+  assert.equal(shots[0].range, 5);
+});
+
+console.log('Staff Sweep');
+function staffGame(rank = 1, enemyTiles = SWEEP_OFFSETS.map((o) => [5 + o.x, 5 + o.y]), rng = new RNG(5)) {
+  const p = player({ weapon: weapon('staff', 6, 10) });
+  p.skillState.known.staffSweep = rank;
+  p.x = 5; p.y = 5; p.facing = { x: 1, y: 0 };
+  const enemies = enemyTiles.map(([x, y], i) => ({ id: i, x, y, defense: 0, hp: 999 }));
+  enemies.push({ id: 99, x: 7, y: 5, defense: 0, hp: 999 }); // two tiles away: out of reach
+  const hits = [], fx = [];
+  const game = {
+    player: p, rng, bus: { emit() {} },
+    enemyAt: (x, y) => enemies.find((e) => e.x === x && e.y === y) || null,
+    damageEnemy: (e, amount, opts) => hits.push({ e, amount, opts }),
+    effect: (t) => fx.push(t),
+  };
+  return { p, game, hits, fx };
+}
+test('slot 1 with a staff casts Staff Sweep: hits all 8 surrounding tiles, nothing further, no mana', () => {
+  const { p, game, hits, fx } = staffGame();
+  const mana = p.mana;
+  assert.ok(useSkill(game, 0));
+  assert.equal(hits.length, 8);
+  assert.deepEqual(new Set(hits.map((h) => `${h.e.x},${h.e.y}`)).size, 8);
+  assert.ok(!hits.some((h) => h.e.id === 99));
+  assert.equal(p.mana, mana);
+  assert.deepEqual(fx, ['sweep']);
+  close(skillCooldown(p, 'staffSweep').max, 0.6);
+  for (const h of hits) {
+    assert.equal(h.opts.source, 'melee');
+    // melee row (weapon + int*0.8) x +-15% variance x crit
+    assert.ok(h.amount >= Math.floor(p.stats.meleeMin * 0.85) && h.amount <= Math.ceil(p.stats.meleeMax * 1.15 * p.stats.critMult));
+  }
+});
+test('Staff Sweep knockback: on crit at rank 1, every hit at rank 3, pushed straight away from the player', () => {
+  const noCrit = { range: (a) => a, chance: () => false };
+  const r1 = staffGame(1, undefined, noCrit);
+  useSkill(r1.game, 0);
+  assert.ok(r1.hits.every((h) => !h.opts.knockback));
+  const r3 = staffGame(3, undefined, noCrit);
+  useSkill(r3.game, 0);
+  for (const h of r3.hits) assert.deepEqual(h.opts.knockback, { x: h.e.x - 5, y: h.e.y - 5 });
+  const crit = staffGame(1, [[6, 6]], { range: (a) => a, chance: () => true });
+  useSkill(crit.game, 0);
+  assert.deepEqual(crit.hits[0].opts.knockback, { x: 1, y: 1 });
+});
+test('Staff Sweep damage is armor-reduced through computeDamage (melee path)', () => {
+  const flat = { range: (a) => a, chance: () => false };
+  const { p, game, hits } = staffGame(1, [[5, 4]], flat);
+  game.enemyAt = (x, y) => (x === 5 && y === 4 ? { x, y, defense: 50 } : null);
+  useSkill(game, 0);
+  assert.equal(hits[0].amount, reduceByDefense(p.stats.meleeMin * 0.85, 50));
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

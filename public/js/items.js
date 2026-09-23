@@ -27,7 +27,7 @@ export const SLOTS = [
 ];
 
 const ALL_EQUIP = ['weapon', 'offhand', 'helm', 'armor', 'boots', 'ring', 'amulet'];
-const WEAPON_KINDS = ['sword', 'axe', 'mace', 'dagger', 'staff', 'bow'];
+const WEAPON_KINDS = ['sword', 'axe', 'mace', 'dagger', 'staff', 'bow', 'wand'];
 const OFFHAND_KINDS = ['shield', 'orb', 'tome'];
 
 // ---------------------------------------------------------------------------
@@ -47,11 +47,14 @@ export const WEAPON_KIND_INFO = Object.freeze({
   mace: MELEE_1H,
   dagger: MELEE_1H,
   bow: Object.freeze({ hands: 2, cls: 'bow', role: 'ranged', scale: 'dex', defaultAttack: 'bowShot' }),
+  // Caster weapons (Phase 5): int-scaled. Wand is a 1H ranged shooter (keeps the off-hand for an orb/tome/shield);
+  // staff is a 2H melee sweeper (off-hand locked, two-handed itemization tier).
+  wand: Object.freeze({ hands: 1, cls: 'wand', role: 'ranged', scale: 'int', defaultAttack: 'spark' }),
+  staff: Object.freeze({ hands: 2, cls: 'staff', role: 'melee', scale: 'int', defaultAttack: 'staffSweep' }),
 });
-// Fallback for unarmed AND for any weapon kind without an entry above. Today that's only `staff`, which isn't
-// itemized as its own class yet — Phase 5 adds a real `staff` entry and this fallback simply stops applying to it.
-// An unlisted kind behaves exactly like a one-handed melee weapon: feeds meleeMin/Max (str), no off-hand
-// restriction, melee1h class (Cleave).
+// Fallback for unarmed AND for any weapon kind without an entry above (every itemized kind has one today, so in
+// practice: unarmed, and old/unknown kinds from a save). An unlisted kind behaves exactly like a one-handed melee
+// weapon: feeds meleeMin/Max (str), no off-hand restriction, melee1h class (Cleave).
 export const FALLBACK_WEAPON_INFO = MELEE_1H;
 
 export function weaponKindInfo(kind) {
@@ -76,7 +79,7 @@ export function weaponTier(weaponKind) {
 const TYPE_WEIGHTS = { weapon: 20, offhand: 12, helm: 12, armor: 16, boots: 12, ring: 14, amulet: 14 };
 
 const ICONS = {
-  sword: '🗡️', axe: '🪓', mace: '🔨', dagger: '🔪', staff: '🪄', bow: '🏹',
+  sword: '🗡️', axe: '🪓', mace: '🔨', dagger: '🔪', staff: '🦯', bow: '🏹', wand: '🪄',
   shield: '🛡️', orb: '🔮', tome: '📖',
   helm: '⛑️', armor: '🥋', boots: '👢', ring: '💍', amulet: '📿',
   potionHealth: '🧪', potionMana: '💧',
@@ -101,6 +104,7 @@ const WEAPON_NAMES = {
   dagger: ['Bent Dagger', 'Iron Dagger', 'Serrated Knife', "Assassin's Blade", 'Runed Kris', 'Nightfang'],
   staff: ['Gnarled Stick', 'Apprentice Staff', 'Oak Staff', "Sorcerer's Staff", 'Runed Staff', "Archmage's Staff"],
   bow: ['Crude Bow', 'Short Bow', "Hunter's Bow", 'Recurve Bow', 'Runed Longbow', 'Stormcaller Bow'],
+  wand: ['Twig Wand', 'Apprentice Wand', 'Ashwood Wand', "Sorcerer's Wand", 'Runed Wand', "Archmage's Wand"],
 };
 
 const OFFHAND_NAMES = {
@@ -181,6 +185,16 @@ function tierName(type, kind, itemLevel) {
   return SLOT_NAMES[type][idx];
 }
 
+const STAFF_SP_BASE = 3;
+const STAFF_SP_PER_LVL = 1.35;
+
+// Unrounded common-rarity base stats (before the 2H tier multiplier) — exported for the balance tests only.
+export function baseStatsFor(type, kind, lvl) {
+  if (type === 'weapon') return weaponBaseStats(kind, lvl);
+  if (type === 'offhand') return offhandBaseStats(kind, lvl);
+  return {};
+}
+
 function weaponBaseStats(kind, lvl) {
   switch (kind) {
     case 'sword': {
@@ -200,8 +214,15 @@ function weaponBaseStats(kind, lvl) {
       return { damageMin: min, damageMax: min + (1 + lvl * 0.2), dex: 1 + lvl * 0.5, critChance: 0.01 + lvl * 0.002 };
     }
     case 'staff': {
+      // Spell power raised from 2 + lvl*1.0 (Phase 5) so staff (x1.5 as a 2H weapon) keeps >= 1.1x a same-level
+      // wand + orb (and wand + tome) combo's spell power — see DESIGN §17.9 and test/items.test.js.
       const min = 1 + lvl * 0.5;
-      return { damageMin: min, damageMax: min + (1 + lvl * 0.2), spellPower: 2 + lvl * 1.0, int: 1 + lvl * 0.4 };
+      return { damageMin: min, damageMax: min + (1 + lvl * 0.2), spellPower: STAFF_SP_BASE + lvl * STAFF_SP_PER_LVL, int: 1 + lvl * 0.4 };
+    }
+    case 'wand': {
+      // Caster 1H: low physical damage (Spark's damage is mostly the int*0.8 on the ranged row), real spell power + int.
+      const min = 1 + lvl * 0.6;
+      return { damageMin: min, damageMax: min + (1.5 + lvl * 0.25), spellPower: 1.5 + lvl * 0.7, int: 1 + lvl * 0.4 };
     }
     case 'bow': {
       const min = 1 + lvl * 0.8;
@@ -494,7 +515,14 @@ export function equipItem(player, item, log = null) {
   return true;
 }
 
-// Saves from before bows were two-handed can hold a bow AND an off-hand. Moves the off-hand to the bag and returns
+// Saved items keep the icon they were generated with; re-derive a weapon's from the current ICONS table so e.g. a
+// staff saved before Phase 5 (when staff used the wand emoji) doesn't look like a wand. No-op for everything else.
+export function refreshItemIcon(item) {
+  if (item && item.type === 'weapon' && item.weaponKind && ICONS[item.weaponKind]) item.icon = ICONS[item.weaponKind];
+  return item;
+}
+
+// Saves from before bows/staves were two-handed can hold a bow or staff AND an off-hand. Moves the off-hand to the bag and returns
 // null, or returns it (already unequipped) when the bag is full so the caller can drop it on the ground.
 export function enforceTwoHanded(player) {
   const off = player && player.equipment && player.equipment.offhand;

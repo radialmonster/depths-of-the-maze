@@ -369,6 +369,34 @@ class Sfx {
     } catch (e) { /* ignore */ }
   }
 
+  // Spark (wand): a light, quick arcane zap — a short upward chirp + a tiny crackle. Deliberately smaller and
+  // drier than Arcane Bolt's cast (no long shimmer tail), since it's the free filler fired constantly.
+  spark() {
+    if (!this._gate('spark', 40, 0.16)) return;
+    try {
+      const t0 = this.ctx.currentTime;
+      const f = this._pitch(900, 0.1);
+      this._tone('square', t0, f, f * 2.2, 0.06, 0.05, { attack: 0.002, release: 0.04, lowpass: 3500 });
+      this._tone('sine', t0, f * 2, f * 3.4, 0.07, 0.04, { attack: 0.002, release: 0.06, detune: 8, send: 0.15 });
+      this._noise(t0, 0.05, 'highpass', 5000, 7000, 0.06, { attack: 0.001, release: 0.03 });
+    } catch (e) { /* ignore */ }
+  }
+
+  // Staff Sweep: a broader, lower whoosh than Cleave's swing (the staff goes all the way around), with the arcane
+  // detuned-shimmer layer (§17.2) riding on top so it reads as a caster weapon.
+  staffSweep() {
+    if (!this._gate('staffSweep', 40, 0.2)) return;
+    try {
+      const t0 = this.ctx.currentTime;
+      const f = this._pitch(1500, 0.1);
+      this._noise(t0, 0.24, 'bandpass', f * 0.6, f * 1.6, 0.26, { q: 1.1, attack: 0.03, release: 0.12 });
+      this._noise(t0, 0.18, 'lowpass', 500, 220, 0.12, { attack: 0.02, release: 0.1 });
+      const s = this._pitch(1200, 0.06);
+      this._tone('sine', t0 + 0.04, s, s * 1.25, 0.16, 0.03, { attack: 0.02, release: 0.14, detune: 12, send: 0.25 });
+      this._tone('sine', t0 + 0.04, s * 1.5, s * 1.9, 0.16, 0.022, { attack: 0.02, release: 0.14, detune: -12, send: 0.25 });
+    } catch (e) { /* ignore */ }
+  }
+
   // Squelchy pop + puff, a faint "confirm" ping; elites get an extra sub boom.
   enemyDeath(elite) {
     if (!this._gate('enemyDeath', 40, 0.25)) return;
@@ -707,6 +735,8 @@ export function wireAudio(game) {
     switch (skill && skill.id) {
       case 'cleave': sfx.swing(); break;
       case 'bowShot': sfx.bowShot(); break;
+      case 'spark': sfx.spark(); break;
+      case 'staffSweep': sfx.staffSweep(); break;
       case 'arcaneBolt': sfx.bolt(); break;
       case 'frostNova': sfx.nova(); break;
       case 'shadowDash': sfx.dash(); break;

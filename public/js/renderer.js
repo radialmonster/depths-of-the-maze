@@ -1284,6 +1284,13 @@ export class Renderer {
         add(geo.sphereLow, accent, [0.18, 0.18, 0.18], [0, 0.4, 0]);
         g.rotation.z = -Math.PI / 6;
         break;
+      case 'wand':
+        add(geo.cylinder, this._newMat(0x4a2c1a, { roughness: 0.8 }, materials), [0.045, 0.5, 0.045], [0, -0.04, 0]);
+        add(geo.cylinder, gold, [0.07, 0.05, 0.07], [0, -0.2, 0]);
+        add(geo.torus, gold, [0.1, 0.1, 0.16], [0, 0.22, 0], [Math.PI / 2, 0, 0]);
+        add(geo.sphereLow, accent, [0.12, 0.12, 0.12], [0, 0.26, 0]);
+        g.rotation.z = -Math.PI / 4;
+        break;
       case 'bow':
         add(geo.bowArc, wood, [0.36, 0.5, 0.5], null, [0, 0, -Math.PI / 2]);
         add(geo.box, this._newMat(0xf4f1e6, { roughness: 0.6 }, materials), [0.015, 0.72, 0.015]);
@@ -1389,6 +1396,7 @@ export class Renderer {
     const size = THREE.MathUtils.clamp(p.size || 0.2, 0.08, 0.6);
     const core = new THREE.Mesh(this._geo.sphereLow, coreMat);
     if (p.kind === 'arrow') core.scale.set(size * 0.5, size * 0.5, size * 2.2);
+    else if (p.kind === 'spark') core.scale.set(size, size, size * 1.6); // wand Spark: a small bright elongated mote
     else core.scale.set(size, size, size * (p.kind === 'fireball' ? 1.3 : 1));
     root.add(core);
     const trailMat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.35, blending: THREE.AdditiveBlending, depthWrite: false });
@@ -1457,6 +1465,10 @@ export class Renderer {
         if (this.playerEntry) this.playerEntry.swingT = SWING_DURATION; // hero swings the held weapon
         break;
       case 'nova': this._fxNova(x, y, opts); break;
+      case 'sweep': // Staff Sweep: a quick violet ring over the 8 surrounding tiles + the hero swings the staff
+        this._fxNova(x, y, { radius: 1.6, color: opts.color !== undefined ? opts.color : 0xc9a6ff });
+        if (this.playerEntry) this.playerEntry.swingT = SWING_DURATION;
+        break;
       case 'dash': this._fxDash(x, y, opts); break;
       case 'hit': {
         const crit = !!opts.crit;

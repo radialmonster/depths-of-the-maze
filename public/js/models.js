@@ -309,6 +309,14 @@ export class Models {
           accent: [P('sphere', W, 0.14, [0, 0.72, 0])],
         };
         break;
+      case 'wand':
+        // A short tapered rod with a gold ferrule and a glowing tip crystal (clearly shorter than the staff).
+        spec = {
+          metal: [P('cylinder', GOLD, [0.05, 0.035, 0.05], [0, 0.1, 0]), P('torus', GOLD, [0.07, 0.07, 0.12], [0, 0.34, 0], [Math.PI / 2, 0, 0])],
+          wood: [P('cylinder', 0x4a2c1a, [0.032, 0.36, 0.032], [0, 0.17, 0]), P('cone', 0x4a2c1a, [0.035, 0.05, 0.035], [0, -0.03, 0], [Math.PI, 0, 0])],
+          accent: [P('octa', W, [0.1, 0.15, 0.1], [0, 0.4, 0])],
+        };
+        break;
       case 'bow':
         spec = {
           metal: [P('box', 0xf4f1e6, [0.012, 0.56, 0.012], [0, 0, -0.01])],
@@ -377,7 +385,7 @@ export class Models {
     entry._heldWeapon = hw;
     entry.materials.push(...hw.mats);
     // Per-kind resting grip angle (radians about the hand's x axis; ~1.2 = blade forward-up).
-    entry._gripRest = wk === 'staff' ? 0.12 : wk === 'bow' ? 0.15 : 1.15;
+    entry._gripRest = wk === 'staff' ? 0.12 : wk === 'bow' ? 0.15 : wk === 'wand' ? 0.9 : 1.15;
     if (o) {
       const ok = o.offhandKind || 'shield';
       const ho = this.buildHeld(ok, o.rarity, 'offhand');

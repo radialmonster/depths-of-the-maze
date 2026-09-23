@@ -33,6 +33,23 @@ const BOW_RANGE = 9;
 const BOW_SLOW_PCT = 0.22;
 const BOW_SLOW_DUR = 0.6;
 
+// Spark (wand, §9 / §17.12): the caster's free filler between mana spells — no mana, Cleave/Bow Shot cadence, a short
+// (~4 tile) armor-reduced magic shot off the int-scaled ranged row, with the same point-blank floor as Bow Shot.
+const SPARK_BASE_CD = CLEAVE_BASE_CD;
+const SPARK_SPEED = 16;
+const SPARK_RANGE = 4;
+const SPARK_RANGE_PERK = 1;   // rank 3: +1 tile of range
+
+// Staff Sweep (staff, §9): hits all 8 surrounding tiles off the int-scaled melee row; knockback away from the player
+// on crit (every hit from rank 3, like Cleave). A bit slower than Cleave since it covers far more tiles.
+const SWEEP_BASE_CD = 0.6;
+// The 8 tiles around the player (offsets), in a fixed order.
+export const SWEEP_OFFSETS = Object.freeze([
+  [-1, -1], [0, -1], [1, -1],
+  [-1, 0], [1, 0],
+  [-1, 1], [0, 1], [1, 1],
+].map(([x, y]) => Object.freeze({ x, y })));
+
 // Arcane Bolt damage comes from spell power (it used to read stats.rangedMin/Max, which also added a little dex;
 // that row now belongs to ranged weapons — §17.9). Same spell-power factors as before.
 const BOLT_SP_MIN = 0.8;
@@ -64,6 +81,10 @@ const DASH_INVULN_PER_RANK = 0.05;
 
 const NO_MANA_FLASH_THROTTLE = 0.6; // seconds between "No mana" float texts
 
+// Is the equipped weapon one this attack skill can use? Attack tooltips only quote numbers from the damage row when it
+// is, since that row belongs to whatever weapon is held (e.g. a wand's ranged row is not Bow Shot's damage).
+function heldBy(def, player) { return !player || (def.classes || []).includes(weaponClass(player)); }
+
 function rankMult(rank) { return 1 + (rank - 1) * RANK_DAMAGE_BONUS; }
 
 // Sums a numeric rankPerks key over every perk rank <= `rank` (booleans count as 1), e.g. Arcane Bolt's
@@ -84,8 +105,8 @@ function perkTotal(def, rank, key) {
 export const SLOT_CATEGORIES = ['attack', 'spell', 'special', 'movement'];
 
 // Weapon classes and their default attacks are derived from items.js WEAPON_KIND_INFO (the single weapon-kind table,
-// DESIGN §17.9) plus its unarmed/unlisted-kind fallback. Right now: melee1h (Cleave) and bow (Bow Shot); later phases
-// add melee2h / wand / staff by adding table entries. Every class must have a default attack skill in SKILL_DEFS
+// DESIGN §17.9) plus its unarmed/unlisted-kind fallback. Right now: melee1h (Cleave), bow (Bow Shot), wand (Spark)
+// and staff (Staff Sweep); a later phase adds melee2h (spear / Thrust) by adding a table entry. Every class must have a default attack skill in SKILL_DEFS
 // (validated at startup).
 const UNARMED_CLASS = FALLBACK_WEAPON_INFO.cls;
 export const WEAPON_CLASSES = [...new Set([UNARMED_CLASS, ...Object.values(WEAPON_KIND_INFO).map((i) => i.cls)])];
@@ -103,7 +124,7 @@ export function weaponClassName(cls) { return WEAPON_CLASS_NAMES[cls] || cls; }
 // category has an unconditional default, always known at rank >= 1.
 export const CATEGORY_DEFAULT = { spell: 'arcaneBolt', special: 'frostNova', movement: 'shadowDash' };
 
-// Equipped weapon's class via WEAPON_KIND_INFO; unarmed and kinds not in the table (staff, for now) -> melee1h.
+// Equipped weapon's class via WEAPON_KIND_INFO; unarmed and kinds not in the table -> melee1h.
 export function weaponClass(player) {
   return weaponClassOf(player && player.equipment && player.equipment.weapon);
 }
@@ -128,7 +149,7 @@ export const SKILL_DEFS = {
       const mult = rankMult(rank);
       const kb = perkTotal(this, rank, 'knockbackAlways') ? ' Knockback on hit.' : ' Knockback on crit.';
       // meleeMin is null while a non-melee weapon (bow) is equipped — the numbers would be meaningless.
-      if (stats.meleeMin == null) return `Deals melee weapon damage to 3 tiles in front.${kb}`;
+      if (stats.meleeMin == null || !heldBy(this, player)) return `Deals melee weapon damage to 3 tiles in front.${kb}`;
       const lo = Math.max(1, Math.round(stats.meleeMin * mult));
       const hi = Math.max(lo + 1, Math.round(stats.meleeMax * mult));
       return `Deals ${lo}-${hi} damage to 3 tiles in front.${kb}`;
@@ -146,11 +167,45 @@ export const SKILL_DEFS = {
       const slowPct = perkTotal(this, rank, 'slowPct');
       const slow = slowPct > 0 ? ` Slows by ${Math.round(slowPct * 100)}% for ${perkTotal(this, rank, 'slowDur')}s.` : '';
       const pierce = stats.pierce > 0 ? ` Pierces ${stats.pierce} ${stats.pierce > 1 ? 'enemies' : 'enemy'}.` : '';
-      if (stats.rangedMin == null) return `Fires an arrow for bow damage (reduced by armor).${pierce}${slow}`;
+      if (stats.rangedMin == null || !heldBy(this, player)) return `Fires an arrow for bow damage (reduced by armor).${pierce}${slow}`;
       const mult = rankMult(rank);
       const lo = Math.max(1, Math.round(stats.rangedMin * mult));
       const hi = Math.max(lo + 1, Math.round(stats.rangedMax * mult));
       return `Fires an arrow dealing ${lo}-${hi} damage, reduced by armor; only ${lo} point-blank.${pierce}${slow}`;
+    },
+  },
+  spark: {
+    id: 'spark', name: 'Spark', icon: '⚡',
+    description: 'Flicks a short-range arcane spark. Free to cast; armor reduces it; point-blank sparks hit weakly.',
+    category: 'attack', classes: ['wand'], aimed: true, range: SPARK_RANGE, element: 'arcane',
+    baseCooldown: SPARK_BASE_CD, manaCost: 0,
+    rankPerks: { 3: { rangeBonus: SPARK_RANGE_PERK, text: `Range +${SPARK_RANGE_PERK} tile.` } },
+    cast: castSpark,
+    describe(rank, player) {
+      const stats = (player && player.stats) || {};
+      const range = sparkRange(this, rank);
+      if (stats.rangedMin == null || !heldBy(this, player)) return `Fires a spark up to ${range} tiles for wand damage (reduced by armor). No mana.`;
+      const mult = rankMult(rank);
+      const lo = Math.max(1, Math.round(stats.rangedMin * mult));
+      const hi = Math.max(lo + 1, Math.round(stats.rangedMax * mult));
+      return `Fires a spark up to ${range} tiles dealing ${lo}-${hi} damage, reduced by armor; only ${lo} point-blank. No mana.`;
+    },
+  },
+  staffSweep: {
+    id: 'staffSweep', name: 'Staff Sweep', icon: '💫',
+    description: 'Sweeps the staff in a full circle, striking all 8 surrounding tiles.',
+    category: 'attack', classes: ['staff'], aimed: false, element: 'physical',
+    baseCooldown: SWEEP_BASE_CD, manaCost: 0,
+    rankPerks: { 3: { knockbackAlways: true, text: 'Knockback on every hit, not just crits.' } },
+    cast: castStaffSweep,
+    describe(rank, player) {
+      const stats = (player && player.stats) || {};
+      const kb = perkTotal(this, rank, 'knockbackAlways') ? ' Knockback on hit.' : ' Knockback on crit.';
+      if (stats.meleeMin == null || !heldBy(this, player)) return `Deals staff damage to all 8 surrounding tiles.${kb}`;
+      const mult = rankMult(rank);
+      const lo = Math.max(1, Math.round(stats.meleeMin * mult));
+      const hi = Math.max(lo + 1, Math.round(stats.meleeMax * mult));
+      return `Deals ${lo}-${hi} damage to all 8 surrounding tiles.${kb}`;
     },
   },
   arcaneBolt: {
@@ -522,17 +577,23 @@ export function boltDamageRange(player) {
 // Bow Shot: an arrow along the 4-way facing (DESIGN §17.1), nudged by aim assist (aimed:true). Damage and crit are
 // rolled at release; defense and the point-blank check happen at impact in main.js (projectileHitDamage, §17.12).
 // pointBlankDamage = the bottom of the roll (rangedMin x rank), never more than the rolled damage.
-function castBowShot(game, player, skill, rank) {
+// Release roll shared by every weapon-role shot off the ranged row (Bow Shot, Spark): rangedMin/Max x rank, +-15%
+// variance, crit at release. pointBlankDamage = the bottom of the roll, never more than the rolled damage (§17.12).
+export function rollWeaponShot(player, rank, rng) {
   const s = player.stats;
-  if (s.rangedMin == null) return false; // no ranged weapon (can't normally happen: bowShot is bow-class only)
-  const rng = game.rng;
   const mult = rankMult(rank);
   const lo = s.rangedMin * mult, hi = s.rangedMax * mult;
   const crit = rng.chance(s.critChance);
   let amount = rng.range(lo, hi) * (1 + rng.range(-0.15, 0.15));
   if (crit) amount *= s.critMult;
   amount = Math.max(1, Math.round(amount));
-  const pointBlankDamage = Math.min(amount, Math.max(1, Math.round(lo)));
+  return { amount, crit, pointBlankDamage: Math.min(amount, Math.max(1, Math.round(lo))) };
+}
+
+function castBowShot(game, player, skill, rank) {
+  const s = player.stats;
+  if (s.rangedMin == null) return false; // no ranged weapon (can't normally happen: bowShot is bow-class only)
+  const { amount, crit, pointBlankDamage } = rollWeaponShot(player, rank, game.rng);
 
   const facing = facingOf(player);
   const ox = player.fx ?? player.x, oy = player.fy ?? player.y;
@@ -559,6 +620,59 @@ function castBowShot(game, player, skill, rank) {
     });
   }
   return true; // like a swing: a shot into a wall still spends the cooldown
+}
+
+function sparkRange(def, rank) { return def.range + perkTotal(def, rank, 'rangeBonus'); }
+
+// Spark: a short weapon-role magic shot. Same release roll / point-blank / applyDefense plumbing as Bow Shot, off the
+// wand's int-scaled ranged row; aims like Arcane Bolt (free stick angle, player.aim) since it's a caster shot.
+function castSpark(game, player, skill, rank) {
+  const s = player.stats;
+  if (s.rangedMin == null) return false; // no ranged weapon (can't normally happen: spark is wand-class only)
+  const { amount, crit, pointBlankDamage } = rollWeaponShot(player, rank, game.rng);
+  const range = sparkRange(skill, rank);
+  const ox = player.fx ?? player.x, oy = player.fy ?? player.y;
+  const aim = assistAim(game, player, { aimed: skill.aimed, range }, player.aim || facingOf(player), ox, oy);
+
+  if (typeof game.spawnProjectile === 'function') {
+    game.spawnProjectile({
+      x: ox, y: oy, ox, oy,
+      dx: aim.x, dy: aim.y,
+      speed: SPARK_SPEED,
+      range,
+      damage: amount,
+      pointBlankDamage,
+      applyDefense: true,
+      crit,
+      owner: 'player',
+      color: '#7fe3ff',
+      size: 0.14,
+      pierce: 0,
+      kind: 'spark',
+      element: skill.element,
+    });
+  }
+  return true; // like a swing: a spark into a wall still spends the cooldown
+}
+
+// Staff Sweep: the Cleave damage path (computeDamage -> armor at hit) over the 8 surrounding tiles instead of an arc.
+function castStaffSweep(game, player, skill, rank) {
+  if (player.stats.meleeMin == null) return false; // can't normally happen: staff is a melee-role weapon
+  const mult = rankMult(rank);
+  const knockbackAlways = perkTotal(skill, rank, 'knockbackAlways') > 0;
+  const rng = game.rng;
+  const { critChance, critMult } = player.stats;
+  for (const o of SWEEP_OFFSETS) {
+    const enemy = typeof game.enemyAt === 'function' ? game.enemyAt(player.x + o.x, player.y + o.y) : null;
+    if (!enemy) continue;
+    const power = rng.range(player.stats.meleeMin, player.stats.meleeMax) * mult;
+    const { amount, crit } = computeDamage(power, enemy.defense, rng, critChance, critMult);
+    const opts = { crit, source: 'melee', element: skill.element };
+    if (knockbackAlways || crit) opts.knockback = { x: o.x, y: o.y }; // straight away from the player
+    if (typeof game.damageEnemy === 'function') game.damageEnemy(enemy, amount, opts);
+  }
+  if (typeof game.effect === 'function') game.effect('sweep', player.x, player.y, {});
+  return true; // a whiffed sweep still spends the cooldown, like Cleave
 }
 
 function castArcaneBolt(game, player, skill, rank) {

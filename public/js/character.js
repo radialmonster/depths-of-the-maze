@@ -10,9 +10,9 @@ import { weaponInfo } from './items.js';
 // Attribute metadata for the Character (C) panel.
 // ---------------------------------------------------------------------------
 export const ATTRIBUTES = [
-  { id: 'str', name: 'Strength', description: 'Increases melee damage and adds a small amount of max HP.' },
+  { id: 'str', name: 'Strength', description: 'Increases sword, axe, mace and dagger damage and adds a small amount of max HP.' },
   { id: 'dex', name: 'Dexterity', description: 'Increases bow damage, crit chance, dodge chance, and move speed slightly. Improves Aim.' },
-  { id: 'int', name: 'Intelligence', description: 'Increases max mana, spell power, and mana regen.' },
+  { id: 'int', name: 'Intelligence', description: 'Increases max mana, spell power, mana regen, and wand and staff damage.' },
   { id: 'vit', name: 'Vitality', description: 'Increases max HP and HP regen.' },
   { id: 'def', name: 'Defense', description: 'Reduces incoming damage (diminishing returns).' },
 ];
@@ -31,7 +31,7 @@ const MANA_PER_LEVEL = 2;
 const FIST_MIN = 1;
 const FIST_MAX = 3;
 // Class attribute points -> flat damage added on top of weapon damageMin/Max, for whichever row the weapon's role
-// feeds (melee: str, bow: dex — WEAPON_KIND_INFO.scale). Same 0.8 factor for every role (§17.9).
+// feeds (melee1h: str, bow: dex, wand/staff: int — WEAPON_KIND_INFO.scale). Same 0.8 factor for every role (§17.9).
 const WEAPON_ATTR_SCALE = 0.8;
 
 const DEFENSE_K = 1.0; // mitigate(): raw * 100/(100+defense*k)
@@ -183,8 +183,9 @@ export function recalcStats(player) {
   const maxMana = Math.round(BASE_MANA + (lvl - 1) * MANA_PER_LEVEL + int_ * MANA_PER_INT + maxManaBonus + buffMaxMana);
 
   // Damage rows (§17.9): the weapon's damage feeds only the row matching its role, plus that class's attribute
-  // x0.8. The other row is null ("not applicable" — the Character screen shows it as a dimmed "—"). Unarmed (and
-  // any weapon kind not in WEAPON_KIND_INFO, e.g. staff for now) is melee/str. Arcane Bolt no longer reads either
+  // x0.8 (melee1h: str, staff: int, bow: dex, wand: int). The other row is null ("not applicable" — the Character
+  // screen shows it as a dimmed "—"). Unarmed (and
+  // any weapon kind not in WEAPON_KIND_INFO) is melee/str. Arcane Bolt no longer reads either
   // row — its damage comes from spellPower in its own skill definition (skills.js boltDamageRange).
   const info = weaponInfo(equipmentSlots.weapon);
   const attrs = { str, dex, int: int_ };

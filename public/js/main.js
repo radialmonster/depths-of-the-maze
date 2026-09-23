@@ -6,7 +6,7 @@ import { Renderer } from './renderer.js';
 import { createPlayer, recalcStats, gainXP, mitigate, updatePlayer, projectileHitDamage } from './character.js';
 import { createSkillState, normalizeSkillState, useSkill, updateSkills } from './skills.js';
 import { spawnEnemies, updateEnemies, createEnemy, getResist, applySlow } from './enemies.js';
-import { rollLoot, startingGear, addToInventory, useItem, generateItem, activePotion, enforceTwoHanded } from './items.js';
+import { rollLoot, startingGear, addToInventory, useItem, generateItem, activePotion, enforceTwoHanded, refreshItemIcon } from './items.js';
 import { Input } from './input.js';
 import { UI, padLabel } from './ui.js';
 import { sfx, wireAudio } from './audio.js';
@@ -383,14 +383,18 @@ function continueGame(data) {
     // Bump the id counter past every id in the restored equipment/inventory so new items,
     // enemies and projectiles created from here on never collide with a saved id.
     let maxId = 0;
-    for (const item of p.inventory) if (item && typeof item.id === 'number') maxId = Math.max(maxId, item.id);
+    for (const item of p.inventory) {
+      if (item && typeof item.id === 'number') maxId = Math.max(maxId, item.id);
+      refreshItemIcon(item);
+    }
     for (const slot in p.equipment) {
       const item = p.equipment[slot];
       if (item && typeof item.id === 'number') maxId = Math.max(maxId, item.id);
+      refreshItemIcon(item);
     }
     bumpUid(maxId);
 
-    // Saves from before bows were two-handed may hold a bow + off-hand: move the off-hand to the bag (§17.9).
+    // Saves from before bows/staves were two-handed may hold a bow or staff + off-hand: move the off-hand to the bag (§17.9).
     const strayOffhand = enforceTwoHanded(p);
     recalcStats(p);
     p.hp = clamp(sp.hp ?? p.stats.maxHp, 0, p.stats.maxHp);

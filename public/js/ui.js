@@ -94,7 +94,7 @@ const DERIVED = [
   { k: 'maxHp', label: 'Max HP', icon: '❤️' },
   { k: 'maxMana', label: 'Max Mana', icon: '💧' },
   { k: 'melee', label: 'Melee', icon: '⚔️' },
-  { k: 'ranged', label: 'Ranged', icon: '🏹' }, // bow damage (§17.9); melee/ranged not in use shows a dimmed "—"
+  { k: 'ranged', label: 'Ranged', icon: '🏹' }, // bow / wand damage (§17.9); melee/ranged not in use shows a dimmed "—"
   { k: 'spellPower', label: 'Spell Power', icon: '✨' },
   { k: 'defense', label: 'Defense', icon: '🛡️' },
   { k: 'dodgeChance', label: 'Dodge', icon: '🌀' },
@@ -1954,7 +1954,7 @@ export class UI {
   }
 
   // Slot 1's weapon-class row: every class's remembered attack pick, the equipped class marked, the class the list is
-  // editing highlighted. Hidden while only one weapon class exists (now: melee1h + bow, so it shows).
+  // editing highlighted. Hidden while only one weapon class exists (now: melee1h, bow, wand, staff, so it shows).
   _refreshClassChips(card, p, model) {
     const show = WEAPON_CLASSES.length > 1;
     card.classes.style.display = show ? '' : 'none';

@@ -95,7 +95,7 @@ game = {
   applyDefense /*bool — true = reduced by target defense like a melee hit (weapon shots); false = ignores defense (spells)*/,
   slow:{pct,dur}|null /*applied to the enemy on hit, via applySlow(), see §17.6*/,
   owner:'player'|'enemy', color:'#hex', size /*0.1-0.5*/, pierce:0,
-  kind:'arrow'|'bolt'|'fireball'|'enemyBolt', hit:Set }
+  kind:'arrow'|'spark'|'bolt'|'fireball'|'enemyBolt', hit:Set }
 ```
 main.js moves projectiles, stops them at walls, and calls damageEnemy / damagePlayer on hit. Damage and crit are rolled
 when the projectile is fired (so the crit feel happens at release); `applyDefense` and the point-blank check are
@@ -231,7 +231,9 @@ Every skill in a category must follow that category's rules, so a new addition n
 
 Launch attack skills: **Cleave** (1H melee, str; arc on facing tile + the two beside it, knockback), **Bow Shot**
 (bow, dex; ranged, armor-reduced, point-blank penalty, rank-3 slow — §17.12), **Spark** (wand, int; free/no-mana
-short-range magic shot, armor-reduced), **Staff Sweep** (staff, int; hits all 8 surrounding tiles + knockback).
+short-range (4 tiles) arcane shot, armor-reduced, same point-blank penalty as Bow Shot, rank 3: +1 tile range; aims
+along `player.aim` like Arcane Bolt), **Staff Sweep** (staff, int; hits all 8 surrounding tiles, knockback straight
+away from the player on crit — every hit from rank 3, like Cleave; 0.6s base cooldown).
 Spell/special/movement at launch: **Arcane Bolt** (projectile, piercing at higher ranks), **Frost Nova** (AoE radius
 ~2.5, damage + slow/freeze, mana heavy), **Shadow Dash** (dash up to 3 tiles through free tiles, 0.4s invuln, short CD).
 See §17.10 for the loadout/unlock system these plug into.
@@ -356,7 +358,8 @@ export class Renderer {
   update(game, dt)              // sync meshes to game.player / enemies / groundItems / projectiles (Map<obj.id, mesh>; create/remove as needed),
                                 // lerp positions, facing rotation, hit flash, death anim, fog-of-war from map.visible/explored, camera follow
   render()
-  spawnEffect(type, x, y, opts) // 'slash'(opts.dir), 'nova'(opts.radius), 'dash'(opts.from), 'hit', 'death', 'levelup', 'heal', 'pickup', 'exit'
+  spawnEffect(type, x, y, opts) // 'slash'(opts.dir), 'nova'(opts.radius), 'sweep' (Staff Sweep ring + hero swing), 'dash'(opts.from),
+                                //   'hit', 'death', 'levelup', 'heal', 'pickup', 'exit'
   floatText(x, y, text, color)  // rising fading damage numbers (DOM or sprite)
   shake(intensity)
   revealTile(x, y)              // hides one wall block + adds a door frame in its place, with a shimmer effect;
@@ -418,8 +421,8 @@ Decisions made with the user while building. Keep this section current — when 
   attack. This replaces an earlier "brush-past" rule that attacked on any incidental collision-block regardless of
   aim; that fired on the ordinary "walk around an enemy" gesture (an accidental swing for melee, an accidental
   point-blank arrow for a bow) and was removed. Don't widen the 40° cone — that would effectively bring it back.
-- Arcane Bolt fires along the exact stick angle (`player.aim`); tile-based attack skills (Cleave, Bow Shot, Staff
-  Sweep) and Dash use the nearest 4-way `facing`.
+- Arcane Bolt and Spark (the caster shots) fire along the exact stick angle (`player.aim`); tile-based attack skills
+  (Cleave, Bow Shot, Staff Sweep) and Dash use the nearest 4-way `facing`.
 - Keys: 1-4 skills · 5 / LT health potion · 6 / RT mana potion (H/M are no longer bound) · C / LB character ·
   I, Tab / RB bag · E, Enter, Space / A
   confirm & **Trade** (near a merchant A trades instead of Cleaving) · U mute · Esc, P / Start pause.
@@ -612,7 +615,7 @@ must be ≥1.1× a same-level wand+orb combo, or wand+orb strictly dominates and
 
 **Implementation notes (Phase 4 — bow):**
 - `WEAPON_KIND_INFO` has real entries only for sword/axe/mace/dagger (`melee1h`) and bow. Any kind not in the table —
-  today only **staff** — and unarmed use `FALLBACK_WEAPON_INFO` (1H, melee, str, `melee1h`, Cleave), i.e. staff keeps
+  at the time only **staff** (Phase 5 gave it an entry) — and unarmed use `FALLBACK_WEAPON_INFO` (1H, melee, str, `melee1h`, Cleave), i.e. staff keeps
   behaving exactly as before until Phase 5 adds its entry. skills.js derives `WEAPON_CLASSES` and
   `CLASS_DEFAULT_ATTACK` from this table + fallback (the old `KIND_CLASS` shim is gone), and the registry validator
   checks each entry's `defaultAttack` matches its class default.
@@ -626,6 +629,45 @@ must be ≥1.1× a same-level wand+orb combo, or wand+orb strictly dominates and
   items.js via `setAttackSkillResolver` (items.js can't import skills.js without an import cycle).
 - Saves from before bows were two-handed can hold bow + off-hand: Continue moves the off-hand to the bag
   (`enforceTwoHanded`), or drops it at the player's feet if the bag is full.
+
+**Implementation notes (Phase 5 — wand/staff):**
+- Adding a weapon kind = one `WEAPON_KIND_INFO` row (`wand: {hands:1, cls:'wand', role:'ranged', scale:'int',
+  defaultAttack:'spark'}`, `staff: {hands:2, cls:'staff', role:'melee', scale:'int', defaultAttack:'staffSweep'}`) + its
+  default attack in `SKILL_DEFS` + items.js data (`WEAPON_KINDS`, `ICONS`, `WEAPON_NAMES` tier names, a
+  `weaponBaseStats` case) + a `buildHeld` case (models.js, plus a `_gripRest` angle) and a ground-loot case
+  (renderer.js `_buildItemModel`'s switch) + a `skillUsed` sound in `wireAudio`. Everything else followed with no
+  code change: character.js's damage rows (generic on `info.role`/`info.scale` — confirmed, no Phase 4 bug), the 2H
+  itemization tier / price and equip rules (staff now evicts the off-hand, is refused with a full bag, locks the off-hand
+  slot), `WEAPON_CLASSES`/`CLASS_DEFAULT_ATTACK`, the registry validator, the Skills tab class chips and "Requires
+  {class}" dimming, compareGear's ⇄ swap and quick-equip's same-class rule.
+- The fallback now only covers unarmed and unknown kinds (e.g. from a future/old save). `FALLBACK_WEAPON_INFO` is kept.
+- **Spark** reuses Bow Shot's weapon-shot plumbing via a shared `rollWeaponShot(player, rank, rng)` (release roll off
+  `rangedMin/Max` × rank, crit at release, `pointBlankDamage` = bottom of the roll), `applyDefense:true`, `ox/oy`, and
+  main.js's existing `projectileHitDamage` at impact — no parallel mechanism. Projectile `kind:'spark'` (small bright
+  elongated mote in renderer.js). Range 4 (+1 at rank 3; aim assist uses the ranked range). Because a wand's ranged row
+  is mostly `int × 0.8` with a narrow weapon spread, Spark's point-blank floor is only ~5-10% under its average (e.g. 27 vs a 27-31 roll at L10, 25 int) — the
+  penalty is real but mild for wands (bows have a wider spread). Tune `weaponBaseStats('wand')` spread if it should bite
+  harder.
+- **Staff Sweep** is Cleave's damage path (per-target `rng.range(meleeMin, meleeMax) × rank` → `computeDamage` → armor at
+  hit, `source:'melee'`) over `SWEEP_OFFSETS` (the 8 neighbours) instead of an arc. Knockback vector = the tile offset
+  (diagonals push diagonally); `damageEnemy` only moves it if the destination is free. Effect `'sweep'` (violet ring,
+  radius 1.6, + hero swing).
+- **Wand base stats** (1H, no tier mult): damage `1 + L×0.6` to `+1.5 + L×0.25` above that, spellPower `1.5 + L×0.7`,
+  int `1 + L×0.4`. Wand and staff keep baseline spell power (they're the caster weapons — the Phase 4 "no baseline spell
+  power" rule is bow-only).
+- **Staff spell power raised** from `2 + L×1.0` to `3 + L×1.35` (then ×1.5 as 2H) to satisfy the ≥1.1× rule above.
+  With the old formula a staff was only ~0.88-0.94× a wand + orb (~0.99-1.03× counting int). Now (common, before
+  affixes) staff raw spell power
+  `4.5 + 2.025L` vs wand+orb `3.5 + 1.6L` ≈ **1.27×** at every level; counting int (the Spell Power stat adds int × 0.8)
+  staff ≈ 1.31-1.32× vs wand+orb and ≈ 1.18-1.22× vs wand+tome (the stronger combo once int counts). Covered for
+  L1-60 by test/items.test.js via the exported `baseStatsFor(type, kind, lvl)`.
+- Staff icon changed 🪄 → 🦯 (🪄 is now the wand). Saved items keep their generated icon, so Continue re-derives weapon
+  icons from the current table (`refreshItemIcon`, main.js restore). A pre-Phase-5 save holding a staff + off-hand gets
+  the off-hand moved to the bag by the existing `enforceTwoHanded`.
+- Attack-skill tooltips only quote numbers while their own class is held (`heldBy` in skills.js) — with four classes
+  a wand's ranged row was showing up as Bow Shot's damage, and a staff's melee row as Cleave's.
+- Strength/Intelligence attribute descriptions now say which weapons they scale (str: sword/axe/mace/dagger; int: wand
+  and staff damage).
 
 ### 17.10 Skill slots & the loadout system
 Slots keep a fixed category (attack/spell/special/movement, §9) but which concrete skill occupies each one is
@@ -685,7 +727,7 @@ No random enemy drops. Three sources, all via the `skillbook` item type (§11):
   (used) even without the required weapon equipped — they just show greyed out in the Skills tab until you equip it.
 
 ### 17.12 Combat: armor on weapon shots, point-blank, and slow strength
-- **Weapon-role projectiles** (Bow Shot, Volley, Spark) set `applyDefense:true` and are reduced by the target's
+- **Weapon-role projectiles** (Bow Shot, Volley, Spark — Spark is `element:'arcane'` but still a weapon attack) set `applyDefense:true` and are reduced by the target's
   defense at hit time, the same formula as a melee hit (`× 100/(100+def)`) — consistent with "physical/weapon damage
   is mitigated by armor, spells bypass it" (§17.6). Damage and crit are still rolled at *release* so the crit feel
   stays there; only the defense reduction (and point-blank check, below) happens on impact. True spells (Arcane Bolt,
