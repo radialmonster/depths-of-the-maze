@@ -42,8 +42,8 @@ const CRIT_CHANCE_PER_DEX = 0.002;
 const DODGE_CHANCE_BASE = 0.0;
 const DODGE_CHANCE_PER_DEX = 0.0015;
 const DODGE_CHANCE_MAX = 0.35;
-// Arcane Bolt auto-aim assist: fraction the fired direction is blended toward the nearest enemy ahead
-// (skills.js castArcaneBolt). Linear per dex, capped small: 0.5% at base 5 dex, hits 20% at 200 dex.
+// Aim assist: fraction the fired direction of any aimed:true skill is blended toward the nearest enemy ahead
+// (skills.js assistAim). Linear per dex, capped small: 0.5% at base 5 dex, hits 20% at 200 dex.
 const AUTO_AIM_PER_DEX = 0.001;
 const AUTO_AIM_MAX = 0.20;
 
@@ -85,12 +85,17 @@ export function createPlayer() {
       manaRegen: MANA_REGEN_BASE,
       dodgeChance: DODGE_CHANCE_BASE,
       autoAimAssist: 0,
+      cooldownReduction: 0,
     },
     equipment: { weapon: null, offhand: null, helm: null, armor: null, boots: null, ring: null, amulet: null },
     inventory: [],
     activeHealPotionId: null, // hotbar potion pins (items.js activePotion); null = strongest first
     activeManaPotionId: null,
-    skills: [],
+    // Skills (skills.js, DESIGN §8/§17.10). main.js seeds skillState via createSkillState() / normalizeSkillState()
+    // — skills.js treats an empty `known` as "defaults at rank 1", so this bare shape still resolves every slot.
+    skillState: { known: {}, loadout: { attack: {} } },
+    skillCooldowns: {},   // { [skillId]: { t, max } } — runtime only, not saved
+    bossesDefeated: [],   // boss type ids killed this run (saved; populated by a later phase — §17.11)
     moveTimer: 0,
     invuln: 0,
     hitFlash: 0,
@@ -117,7 +122,7 @@ export function recalcStats(player) {
   // Equipment aggregate.
   let armor = 0, damageMin = 0, damageMax = 0, spellPower = 0;
   let maxHpBonus = 0, maxManaBonus = 0, critChanceBonus = 0;
-  let hpRegenBonus = 0, manaRegenBonus = 0, moveSpeedBonus = 0;
+  let hpRegenBonus = 0, manaRegenBonus = 0, moveSpeedBonus = 0, cooldownReductionBonus = 0;
   let hasWeapon = false;
 
   const equipmentSlots = player.equipment || {};
@@ -140,6 +145,7 @@ export function recalcStats(player) {
     if (s.hpRegen) hpRegenBonus += s.hpRegen;
     if (s.manaRegen) manaRegenBonus += s.manaRegen;
     if (s.moveSpeed) moveSpeedBonus += s.moveSpeed;
+    if (s.cooldownReduction) cooldownReductionBonus += s.cooldownReduction; // no gear rolls this yet
   }
 
   // Buffs (temporary stat deltas, keys match player.stats or raw attrs — support both).
@@ -184,6 +190,8 @@ export function recalcStats(player) {
 
   const dodgeChance = clamp(DODGE_CHANCE_BASE + dex * DODGE_CHANCE_PER_DEX, 0, DODGE_CHANCE_MAX);
   const autoAimAssist = clamp(dex * AUTO_AIM_PER_DEX, 0, AUTO_AIM_MAX);
+  // Skill cooldown reduction (0..0.4 — also clamped again in skills.js effectiveCooldown()).
+  const cooldownReduction = clamp(cooldownReductionBonus, 0, 0.4);
 
   const hpRegen = HP_REGEN_BASE + vit * HP_REGEN_PER_VIT + hpRegenBonus;
   const manaRegen = MANA_REGEN_BASE + int_ * MANA_REGEN_PER_INT + manaRegenBonus;
@@ -202,6 +210,7 @@ export function recalcStats(player) {
     hpRegen, manaRegen,
     dodgeChance,
     autoAimAssist,
+    cooldownReduction,
   };
 
   // Clamp current hp/mana to new caps without healing.

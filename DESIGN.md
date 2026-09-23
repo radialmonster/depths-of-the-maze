@@ -89,10 +89,17 @@ game = {
 ```
 ### 6.1 Projectile
 ```js
-{ id, x, y /*float*/, dx, dy /*unit dir*/, speed /*tiles/s*/, range /*tiles*/, traveled,
-  damage, crit, owner:'player'|'enemy', color:'#hex', size /*0.1-0.5*/, pierce:0, kind:'arrow'|'bolt'|'fireball'|'enemyBolt', hit:Set }
+{ id, x, y /*float*/, ox, oy /*origin tile, float — for point-blank distance*/, dx, dy /*unit dir*/,
+  speed /*tiles/s*/, range /*tiles*/, traveled,
+  damage, pointBlankDamage /*dmg used if it hits within POINT_BLANK_RANGE (~1.5) of ox,oy*/, crit,
+  applyDefense /*bool — true = reduced by target defense like a melee hit (weapon shots); false = ignores defense (spells)*/,
+  slow:{pct,dur}|null /*applied to the enemy on hit, via applySlow(), see §17.6*/,
+  owner:'player'|'enemy', color:'#hex', size /*0.1-0.5*/, pierce:0,
+  kind:'arrow'|'bolt'|'fireball'|'enemyBolt', hit:Set }
 ```
-main.js moves projectiles, stops them at walls, and calls damageEnemy / damagePlayer on hit.
+main.js moves projectiles, stops them at walls, and calls damageEnemy / damagePlayer on hit. Damage and crit are rolled
+when the projectile is fired (so the crit feel happens at release); `applyDefense` and the point-blank check are
+resolved at hit time (see §17.12).
 
 ## 7. Map (map.js)
 ```js
@@ -139,29 +146,86 @@ player = {
   level:1, xp:0, attrPoints:0, skillPoints:0, gold:0,
   base: { str, dex, int, vit, def },           // spendable attributes
   hp, mana,
-  stats: { maxHp, maxMana, meleeMin, meleeMax, rangedMin, rangedMax, spellPower, defense, critChance, critMult,
+  stats: { maxHp, maxMana,
+           meleeMin, meleeMax,  // weapon dmg + STR*0.8; null when the equipped weapon's role isn't melee (§17.9)
+           rangedMin, rangedMax, // weapon dmg + (DEX or INT)*0.8; null when the role isn't ranged
+           spellPower, defense, critChance, critMult,
            moveCooldown /*s per tile, ~0.14*/, hpRegen, manaRegen /*per s*/, dodgeChance,
-           autoAimAssist /*0..0.20, dex-driven ranged-skill aim nudge (currently Arcane Bolt), see §17.5*/ },
+           cooldownReduction /*0..0.4, clamps effectiveCooldown() — see §17.10*/,
+           autoAimAssist /*0..0.20, dex-driven aim nudge for any skill with aimed:true, see §17.5*/ },
   equipment: { weapon:null, offhand:null, helm:null, armor:null, boots:null, ring:null, amulet:null },
   inventory: [],               // max 24 item objects (INVENTORY_SIZE exported)
-  skills: [skill, skill, skill, skill],        // from skills.js createSkillLoadout()
+  skillState: {
+    known: { [skillId]: rank },     // learned skills and their individual ranks (1-5) — see §17.10
+    loadout: {
+      attack: { melee1h, melee2h, bow, wand, staff },  // skill id assigned to slot 1 per weapon class
+      spell, special, movement,                        // skill id assigned to slots 2-4
+    },
+  },
+  skillCooldowns: { [skillId]: { t, max } },  // NOT saved — current cooldown timer per skill id
+  bossesDefeated: [bossTypeId],   // saved; drives boss-unique skill-book drops, see §17.11
   moveTimer:0, invuln:0, hitFlash:0, dead:false, buffs:[]
 }
 ```
 
 ## 9. Skills (skills.js)
+
+### Registry
+Skill **definitions** are static data keyed by id, never saved (so a save never freezes old balance numbers):
 ```js
-export function createSkillLoadout() -> [4 skill objects]
-export function useSkill(game, index) -> bool  // checks cooldown/mana/dead; performs effect via game API; sets cooldown
-export function updateSkills(game, dt)
-export function upgradeSkill(player, index) -> bool   // spends 1 skillPoint, rank++ (max 5)
-export function skillDescription(skill, player) -> string  // for tooltips / C panel
-skill = { id, key:'1'..'4', name, icon /*emoji*/, description, type:'melee'|'ranged'|'special'|'dodge',
-          rank:1, maxRank:5, cooldown /*current timer*/, baseCooldown, manaCost }
+SKILL_DEFS = { [id]: {
+  id, name, icon /*emoji*/, description,
+  category: 'attack'|'spell'|'special'|'movement',   // decides which HUD slot (1-4) it can occupy
+  classes,      // attack skills only: which weapon classes (§17.9) can use this skill — e.g. ['bow']
+  aimed,        // bool — true = eligible for dex/int aim-assist (§17.5), uses this skill's own range
+  element,      // 'physical'|'arcane'|'frost'|'fire'|'poison'|'lightning'
+  baseCooldown, manaCost,
+  rankPerks,    // per-rank bonuses beyond the shared curve (see below)
+  cast(game, player, skill, rank),  // performs the effect via the game API
+} }
 ```
-Slots: 1 Cleave (melee arc on facing tile + the two tiles beside it, knockback) · 2 Arcane Bolt (projectile, piercing at higher ranks)
-· 3 Frost Nova (AoE radius ~2.5, damage + slow/freeze enemies, mana heavy) · 4 Shadow Dash (dash up to 3 tiles in facing dir through
-free tiles, 0.4s invuln, short CD).
+Every weapon **class** (`melee1h`, `melee2h`, `bow`, `wand`, `staff` — see §17.9) has exactly one default attack skill
+that is always known and eligible with no unlock required (Cleave, Thrust, Bow Shot, Spark, Staff Sweep). Slots 2-4
+each have a default with no weapon requirement (Arcane Bolt, Frost Nova, Shadow Dash). **This is a permanent rule,
+enforced at startup with a loud error if violated, and covered by a unit test**: every slot must always resolve to a
+usable skill no matter what's equipped or known — a weapon-restricted skill can only ever add an option, never be a
+slot's only option (§17.10).
+
+### API
+```js
+export function activeSkill(player, slotIndex) -> skillDef   // resolves what's actually in a slot right now (§17.10)
+export function useSkill(game, index) -> bool   // checks cooldown/mana/dead; calls activeSkill(...).cast(...); sets cooldown
+export function updateSkills(game, dt)          // ticks player.skillCooldowns
+export function upgradeSkill(player, skillId) -> bool   // spends 1 skillPoint, that skill's known rank++ (max 5)
+export function assignSkill(player, categoryOrClass, skillId) -> bool  // Skills-tab picker: sets loadout.attack[class] or loadout[category]
+export function learnSkill(player, skillId) -> bool     // from a skill book: adds to known (or +1 rank if already known, capped 5)
+export function skillDescription(skillId, rank, player) -> string  // for tooltips / Skills tab
+export function effectiveCooldown(skillDef, rank, player) -> number  // base * 0.95^(rank-1) * (1 - clamp(cooldownReduction,0,0.4))
+```
+`useSkill`/the HUD/the bump-attack in main.js only ever go through `activeSkill()` — none of them know which concrete
+skill id is in a slot.
+
+### Rank curve
+Every skill shares +15% damage/rank and −5% cooldown/rank (via `effectiveCooldown`); each skill's `rankPerks` layers
+extra effects on top at specific ranks (e.g. Cleave/Staff Sweep gain knockback on every hit at rank 3, not just crits;
+Bow Shot gains an on-hit slow at rank 3; Arcane Bolt pierces +1 enemy at rank 3 and +1 more at rank 5).
+
+### Slots and their category rules
+Every skill in a category must follow that category's rules, so a new addition never needs special-casing elsewhere:
+
+| Slot | Category | Default skill | Rules |
+|---|---|---|---|
+| 1 | Attack | Weapon-class-dependent (§17.9) | No mana cost; short cooldown; uses weapon damage; must work when triggered by walking into an adjacent enemy |
+| 2 | Spell | Arcane Bolt | Costs mana; ignores armor (`applyDefense:false`); has an element |
+| 3 | Special | Frost Nova | Long cooldown; high impact (area damage or crowd control) |
+| 4 | Movement | Shadow Dash | Moves the player; gives brief invulnerability or an escape |
+
+Launch attack skills: **Cleave** (1H melee, str; arc on facing tile + the two beside it, knockback), **Bow Shot**
+(bow, dex; ranged, armor-reduced, point-blank penalty, rank-3 slow — §17.12), **Spark** (wand, int; free/no-mana
+short-range magic shot, armor-reduced), **Staff Sweep** (staff, int; hits all 8 surrounding tiles + knockback).
+Spell/special/movement at launch: **Arcane Bolt** (projectile, piercing at higher ranks), **Frost Nova** (AoE radius
+~2.5, damage + slow/freeze, mana heavy), **Shadow Dash** (dash up to 3 tiles through free tiles, 0.4s invuln, short CD).
+See §17.10 for the loadout/unlock system these plug into.
 
 ## 10. Enemies (enemies.js)
 ```js
@@ -172,29 +236,36 @@ enemy = { id, type, name, x, y, facing, hp, maxHp, attack, defense, xp, gold:[mi
           moveCooldown, moveTimer, attackCooldown, attackTimer, aggroRange, behavior:'melee'|'ranged'|'coward'|'swarm'|'boss',
           state:'idle'|'wander'|'chase'|'flee'|'attack'|'return', home:{x,y},
           visual:{ shape:'slime'|'skeleton'|'bat'|'goblin'|'spider'|'mage'|'ogre'|'boss', color:'#hex', scale },
-          slow:0 /*timer*/, frozen:0, hitFlash:0, dead:false, deathTimer:0, elite:bool }
+          slow:0 /*timer*/, slowPct:0 /*0..0.75, current slow strength — see applySlow() in §17.12*/,
+          frozen:0, hitFlash:0, dead:false, deathTimer:0, elite:bool }
 ```
 Behaviors: idle/wander near home; chase when player within aggroRange + line of sight; give up after losing player; cowards flee
 at low HP (or always keep distance); ranged keep 3–5 tiles away and shoot `enemyBolt` projectiles; bosses have patterns.
 Enemies attack adjacent (orthogonal) player via `game.damagePlayer(amount, enemy)`. Pathfinding: BFS/A* on grid, occupancy via `game.isFree`.
+`effMoveCooldown = moveCooldown / (1 - slowPct)`, capped at `slowPct <= 0.75` so nothing is ever fully immobilized (§17.6).
 
 ## 11. Items (items.js)
 ```js
 export const INVENTORY_SIZE = 24
 export function generateItem(depth, rng, opts={}) -> item   // opts {slot, rarity, type}
 export function rollLoot(enemy, depth, rng) -> [item|{type:'gold',amount}]
-export function equipItem(player, item) -> bool   // from inventory; swaps with equipped; recalcStats
+export function equipItem(player, item) -> bool   // from inventory; swaps with equipped; handles 2H off-hand eviction (§17.9); recalcStats
 export function unequipItem(player, slot) -> bool
-export function useItem(game, item) -> bool       // potions: heal/mana; consumed
+export function useItem(game, item) -> bool       // potions: heal/mana; skillbook: learnSkill(); consumed
 export function dropItem(game, item)              // from inventory to ground at player
 export function sellValue(item)
 export function itemTooltip(item, player) -> HTML string (with compare vs equipped)
 export function startingGear() -> {equipment, inventory}
-item = { id, name, type:'weapon'|'offhand'|'helm'|'armor'|'boots'|'ring'|'amulet'|'potion', slot, rarity, icon /*emoji*/,
+item = { id, name, type:'weapon'|'offhand'|'helm'|'armor'|'boots'|'ring'|'amulet'|'potion'|'skillbook',
+         slot, rarity, icon /*emoji*/,
          itemLevel, stats:{ str, dex, int, vit, def, armor, damageMin, damageMax, spellPower, maxHp, maxMana, critChance, hpRegen, manaRegen, moveSpeed },
-         potion:{ heal, mana } (potions only), stack (potions), value, weaponKind:'sword'|'axe'|'mace'|'dagger'|'staff'|'bow' }
+         potion:{ heal, mana } (potions only), stack (potions), value,
+         weaponKind:'sword'|'axe'|'mace'|'dagger'|'staff'|'bow'|'wand',  // ('spear' reserved for later, not itemized yet — §17.9
+         skillId (skillbook only) }             // which skill this book teaches; unique-boss books are legendary-coloured
 ```
-Only non-zero stats present. Rarity multiplies stats & adds affixes; names like "Rare Vicious Axe of the Bear".
+Only non-zero stats present. Rarity multiplies stats & adds affixes; names like "Rare Vicious Axe of the Bear". Skill
+books are never merchant stock, and can be sold/bought back like any item. See §17.9 for weapon-kind itemization and
+§17.11 for how skill books are obtained.
 
 ## 12. Input (input.js)
 ```js
@@ -212,8 +283,11 @@ export class Input {
                                    // (the DualSense reports "DualSense Wireless Controller (STANDARD GAMEPAD Vendor: 054c Product: 0ce6)").
                                    // Button MAPPING never changes — only ui.js label glyphs (see §17.1).
 }
-actions: 'skill1'..'skill4' (1-4 / J K L Space? / gamepad A,X,B,Y → 1,2,3,4 respectively: A=skill1 Cleave, X=skill2 Bolt, Y=skill3 Nova, B=skill4 Dash)
-         'character' (C / gamepad Back/View or LB), 'inventory' (I / gamepad RB), 'pause' (Esc, P / Start),
+actions: 'skill1'..'skill4' (1-4 / gamepad A,X,B,Y → 1,2,3,4; the skill each slot casts is resolved live via
+         `activeSkill()` — §9 — so which concrete skill A/X/B/Y triggers depends on equipped weapon + loadout, not a
+         fixed name)
+         'character' (C / gamepad Back/View or LB), 'skills' (K — opens the Skills tab directly, §17.10),
+         'inventory' (I / gamepad RB), 'pause' (Esc, P / Start),
          'ui_up','ui_down','ui_left','ui_right' (arrows/WASD/dpad edges), 'confirm' (Enter/E / A), 'cancel' (Esc / B), 'drop' (Q/Delete / X),
          'potion' (5 / gamepad LT), 'mana_potion' (6 / gamepad RT) → drink items.js `activePotion(player, kind)`:
          the pinned stack if any, else the strongest stack of that kind (see §17.8b),
@@ -233,12 +307,20 @@ export class UI {
   showStart(onStart)            // title screen with controls help
 }
 ```
-HUD: HP orb/bar, Mana bar, XP bar with level, depth indicator, gold, 4 skill slots with cooldown sweep + mana cost + key hint
-(show gamepad glyphs when input.lastDevice==='gamepad'), minimap (draw map.explored/visible on a <canvas>, player dot, exits, enemies
-visible), potion counts, pending attr/skill point indicator ("C" badge).
-Character panel: attributes with + buttons, derived stats, skill ranks with upgrade buttons and descriptions.
-Inventory panel: paperdoll equipment slots + 24-slot grid, rarity-colored borders, hover tooltips with comparison, click=equip/use,
-right-click or drop action=drop, shift-click=sell (to gold, "salvage"). Full keyboard/gamepad navigation.
+HUD: HP orb/bar, Mana bar, XP bar with level, depth indicator, gold, 4 skill slots (icon/name/cooldown sweep/mana cost
+resolved live via `activeSkill()`, §9) with key hint (show gamepad glyphs when input.lastDevice==='gamepad'), minimap
+(draw map.explored/visible on a <canvas>, player dot, exits, enemies visible), potion counts, pending attr/skill point
+indicator (routes to the Character tab for attribute points, the Skills tab for skill points).
+Three tabs in one window — **Character | Skills | Bag** (LB/RB or Tab cycle all three, like the shop's Buy/Sell/Buyback):
+- Character: attributes with + buttons, derived stats (now 3 damage rows: Melee / Ranged / Spell Power — §17.9; the
+  role you aren't using shows dimmed "—").
+- **Skills** (new, K opens it directly): left side = the 4 slot cards (skill in each, rank, cooldown, mana cost; the
+  Attack card is labelled by the equipped weapon's class and also shows the other classes' current assignments);
+  right side = known skills for the selected slot's category, eligible ones first, weapon-locked ones dimmed with
+  "Requires {weapon}". Click/A assigns a skill to the slot; +/Y spends a rank point. See §17.10.
+- Bag: paperdoll equipment slots (off-hand shown locked + tooltip while a two-handed weapon is equipped, §17.9) +
+  24-slot grid, rarity-colored borders, hover tooltips with comparison, click=equip/use, right-click or drop
+  action=drop, shift-click=sell (to gold, "salvage"). Full keyboard/gamepad navigation.
 
 ## 14. Renderer (renderer.js)
 ```js
@@ -251,6 +333,8 @@ export class Renderer {
   spawnEffect(type, x, y, opts) // 'slash'(opts.dir), 'nova'(opts.radius), 'dash'(opts.from), 'hit', 'death', 'levelup', 'heal', 'pickup', 'exit'
   floatText(x, y, text, color)  // rising fading damage numbers (DOM or sprite)
   shake(intensity)
+  revealTile(x, y)              // hides one wall block + adds a door frame in its place, with a shimmer effect;
+                                 // used when a hidden treasure-room door is discovered (§17.11)
 }
 ```
 Look: angled top-down perspective camera (~55–65° pitch) following the player smoothly; stylized low-poly; dark dungeon with warm
@@ -298,9 +382,18 @@ Decisions made with the user while building. Keep this section current — when 
 
 ### 17.1 Movement & controls
 - Gamepad left stick = free analog movement (radial deadzone 0.22, speed ∝ stick push, top speed = 1 / moveCooldown
-  tiles/s). Box collision (half-size 0.3) slides along walls; a corner assist eases the player into doorways/corridors.
-- Pushing within ~40° toward an adjacent enemy holds position and swings Cleave; a clearly sideways push walks around it.
-- Arcane Bolt fires along the exact stick angle (`player.aim`); Cleave/Dash use the nearest 4-way `facing`.
+  tiles/s). Box collision (half-size 0.3) slides along walls **and along enemies** (movement is applied one axis at a
+  time, so a blocked axis doesn't stop the other) — a corner assist eases the player into doorways/corridors (not
+  applied when the thing ahead is an enemy).
+- Pushing within ~40° toward an adjacent enemy holds position and attacks (slot 1, via `activeSkill` — §9); a clearly
+  sideways push walks/slides around it instead, with no attack. If the player makes **zero** movement progress on
+  both axes this frame while an enemy occupies the facing tile ("fully stuck" — typically a diagonal push in a
+  1-wide corridor/doorway where the enemy blocks one axis and a wall blocks the other), that also counts as an
+  attack. This replaces an earlier "brush-past" rule that attacked on any incidental collision-block regardless of
+  aim; that fired on the ordinary "walk around an enemy" gesture (an accidental swing for melee, an accidental
+  point-blank arrow for a bow) and was removed. Don't widen the 40° cone — that would effectively bring it back.
+- Arcane Bolt fires along the exact stick angle (`player.aim`); tile-based attack skills (Cleave, Bow Shot, Staff
+  Sweep) and Dash use the nearest 4-way `facing`.
 - Keys: 1-4 skills · 5 / LT health potion · 6 / RT mana potion (H/M are no longer bound) · C / LB character ·
   I, Tab / RB bag · E, Enter, Space / A
   confirm & **Trade** (near a merchant A trades instead of Cleaving) · U mute · Esc, P / Start pause.
@@ -348,9 +441,17 @@ Decisions made with the user while building. Keep this section current — when 
     scheduler stats, output RMS/peak and live node counts (music `nodes`, `sfxNodes`).
 
 ### 17.3 Save / continue (save.js)
-- localStorage `dotm.save.v1` (versioned). Saves on entering every depth and on `pagehide` / tab hidden while playing.
-- Persists the player (level, xp, points, gold, attributes, equipment, inventory, skill ranks, hp/mana) and run stats —
-  never positions or timers. Continue regenerates a fresh layout for the saved depth. Death deletes the save.
+- localStorage `dotm.save.v2` (versioned). Saves on entering every depth and on `pagehide` / tab hidden while playing.
+- Persists the player (level, xp, points, gold, attributes, equipment, inventory, `skillState` — known skills + ranks
+  + loadout, `bossesDefeated`, hp/mana) and run stats — never positions, timers or skill *definitions* (so a
+  continued run always uses current balance numbers, not whatever was live when the save was written). Continue
+  regenerates a fresh layout for the saved depth (including re-rolling which rooms are hidden treasure rooms — see
+  §17.11). Death deletes the save.
+- **v1 → v2: no migration.** There's nothing worth preserving across this format change; any v1 save found in
+  storage is simply discarded, same as no save at all.
+- Loading is forgiving: unknown skill ids in `known`/`loadout` (e.g. a skill later removed/renamed) are dropped,
+  and any loadout slot that ends up unresolvable falls back to that slot/class's default — see §17.10's
+  guaranteed-skill rule.
 - Title screen: with a save → "Continue — Depth N · Level L" (default) and "New Game"; random keys don't start anything.
 
 ### 17.4 Merchant & economy (shop.js)
@@ -377,19 +478,21 @@ Decisions made with the user while building. Keep this section current — when 
 - Hit-stop freezes the whole sim briefly (crit 45ms, kill 60ms, boss hit 50ms, boss kill 150ms); input still registers.
 - Camera shake: crit, boss hit, light on kills (shakes take the max, never stack). Crits: bigger popping numbers + sparks.
 - Player hit: red screen-edge pulse scaled by damage fraction.
-- **Dex aim assist** (`stats.autoAimAssist` = dex × 0.001, cap 0.20 at 200 dex): applies to the player's ranged skill
-  (currently Arcane Bolt in skill slot 2 — `skills.js`'s `assistAim()` helper isn't tied to that skill's identity, so
-  it keeps working if a different ranged skill ever occupies that slot). On cast, the fire direction is blended by
-  that fraction toward the closest living enemy within range (10), inside a 40° half-angle cone of the aim, and in
-  line of sight. Only the initial direction is nudged (max ~8°) — the projectile then flies straight, no homing, so
-  enemies can still sidestep. No target = fires exactly where aimed. Not a lock-on; keep it small. Character screen
-  describes this to the player simply as "Improves Aim" (no skill name, no numbers).
+- **Aim assist** (`stats.autoAimAssist` = dex × 0.001, cap 0.20 at 200 dex): applies to **any** skill whose definition
+  has `aimed:true` (§9) — at launch that's Arcane Bolt, Bow Shot, Volley and Spark. `assistAim()` in skills.js reads
+  the active skill's own range rather than a hardcoded one, so it works for whichever aimed skill occupies whichever
+  slot. On cast, the fire direction is blended by that fraction toward the closest living enemy within the skill's
+  range, inside a 40° half-angle cone of the aim, and in line of sight. Only the initial direction is nudged (max
+  ~8°) — the projectile then flies straight, no homing, so enemies can still sidestep. No target = fires exactly
+  where aimed. Not a lock-on; keep it small. Character screen describes this to the player simply as "Improves Aim"
+  (no skill name, no numbers); its icon is 🧭 (moved off 🏹 once Ranged got its own stat row — see §17.9).
 
 ### 17.6 Elements & resistances
 - Damage has an **element**: physical, arcane, frost, fire, poison, lightning (fire/poison/lightning reserved for future
   skills and gear). Skills are tagged with an element (Cleave physical, Arcane Bolt arcane, Frost Nova frost) — resistances
   never refer to specific skills.
-- Status effects are separate keys: freeze, slow (future: burn, poison).
+- Status effects are separate keys: freeze, slow (future: burn, poison). Slow has a **strength** (`slowPct`, §10):
+  applying a new slow only overwrites the current one if it's stronger (or equal but longer) — see `applySlow()` in §17.12.
 - Enemy types may define `resist` per element/effect: positive = resist, negative = weakness. Always clamped to
   −75%..+80% — **nothing is ever fully immune**, and there are no blanket hard rules (e.g. no global "bosses can't be frozen").
 - Hits that are notably resisted / super-effective are tagged on the damage number; bosses list weaknesses/resists on their HP bar.
@@ -433,3 +536,123 @@ Decisions made with the user while building. Keep this section current — when 
   triggers that drink). The item tooltip says which potion the key drinks first; the HUD slot tooltip does too.
 - Pinned stack drained → pin moves to another stack of the same size if one exists, else clears (back to strongest).
   Dropped/sold pinned stack → stale id is ignored, same fallback.
+
+### 17.9 Weapon kinds, classes & itemization
+Two independent properties per weapon kind — never confuse them:
+- **Hands** (1H/2H): controls only whether the off-hand slot can be used, and which item tier the weapon uses.
+- **Role** → **class**: controls what slot 1 does and which attribute it scales with. A weapon's **class** is what
+  slot-1 attack-choice memory (§17.10) keys off — not the exact kind, so e.g. swapping sword→axe doesn't reset your
+  attack pick, only swapping to a different *class* (e.g. sword→bow) does.
+
+| Kind | Hands | Role | Class | Default attack | Scales with | Off-hand |
+|---|---|---|---|---|---|---|
+| sword, axe, mace, dagger | 1H | Melee, physical | `melee1h` | Cleave | str | Allowed |
+| *(unarmed)* | — | Melee, physical | `melee1h` | Cleave (fists) | str | Allowed |
+| spear *(reserved, not built yet)* | 2H | Melee, physical | `melee2h` | Thrust | str | Locked |
+| bow | 2H | Ranged, physical | `bow` | Bow Shot | dex | Locked |
+| wand | 1H | Ranged, caster | `wand` | Spark | int | Allowed (orb, tome, shield) |
+| staff | 2H | Melee, caster | `staff` | Staff Sweep | int | Locked |
+
+Driven from a single `WEAPON_KIND_INFO` table in items.js (`{ bow: { hands:2, cls:'bow', role:'ranged', scale:'dex',
+defaultAttack:'bowShot' }, … }`); character.js's damage-row split, skills.js's attack eligibility, the equip rules
+below, and the held-weapon model all read from it — never hardcode a kind-by-kind check elsewhere.
+
+**Damage rows (character.js):** a weapon's damage feeds only the row matching its own role, scaled by that class's
+attribute × 0.8 (same factor as melee's existing `STR_MELEE_SCALE`) — `meleeMin/Max` for melee-role weapons (incl.
+staff), `rangedMin/Max` for ranged-role weapons (bow, wand). A bow's damage no longer feeds `meleeMin/Max` (it used
+to). Arcane Bolt's damage is computed in its own skill definition from spell power, not from `rangedMin/Max`.
+
+**Two-handed itemization tier** (compensates for losing the off-hand): base stats ×1.5, +1 affix at every rarity,
+price ×1.4 (set at the weapon-type level so shop Featured/buyback pricing follow automatically). Staff's spell power
+must be ≥1.1× a same-level wand+orb combo, or wand+orb strictly dominates and staff never gets picked.
+
+**Equip rules:**
+- Equipping a 2H weapon while an off-hand is equipped needs one free bag slot (to hold the evicted off-hand); refuse
+  with "Bag full: no room for your {off-hand}" if there isn't one. On success, log "{off-hand} unequipped (two-handed
+  weapon)".
+- Equipping an off-hand while a 2H weapon is equipped is refused outright ("Can't equip: {weapon} is two-handed") —
+  it does not silently unequip the weapon.
+- The off-hand paperdoll slot renders locked (with a tooltip explaining why) while a 2H weapon is equipped.
+- `compareGear` for a 2H weapon compares "weapon + empty off-hand" against "current weapon + current off-hand", so
+  the lost off-hand's stats are never invisible to the upgrade verdict.
+- A melee↔ranged↔caster class swap never shows the ▲ upgrade badge — it shows a neutral **⇄** badge instead
+  ("Switches your attack to {skill}. Two-handed: unequips {off-hand}.", lost off-hand stats shown in red in preview).
+- **Quick-equip** (R/Y) only ever considers weapons of the currently-equipped weapon's *class* (sword→axe fine,
+  sword→bow never auto-swaps), and skips the off-hand step entirely while a 2H weapon is equipped — this also avoids
+  the weapon-then-offhand quick-equip steps undoing each other.
+
+### 17.10 Skill slots & the loadout system
+Slots keep a fixed category (attack/spell/special/movement, §9) but which concrete skill occupies each one is
+player-chosen from the skills they know, via the Skills tab (§13). Two layers, kept separate:
+- **Weapon class decides which attack skills are *eligible*** for slot 1 (only `classes` matching the equipped
+  weapon's class, §17.9).
+- **The player decides which *eligible* skill is active**, and that choice is remembered **per weapon class**
+  (`loadout.attack.bow`, `loadout.attack.melee1h`, etc.) — so re-equipping a bow always restores whatever you last
+  picked for bow, with no manual re-selection after a weapon swap. The Skills tab can also set a class's assignment
+  while a different weapon is equipped.
+- Slots 2-4 aren't weapon-gated at all; their `loadout[category]` is a single global choice.
+
+**Guaranteed-skill rule (permanent, not just a launch detail):** every slot must always resolve to a usable skill,
+regardless of equipped gear or what's been unlocked. Every weapon class's default attack, and every category's
+default (Arcane Bolt/Frost Nova/Shadow Dash), are always known — never behind an unlock. Any future weapon-restricted
+skill in slots 2-4 (e.g. a hypothetical "requires a staff" spell) can only ever **add** an eligible option to that
+slot — it can never be the slot's only option, since that would leave players without that weapon with nothing
+usable. If a player's current assignment for a slot becomes ineligible (e.g. they picked a bow-only skill for the
+attack slot, then equip a sword), that slot falls back to the new weapon/category's default; the assignment itself is
+kept and comes back once eligible again. Enforced at startup (loud error if any class/category lacks an
+unconditional default) and covered by a unit test, alongside `activeSkill()` resolution and `effectiveCooldown` math
+(the README already flags these pure-math modules as worth testing).
+
+**Ranks are per skill**, not per slot: `player.skillState.known[skillId]` tracks each known skill's own rank (1-5)
+independently, so e.g. Cleave and Volley rank up separately even though both can occupy slot 1. Trying an
+alternative skill therefore starts it at rank 1 even if your current pick is higher-ranked — accepted tradeoff, in
+exchange for stronger per-skill identity; a skill/attribute respec (already on the README's idea list) is a natural
+future pairing if this feels punishing in practice. **Attribute scaling stays tied to the slot's category** (§9's
+table), not to the individual skill occupying it.
+
+No cooldown penalty on swapping which skill occupies a slot — going into the Skills tab to change it is already
+enough friction; each skill just keeps ticking its own independent cooldown (`player.skillCooldowns[skillId]`)
+whether or not it's currently slotted.
+
+### 17.11 Skill unlocking
+No random enemy drops. Three sources, all via the `skillbook` item type (§11):
+- **Boss-unique book**: guaranteed the first time a given boss type is killed **this run** (`player.bossesDefeated`,
+  saved; since death deletes the save — §17.3 — this is inherently "once per run", not persisted across runs/deaths —
+  that's a deliberately deferred, separate roguelite-progression feature, not built now).
+- **Repeat kill of an already-defeated boss** (first possible at depth 15/20, since bosses only repeat every 5
+  depths): a small chance (~20%) at a random book from the generic pool, and a much smaller chance (~3%) at another
+  copy of that boss's own unique book.
+- **Hidden treasure room chest**: builds on the *existing* treasure-room system (`map.js` already tags one room per
+  depth as `kind:'treasure'`; `seedTreasure()` in main.js already scatters loot there) rather than a new one. The
+  room must additionally be a dead-end with exactly one doorway (so hiding it can never cut off other floor), never
+  the start/exit/boss/merchant room; ~35% chance per depth from depth 2 on (~1 book every 3 depths). Its one doorway
+  starts as a wall tile flagged `secret`; when the player is within 1 tile of it and it's in view, it reveals (via
+  `renderer.revealTile`, §14) with a shimmer + sound + "You found a hidden passage." log line. A chest object (in
+  `game.npcs`, existing chest model) sits inside, opened like trading a merchant (confirm-when-adjacent); opening it
+  drops one random generic-pool book via `dropLoot`.
+- **Duplicate books** (already known): give **+1 rank** instead of nothing (capped at 5) — otherwise duplicates,
+  which will happen often while the generic pool is small, are dead weight.
+- **Learning any brand-new skill also grants +1 free skill point** — softens the "boss reward arrives at rank 1 next
+  to my rank-4 main skill" feeling without making boss-unique skills numerically stronger (which would just make them
+  strictly-better rather than different).
+- Books are tooltip-labeled with category + weapon requirement (e.g. "Attack · requires Bow") and can be learned
+  (used) even without the required weapon equipped — they just show greyed out in the Skills tab until you equip it.
+
+### 17.12 Combat: armor on weapon shots, point-blank, and slow strength
+- **Weapon-role projectiles** (Bow Shot, Volley, Spark) set `applyDefense:true` and are reduced by the target's
+  defense at hit time, the same formula as a melee hit (`× 100/(100+def)`) — consistent with "physical/weapon damage
+  is mitigated by armor, spells bypass it" (§17.6). Damage and crit are still rolled at *release* so the crit feel
+  stays there; only the defense reduction (and point-blank check, below) happens on impact. True spells (Arcane Bolt,
+  a future Fireball) keep `applyDefense:false` and bypass armor — that exception is now reserved for spells specifically,
+  not "anything ranged".
+- **Point-blank penalty**: a weapon-role projectile that hits within `POINT_BLANK_RANGE` (~1.5 tiles) of where it was
+  fired (`ox,oy`, §6.1) uses `pointBlankDamage` (the bottom of that weapon's damage range) instead of its rolled
+  damage, then applies defense as above. Applies identically whether the shot came from walking into an adjacent
+  enemy, an aimed-push, the "fully stuck" rule (§17.1), or pressing the skill key at close range — trigger method
+  never matters, only distance. Feel: duller hit sound + smaller grey damage number.
+- **Slow gets a strength value** (`enemy.slowPct`, §10) instead of the old on/off timer: `applySlow(enemy, pct, dur)`
+  only overwrites the current slow if `pct` is stronger, or equal and `dur` is longer — so a weaker slow can never
+  interrupt/shorten a stronger one already active. Resistance keeps shortening *duration* as it already does
+  (`applyResist`), not strength. Frost Nova stays 50% (unchanged); Bow Shot's rank-3 perk applies ~20-25% for ~0.6s —
+  deliberately much weaker than Nova, with room left above the bow for a possible future "Cripple" skill. Global cap
+  75% (§17.6's "nothing is ever fully immune").

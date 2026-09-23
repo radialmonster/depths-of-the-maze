@@ -6,7 +6,7 @@
 // itself is assumed stable for the lifetime of this UI instance.
 
 import { ATTRIBUTES, xpForLevel, spendAttribute } from './character.js';
-import { upgradeSkill, skillDescription } from './skills.js';
+import { upgradeSkill, skillDescription, activeSkill, skillRank, skillCooldown, effectiveCooldown, MAX_SKILL_RANK } from './skills.js';
 import { equipItem, unequipItem, useItem, dropItem, sellValue, itemTooltip, compareGear, equipUpgrades, SLOTS, INVENTORY_SIZE,
   activePotion, pinnedPotion, potionHotbarKind, togglePotionPin } from './items.js';
 import { buyFromMerchant, sellToMerchant, buybackFromMerchant, nearbyMerchant, shopPrice } from './shop.js';
@@ -239,6 +239,50 @@ function relabelPadEls(padEls, style) {
   }
 }
 
+// Equipped-slot positions, mirroring the .dm-paperdoll CSS grid-template-areas below
+// (3 cols x 4 rows) so D-pad/arrow navigation moves spatially instead of through SLOTS'
+// flat declaration order.
+const PAPERDOLL_POS = {
+  helm: [0, 1],
+  weapon: [1, 0], armor: [1, 1], offhand: [1, 2],
+  boots: [2, 1],
+  ring: [3, 0], amulet: [3, 2],
+};
+
+// Nearest occupied paperdoll slot in `dir` from `fromId` ('up'/'down'/'left'/'right'), or null
+// if none lies that way. Scores candidates by distance along the travel axis, penalizing
+// sideways drift so aligned neighbors (e.g. helm above armor) win over diagonal ones.
+function paperdollNeighbor(fromId, dir) {
+  const [r0, c0] = PAPERDOLL_POS[fromId];
+  let best = null, bestScore = Infinity;
+  for (const id in PAPERDOLL_POS) {
+    if (id === fromId) continue;
+    const [r, c] = PAPERDOLL_POS[id];
+    const dr = r - r0, dc = c - c0;
+    let primary, lateral;
+    if (dir === 'up') { if (dr >= 0) continue; primary = -dr; lateral = Math.abs(dc); }
+    else if (dir === 'down') { if (dr <= 0) continue; primary = dr; lateral = Math.abs(dc); }
+    else if (dir === 'left') { if (dc >= 0) continue; primary = -dc; lateral = Math.abs(dr); }
+    else { if (dc <= 0) continue; primary = dc; lateral = Math.abs(dr); }
+    const score = primary + lateral * 1.5;
+    if (score < bestScore) { bestScore = score; best = id; }
+  }
+  return best;
+}
+
+// Which paperdoll slot to land on when crossing from the bag grid's left column into the doll
+// (row is the grid cursor's row). Matches by nearest row, preferring the rightmost column on
+// ties since that's the edge adjacent to the grid.
+function paperdollEntryFromGridRow(row) {
+  let best = null, bestScore = Infinity;
+  for (const id in PAPERDOLL_POS) {
+    const [r, c] = PAPERDOLL_POS[id];
+    const score = Math.abs(r - row) - c * 0.01;
+    if (score < bestScore) { bestScore = score; best = id; }
+  }
+  return best;
+}
+
 let stylesInjected = false;
 
 export class UI {
@@ -457,7 +501,7 @@ export class UI {
       const cost = mk('div', 'dm-skill-cost', slot, '');
       slot.addEventListener('mouseenter', () => {
         const p = this.game && this.game.player;
-        const sk = p && p.skills && p.skills[i];
+        const sk = p && activeSkill(p, i);
         if (sk) this._showTooltip(slot, this._skillTooltip(sk, p), 'above');
       });
       slot.addEventListener('mouseleave', () => this._hideTooltip());
@@ -586,7 +630,8 @@ export class UI {
       const pips = mk('div', 'dm-pips', head);
       const desc = mk('div', 'dm-charskill-desc', main, '');
       const upgradeBtn = mk('button', 'dm-plus dm-plus-wide', row, 'Upgrade');
-      upgradeBtn.addEventListener('click', () => this._upgradeSkill(i));
+      // row.dataset.skillId tracks the skill currently resolved into slot i (set in _refreshCharacterPanel).
+      upgradeBtn.addEventListener('click', () => this._upgradeSkill(row.dataset.skillId));
       skillRows.push({ row, icon, key, name, pips, pipEls: [], upgradeBtn, desc });
     }
 
@@ -1224,11 +1269,14 @@ export class UI {
     else if (this._hoverInvIndex === index) this._showTooltip(null, this._invCellTooltip(item, p));
   }
 
+  // `sk` is a skill definition (skills.js SKILL_DEFS); rank comes from the player's own known ranks.
   _skillTooltip(sk, p) {
+    const rank = skillRank(p, sk.id);
     const cost = sk.manaCost ? `<span class="tt-pill tt-pill-mana">💧 ${sk.manaCost} mana</span>` : '<span class="tt-pill">No cost</span>';
-    const cd = sk.baseCooldown ? `<span class="tt-pill">⏱ ${(+sk.baseCooldown).toFixed(1)}s</span>` : '';
-    return `<div class="tt-title">${sk.icon || ''} ${sk.name || ''} <span class="tt-rank">Rank ${sk.rank}/${sk.maxRank}</span></div>`
-      + `<div class="tt-body">${skillDescription(sk, p)}</div><div class="tt-pills">${cost}${cd}</div>`;
+    const cdSec = effectiveCooldown(sk, rank, p);
+    const cd = cdSec ? `<span class="tt-pill">⏱ ${cdSec.toFixed(1)}s</span>` : '';
+    return `<div class="tt-title">${sk.icon || ''} ${sk.name || ''} <span class="tt-rank">Rank ${rank}/${MAX_SKILL_RANK}</span></div>`
+      + `<div class="tt-body">${skillDescription(sk.id, rank, p)}</div><div class="tt-pills">${cost}${cd}</div>`;
   }
 
   // ---------------------------------------------------------------------
@@ -1382,11 +1430,10 @@ export class UI {
       c.bagStr = bagStr;
     }
 
-    // Skill slots.
-    const skills = p.skills || [];
+    // Skill slots (resolved live — which skill is in each slot depends on weapon class + loadout).
     for (let i = 0; i < 4; i++) {
       const dom = d.skillSlots[i];
-      const sk = skills[i];
+      const sk = activeSkill(p, i);
       const key = gamepad ? padLabel(SKILL_PAD_LABEL[i], style) : SKILL_KEY_LABEL[i];
       const ck = `skill${i}`;
       if (c[ck + 'key'] !== key) {
@@ -1402,7 +1449,10 @@ export class UI {
         dom.cost.style.display = costStr ? '' : 'none';
         c[ck + 'cost'] = costStr;
       }
-      const frac = clamp((sk.cooldown || 0) / Math.max(0.001, sk.baseCooldown || 1), 0, 1);
+      // Sweep = remaining / the duration actually set at cast time (rank + cooldownReduction), not baseCooldown.
+      const cdState = skillCooldown(p, sk.id);
+      const cdLeft = cdState ? cdState.t : 0;
+      const frac = cdState ? clamp(cdLeft / Math.max(0.001, cdState.max), 0, 1) : 0;
       const cdKey = frac.toFixed(3);
       if (c[ck + 'cd'] !== cdKey) {
         dom.sweep.style.background = frac > 0
@@ -1410,8 +1460,8 @@ export class UI {
           : 'none';
         c[ck + 'cd'] = cdKey;
       }
-      const onCd = sk.cooldown > 0.05;
-      const cdText = onCd ? (sk.cooldown >= 10 ? Math.ceil(sk.cooldown).toString() : sk.cooldown.toFixed(1)) : '';
+      const onCd = cdLeft > 0.05;
+      const cdText = onCd ? (cdLeft >= 10 ? Math.ceil(cdLeft).toString() : cdLeft.toFixed(1)) : '';
       if (c[ck + 'cdtext'] !== cdText) { dom.cdText.textContent = cdText; c[ck + 'cdtext'] = cdText; }
       if (c[ck + 'oncd'] !== onCd) {
         if (c[ck + 'oncd'] && !onCd) flash(dom.slot, 'dm-ready-flash');
@@ -1576,11 +1626,11 @@ export class UI {
     }
   }
 
-  _upgradeSkill(index) {
+  _upgradeSkill(skillId) {
     const p = this.game && this.game.player;
-    if (!p) return;
-    if (upgradeSkill(p, index)) {
-      const row = this.dom.charSkillRows[index];
+    if (!p || !skillId) return;
+    if (upgradeSkill(p, skillId)) {
+      const row = this.dom.charSkillRows.find((r) => r.row.dataset.skillId === skillId);
       if (row) flash(row.icon, 'dm-bump');
       this._refreshCharacterPanel();
     }
@@ -1618,28 +1668,29 @@ export class UI {
 
     this._fillDerived(d.derivedRows, p.stats);
 
-    const skills = p.skills || [];
     for (let i = 0; i < d.charSkillRows.length; i++) {
       const row = d.charSkillRows[i];
-      const sk = skills[i];
+      const sk = activeSkill(p, i);
       if (!sk) continue;
+      const rank = skillRank(p, sk.id);
+      row.row.dataset.skillId = sk.id;
       if (row.icon.firstChild && row.icon.firstChild.nodeType === 3) {
         if (row.icon.firstChild.nodeValue !== sk.icon) row.icon.firstChild.nodeValue = sk.icon || '';
       } else {
         row.icon.insertBefore(document.createTextNode(sk.icon || ''), row.icon.firstChild);
       }
       if (row.name.textContent !== sk.name) row.name.textContent = sk.name || '';
-      if (row.pipEls.length !== sk.maxRank) {
+      if (row.pipEls.length !== MAX_SKILL_RANK) {
         row.pips.textContent = '';
         row.pipEls = [];
-        for (let r = 0; r < sk.maxRank; r++) row.pipEls.push(mk('i', 'dm-pip', row.pips));
+        for (let r = 0; r < MAX_SKILL_RANK; r++) row.pipEls.push(mk('i', 'dm-pip', row.pips));
       }
-      row.pipEls.forEach((el, r) => el.classList.toggle('dm-on', r < sk.rank));
-      row.pips.title = `Rank ${sk.rank} / ${sk.maxRank}`;
-      const desc = skillDescription(sk, p);
+      row.pipEls.forEach((el, r) => el.classList.toggle('dm-on', r < rank));
+      row.pips.title = `Rank ${rank} / ${MAX_SKILL_RANK}`;
+      const desc = skillDescription(sk.id, rank, p);
       if (row._desc !== desc) { row.desc.innerHTML = desc; row._desc = desc; }
-      const canUp = sp > 0 && sk.rank < sk.maxRank;
-      const maxed = sk.rank >= sk.maxRank;
+      const canUp = sp > 0 && rank < MAX_SKILL_RANK;
+      const maxed = rank >= MAX_SKILL_RANK;
       row.upgradeBtn.textContent = maxed ? 'Max' : 'Upgrade';
       row.upgradeBtn.disabled = !canUp;
       row.upgradeBtn.classList.toggle('dm-maxed', maxed);
@@ -2180,7 +2231,7 @@ export class UI {
       const p = this.game && this.game.player;
       if (!p) return;
       if (focused.kind === 'attr') this._spendAttr(focused.ref.attr.id);
-      else this._upgradeSkill(Number(focused.el.dataset.index));
+      else this._upgradeSkill(focused.el.dataset.skillId);
     }
   }
 
@@ -2190,12 +2241,25 @@ export class UI {
     const cur = this._invCursor;
 
     if (cur.area === 'paperdoll') {
-      if (input.pressed('ui_up')) cur.index = Math.max(0, cur.index - 1);
-      if (input.pressed('ui_down')) cur.index = Math.min(SLOTS.length - 1, cur.index + 1);
-      if (input.pressed('ui_right')) { cur.area = 'grid'; cur.index = 0; }
+      // Spatial nav over the paper-doll's real 2D layout (see PAPERDOLL_POS), not SLOTS' flat order.
+      const dir = input.pressed('ui_up') ? 'up' : input.pressed('ui_down') ? 'down'
+        : input.pressed('ui_left') ? 'left' : input.pressed('ui_right') ? 'right' : null;
+      if (dir) {
+        const curId = SLOTS[cur.index].id;
+        const next = paperdollNeighbor(curId, dir);
+        if (next) cur.index = SLOTS.findIndex(s => s.id === next);
+        else if (dir === 'right') {
+          // Ran off the doll's right edge — hand off to the bag grid at roughly the same row.
+          cur.area = 'grid';
+          cur.index = clamp(PAPERDOLL_POS[curId][0], 0, rows - 1) * cols;
+        }
+      }
     } else {
       let col = cur.index % cols, row = Math.floor(cur.index / cols);
-      if (input.pressed('ui_left')) { if (col === 0) { cur.area = 'paperdoll'; cur.index = Math.min(SLOTS.length - 1, row); } else col--; }
+      if (input.pressed('ui_left')) {
+        if (col === 0) { cur.area = 'paperdoll'; cur.index = SLOTS.findIndex(s => s.id === paperdollEntryFromGridRow(row)); }
+        else col--;
+      }
       if (input.pressed('ui_right')) col = Math.min(cols - 1, col + 1);
       if (input.pressed('ui_up')) row = Math.max(0, row - 1);
       if (input.pressed('ui_down')) row = Math.min(rows - 1, row + 1);

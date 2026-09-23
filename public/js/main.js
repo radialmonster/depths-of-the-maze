@@ -4,7 +4,7 @@ import { RNG, EventBus, uid, bumpUid, TILE, dist, clamp, ELEMENTS, RARITY } from
 import { generateDungeon, computeFOV } from './map.js';
 import { Renderer } from './renderer.js';
 import { createPlayer, recalcStats, gainXP, mitigate, updatePlayer } from './character.js';
-import { createSkillLoadout, useSkill, updateSkills } from './skills.js';
+import { createSkillState, normalizeSkillState, useSkill, updateSkills } from './skills.js';
 import { spawnEnemies, updateEnemies, createEnemy, getResist } from './enemies.js';
 import { rollLoot, startingGear, addToInventory, useItem, generateItem, activePotion } from './items.js';
 import { Input } from './input.js';
@@ -333,7 +333,7 @@ function newGame() {
   game.stats = { kills: 0, goldEarned: 0, deepest: 1, timePlayed: 0 };
 
   const p = createPlayer();
-  p.skills = createSkillLoadout();
+  p.skillState = createSkillState();
   const gear = startingGear();
   Object.assign(p.equipment, gear.equipment);
   p.inventory = gear.inventory;
@@ -366,7 +366,9 @@ function continueGame(data) {
     p.base = sp.base ? { ...sp.base } : p.base;
     p.equipment = sp.equipment ? { ...p.equipment, ...sp.equipment } : p.equipment;
     p.inventory = Array.isArray(sp.inventory) ? sp.inventory : p.inventory;
-    p.skills = Array.isArray(sp.skills) && sp.skills.length ? sp.skills.map((s) => ({ ...s, cooldown: 0 })) : createSkillLoadout();
+    // Forgiving: unknown skill ids are dropped, missing/unresolvable loadout slots fall back to defaults (§17.3).
+    p.skillState = normalizeSkillState(sp.skillState);
+    p.bossesDefeated = Array.isArray(sp.bossesDefeated) ? sp.bossesDefeated.filter((id) => typeof id === 'string') : [];
     // Hotbar potion pins (absent in older saves -> null = best-first default).
     p.activeHealPotionId = sp.activeHealPotionId ?? null;
     p.activeManaPotionId = sp.activeManaPotionId ?? null;
@@ -581,7 +583,7 @@ function cornerAssist(p, axis, s, amount) {
   }
 }
 
-// Face the stick: smooth aim for the model and Arcane Bolt, nearest 4-way for tile skills.
+// Face the stick: smooth aim for the model and aimed skills (Arcane Bolt), nearest 4-way for tile skills.
 function faceStick(p, stick) {
   p.aim = { x: stick.x, y: stick.y };
   p.facing = Math.abs(stick.x) >= Math.abs(stick.y)

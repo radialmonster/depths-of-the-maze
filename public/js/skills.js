@@ -1,6 +1,14 @@
-// The 4 player skills: Cleave, Arcane Bolt, Frost Nova, Shadow Dash. Owned by the Character agent — see DESIGN.md §9.
+// Player skills: a static registry of skill definitions (SKILL_DEFS) plus the loadout/resolution model that decides
+// which skill is active in each HUD slot. Owned by the Character agent — see DESIGN.md §9 and §17.10.
 // Uses ONLY the game API in DESIGN §6 (game.enemyAt, enemiesInRadius, damageEnemy, spawnProjectile, effect,
 // floatText, log, isFree, isWalkable, rng, bus, player).
+//
+// Data model:
+//   SKILL_DEFS[id]            static definition (never saved — a continued run always uses current numbers)
+//   player.skillState.known   { [id]: rank }  learned skills and their own ranks (1..MAX_SKILL_RANK)
+//   player.skillState.loadout { attack: { [weaponClass]: id }, spell: id, special: id, movement: id }
+//   player.skillCooldowns     { [id]: { t, max } }  runtime only (not saved); `max` = the duration set at cast time
+// activeSkill(player, slotIndex) resolves what's in a slot right now; nothing else indexes slots directly.
 
 import { computeDamage } from './character.js';
 import { applyResist } from './enemies.js';
@@ -8,8 +16,10 @@ import { applyResist } from './enemies.js';
 // ---------------------------------------------------------------------------
 // Tuning constants
 // ---------------------------------------------------------------------------
-const RANK_DAMAGE_BONUS = 0.15;   // +15% damage per rank (rank 1 = base, so multiplier = 1 + (rank-1)*0.15)
-const RANK_COOLDOWN_REDUCTION = 0.05; // -5% cooldown per rank
+export const MAX_SKILL_RANK = 5;
+const RANK_DAMAGE_BONUS = 0.15;       // +15% damage per rank (rank 1 = base, so multiplier = 1 + (rank-1)*0.15)
+const RANK_COOLDOWN_MULT = 0.95;      // -5% cooldown per rank (compounding), see effectiveCooldown()
+const MAX_COOLDOWN_REDUCTION = 0.4;   // cap on stats.cooldownReduction
 
 const CLEAVE_BASE_CD = 0.45;
 const CLEAVE_MANA = 0;
@@ -18,10 +28,9 @@ const BOLT_BASE_CD = 0.6;
 const BOLT_MANA = 6;
 const BOLT_SPEED = 14;
 const BOLT_RANGE = 10;
-// Dex auto-aim assist (player.stats.autoAimAssist, 0..0.20): applies to the player's ranged skill (currently
-// Arcane Bolt, skill slot 2 — assistAim() is generic and isn't tied to that skill's identity, so it keeps working
-// if a different ranged skill ever occupies that slot). At cast time only, blend the fire direction toward the
-// closest visible enemy inside this forward cone and BOLT_RANGE. The bolt still flies straight (no homing).
+// Aim assist (player.stats.autoAimAssist, 0..0.20) applies to any skill whose definition has aimed:true, using that
+// skill's own `range`. At cast time only, blend the fire direction toward the closest visible enemy inside this
+// forward cone and the skill's range. The projectile still flies straight (no homing). See DESIGN §17.5.
 const RANGED_ASSIST_CONE_COS = Math.cos(40 * Math.PI / 180); // 40deg half-angle, like main.js BUMP_CONE; max nudge ~8deg
 
 const NOVA_BASE_CD = 6.0;
@@ -41,36 +50,260 @@ const DASH_INVULN_PER_RANK = 0.05;
 const NO_MANA_FLASH_THROTTLE = 0.6; // seconds between "No mana" float texts
 
 function rankMult(rank) { return 1 + (rank - 1) * RANK_DAMAGE_BONUS; }
-function cooldownForRank(baseCd, rank) {
-  return Math.max(0.1, baseCd * Math.pow(1 - RANK_COOLDOWN_REDUCTION, rank - 1));
+
+// Sums a numeric rankPerks key over every perk rank <= `rank` (booleans count as 1), e.g. Arcane Bolt's
+// { 3: { pierce: 1 }, 5: { pierce: 1 } } gives pierce 0 / 1 / 2 at ranks 1-2 / 3-4 / 5.
+function perkTotal(def, rank, key) {
+  let total = 0;
+  const perks = def.rankPerks || {};
+  for (const r in perks) {
+    if (Number(r) <= rank && perks[r][key]) total += Number(perks[r][key]);
+  }
+  return total;
 }
 
 // ---------------------------------------------------------------------------
-// createSkillLoadout
+// Slots, categories and weapon classes
 // ---------------------------------------------------------------------------
-export function createSkillLoadout() {
-  return [
-    {
-      id: 'cleave', key: '1', name: 'Cleave', icon: '⚔️',
-      description: 'Melee arc hitting the tile in front and the two beside it.',
-      type: 'melee', rank: 1, maxRank: 5, cooldown: 0, baseCooldown: CLEAVE_BASE_CD, manaCost: CLEAVE_MANA,
+// HUD slot index (0-3) -> category. Slot 1 (index 0) is the weapon-class-dependent attack.
+export const SLOT_CATEGORIES = ['attack', 'spell', 'special', 'movement'];
+
+// Weapon classes that exist right now. Every one of them must have a default attack in CLASS_DEFAULT_ATTACK
+// (validated at startup). Later phases add melee2h / bow / wand / staff along with their default attacks.
+export const WEAPON_CLASSES = ['melee1h'];
+
+// Weapon kind -> class. Transitional stand-in for items.js WEAPON_KIND_INFO (DESIGN §17.9): today bows and staves
+// still behave as melee weapons (they Cleave and feed meleeMin/Max), so they map to melee1h until the phase that
+// gives them their own class + default attack. Unarmed / unknown kinds are melee1h too.
+const KIND_CLASS = {
+  sword: 'melee1h', axe: 'melee1h', mace: 'melee1h', dagger: 'melee1h',
+  bow: 'melee1h', staff: 'melee1h',
+};
+const UNARMED_CLASS = 'melee1h';
+
+// The guaranteed-skill rule (DESIGN §9 / §17.10): every weapon class and every slot 2-4 category has an
+// unconditional default, always known at rank >= 1.
+export const CLASS_DEFAULT_ATTACK = { melee1h: 'cleave' };
+export const CATEGORY_DEFAULT = { spell: 'arcaneBolt', special: 'frostNova', movement: 'shadowDash' };
+
+export function weaponClass(player) {
+  const w = player && player.equipment && player.equipment.weapon;
+  if (!w) return UNARMED_CLASS;
+  return KIND_CLASS[w.weaponKind] || UNARMED_CLASS;
+}
+
+function defaultSkillIds() {
+  return [...new Set([...Object.values(CLASS_DEFAULT_ATTACK), ...Object.values(CATEGORY_DEFAULT)])];
+}
+
+// ---------------------------------------------------------------------------
+// Skill registry
+// ---------------------------------------------------------------------------
+export const SKILL_DEFS = {
+  cleave: {
+    id: 'cleave', name: 'Cleave', icon: '⚔️',
+    description: 'Melee arc hitting the tile in front and the two beside it.',
+    category: 'attack', classes: ['melee1h'], aimed: false, element: 'physical',
+    baseCooldown: CLEAVE_BASE_CD, manaCost: CLEAVE_MANA,
+    rankPerks: { 3: { knockbackAlways: true, text: 'Knockback on every hit, not just crits.' } },
+    cast: castCleave,
+    describe(rank, player) {
+      const stats = (player && player.stats) || {};
+      const mult = rankMult(rank);
+      const lo = Math.max(1, Math.round((stats.meleeMin ?? 1) * mult));
+      const hi = Math.max(lo + 1, Math.round((stats.meleeMax ?? 3) * mult));
+      const kb = perkTotal(this, rank, 'knockbackAlways') ? ' Knockback on hit.' : ' Knockback on crit.';
+      return `Deals ${lo}-${hi} damage to 3 tiles in front.${kb}`;
     },
-    {
-      id: 'arcaneBolt', key: '2', name: 'Arcane Bolt', icon: '🔮',
-      description: 'Fires a piercing bolt of arcane energy.',
-      type: 'ranged', rank: 1, maxRank: 5, cooldown: 0, baseCooldown: BOLT_BASE_CD, manaCost: BOLT_MANA,
+  },
+  arcaneBolt: {
+    id: 'arcaneBolt', name: 'Arcane Bolt', icon: '🔮',
+    description: 'Fires a piercing bolt of arcane energy.',
+    category: 'spell', aimed: true, range: BOLT_RANGE, element: 'arcane',
+    baseCooldown: BOLT_BASE_CD, manaCost: BOLT_MANA,
+    rankPerks: {
+      3: { pierce: 1, text: 'Pierces +1 enemy.' },
+      5: { pierce: 1, text: 'Pierces +1 more enemy.' },
     },
-    {
-      id: 'frostNova', key: '3', name: 'Frost Nova', icon: '❄️',
-      description: 'Damages and freezes/slows all nearby enemies.',
-      type: 'special', rank: 1, maxRank: 5, cooldown: 0, baseCooldown: NOVA_BASE_CD, manaCost: NOVA_MANA,
+    cast: castArcaneBolt,
+    describe(rank, player) {
+      const stats = (player && player.stats) || {};
+      const mult = rankMult(rank);
+      const lo = Math.max(1, Math.round((stats.rangedMin ?? 1) * mult));
+      const hi = Math.max(lo + 1, Math.round((stats.rangedMax ?? 3) * mult));
+      const pierce = perkTotal(this, rank, 'pierce');
+      const pierceStr = pierce > 0 ? ` Pierces ${pierce} ${pierce > 1 ? 'enemies' : 'enemy'}.` : '';
+      return `Fires a bolt dealing ${lo}-${hi} damage.${pierceStr} Costs ${this.manaCost} mana.`;
     },
-    {
-      id: 'shadowDash', key: '4', name: 'Shadow Dash', icon: '💨',
-      description: 'Dash forward through free tiles, briefly invulnerable.',
-      type: 'dodge', rank: 1, maxRank: 5, cooldown: 0, baseCooldown: DASH_BASE_CD, manaCost: DASH_MANA,
+  },
+  frostNova: {
+    id: 'frostNova', name: 'Frost Nova', icon: '❄️',
+    description: 'Damages and freezes/slows all nearby enemies.',
+    category: 'special', aimed: false, element: 'frost',
+    baseCooldown: NOVA_BASE_CD, manaCost: NOVA_MANA,
+    rankPerks: {}, // radius and freeze duration grow every rank (NOVA_*_PER_RANK) instead of at specific ranks
+    cast: castFrostNova,
+    describe(rank, player) {
+      const stats = (player && player.stats) || {};
+      const radius = (NOVA_BASE_RADIUS + (rank - 1) * NOVA_RADIUS_PER_RANK).toFixed(2);
+      const power = Math.round((stats.spellPower ?? 5) * rankMult(rank));
+      const freeze = (NOVA_FROZEN_BASE + (rank - 1) * NOVA_FROZEN_PER_RANK).toFixed(1);
+      return `Deals ~${power} damage to all enemies within ${radius} tiles, freezing them for ${freeze}s and slowing after. Costs ${this.manaCost} mana.`;
     },
-  ];
+  },
+  shadowDash: {
+    id: 'shadowDash', name: 'Shadow Dash', icon: '💨',
+    description: 'Dash forward through free tiles, briefly invulnerable.',
+    category: 'movement', aimed: false, element: 'physical',
+    baseCooldown: DASH_BASE_CD, manaCost: DASH_MANA,
+    rankPerks: { 4: { dashTiles: 1, text: 'Dash 1 tile further.' } },
+    cast: castShadowDash,
+    describe(rank) {
+      const tiles = DASH_BASE_TILES + perkTotal(this, rank, 'dashTiles');
+      const invuln = (DASH_INVULN_BASE + (rank - 1) * DASH_INVULN_PER_RANK).toFixed(2);
+      return `Dash up to ${tiles} tiles, gaining ${invuln}s of invulnerability. Costs ${this.manaCost} mana.`;
+    },
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Registry validation (guaranteed-skill rule). Returns a list of error strings; [] = valid.
+// Run at module load (loud console.error) and by tests/skills.test.js.
+// ---------------------------------------------------------------------------
+export function validateSkillRegistry() {
+  const errors = [];
+  for (const id in SKILL_DEFS) {
+    const d = SKILL_DEFS[id];
+    if (d.id !== id) errors.push(`SKILL_DEFS.${id}: id field is "${d.id}"`);
+    if (!SLOT_CATEGORIES.includes(d.category)) errors.push(`${id}: unknown category "${d.category}"`);
+    if (typeof d.cast !== 'function') errors.push(`${id}: missing cast()`);
+    if (!(d.baseCooldown > 0)) errors.push(`${id}: baseCooldown must be > 0`);
+    if (!(d.manaCost >= 0)) errors.push(`${id}: manaCost must be >= 0`);
+    if (d.category === 'attack' && !(Array.isArray(d.classes) && d.classes.length)) {
+      errors.push(`${id}: attack skills must list the weapon classes that can use them`);
+    }
+  }
+  for (const cls of WEAPON_CLASSES) {
+    const id = CLASS_DEFAULT_ATTACK[cls];
+    const d = id && SKILL_DEFS[id];
+    if (!d) errors.push(`weapon class "${cls}" has no default attack skill`);
+    else if (d.category !== 'attack' || !(d.classes || []).includes(cls)) {
+      errors.push(`weapon class "${cls}" default "${id}" is not an attack skill usable by that class`);
+    }
+  }
+  for (const kind in KIND_CLASS) {
+    if (!WEAPON_CLASSES.includes(KIND_CLASS[kind])) errors.push(`weapon kind "${kind}" maps to unknown class "${KIND_CLASS[kind]}"`);
+  }
+  if (!WEAPON_CLASSES.includes(UNARMED_CLASS)) errors.push(`unarmed class "${UNARMED_CLASS}" is not a weapon class`);
+  for (const cat of SLOT_CATEGORIES) {
+    if (cat === 'attack') continue;
+    const id = CATEGORY_DEFAULT[cat];
+    const d = id && SKILL_DEFS[id];
+    if (!d) errors.push(`category "${cat}" has no default skill`);
+    else if (d.category !== cat) errors.push(`category "${cat}" default "${id}" has category "${d.category}"`);
+    else if (Array.isArray(d.classes) && d.classes.length) {
+      errors.push(`category "${cat}" default "${id}" is weapon-restricted — a slot default must be unconditional`);
+    }
+  }
+  return errors;
+}
+
+{
+  const errors = validateSkillRegistry();
+  if (errors.length) {
+    console.error(`[skills] SKILL REGISTRY INVALID — guaranteed-skill rule violated (DESIGN §17.10):\n  ${errors.join('\n  ')}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Skill state (known ranks + loadout)
+// ---------------------------------------------------------------------------
+export function createSkillState() {
+  const known = {};
+  for (const id of defaultSkillIds()) known[id] = 1;
+  return {
+    known,
+    loadout: { attack: { ...CLASS_DEFAULT_ATTACK }, ...CATEGORY_DEFAULT },
+  };
+}
+
+// Forgiving load of a saved skillState: drops unknown skill ids and ill-typed entries, clamps ranks, re-seeds
+// defaults (always known). Loadout entries that don't name a known skill of the right category are dropped, so
+// that slot falls back to its default through activeSkill().
+export function normalizeSkillState(raw) {
+  const state = createSkillState();
+  const rawKnown = raw && raw.known && typeof raw.known === 'object' ? raw.known : {};
+  for (const id in rawKnown) {
+    if (!Object.prototype.hasOwnProperty.call(SKILL_DEFS, id)) continue;
+    const r = Math.floor(Number(rawKnown[id]));
+    if (!(r >= 1)) continue;
+    state.known[id] = Math.min(MAX_SKILL_RANK, r);
+  }
+  const isKnownOf = (id, cat) => typeof id === 'string' && Object.prototype.hasOwnProperty.call(SKILL_DEFS, id)
+    && SKILL_DEFS[id].category === cat && state.known[id] >= 1;
+  const rawLoadout = raw && raw.loadout && typeof raw.loadout === 'object' ? raw.loadout : {};
+  const rawAttack = rawLoadout.attack && typeof rawLoadout.attack === 'object' ? rawLoadout.attack : {};
+  for (const cls in rawAttack) {
+    const id = rawAttack[cls];
+    // Kept even if currently ineligible for `cls` (§17.10: an assignment survives and returns once eligible).
+    if (isKnownOf(id, 'attack')) state.loadout.attack[cls] = id;
+  }
+  for (const cat of SLOT_CATEGORIES) {
+    if (cat === 'attack') continue;
+    if (isKnownOf(rawLoadout[cat], cat)) state.loadout[cat] = rawLoadout[cat];
+  }
+  return state;
+}
+
+// Rank the player has in a skill (0 = not known). Defaults are always known, at least rank 1.
+export function skillRank(player, skillId) {
+  const known = player && player.skillState && player.skillState.known;
+  const r = known && known[skillId];
+  if (r >= 1) return Math.min(MAX_SKILL_RANK, r);
+  return defaultSkillIds().includes(skillId) ? 1 : 0;
+}
+
+// Is `def` usable in a slot of `category` for a player whose weapon class is `cls`?
+function eligible(player, def, category, cls) {
+  if (!def || def.category !== category || skillRank(player, def.id) < 1) return false;
+  const classes = Array.isArray(def.classes) ? def.classes : [];
+  if (category === 'attack') return classes.includes(cls);
+  return classes.length === 0 || classes.includes(cls);
+}
+
+// ---------------------------------------------------------------------------
+// activeSkill — what's in HUD slot `slotIndex` (0-3) right now (DESIGN §17.10):
+//   slot 0: weapon class -> player's loadout choice for that class if still eligible -> class default.
+//   slots 1-3: player's loadout choice for the category if eligible -> category default.
+// Always returns a skill definition (guaranteed-skill rule), or null only for an out-of-range slot index.
+// ---------------------------------------------------------------------------
+export function activeSkill(player, slotIndex) {
+  const category = SLOT_CATEGORIES[slotIndex];
+  if (!category) return null;
+  const cls = weaponClass(player);
+  const loadout = (player && player.skillState && player.skillState.loadout) || {};
+  if (category === 'attack') {
+    const choice = SKILL_DEFS[(loadout.attack || {})[cls]];
+    if (eligible(player, choice, 'attack', cls)) return choice;
+    return SKILL_DEFS[CLASS_DEFAULT_ATTACK[cls]] || SKILL_DEFS[CLASS_DEFAULT_ATTACK[UNARMED_CLASS]];
+  }
+  const choice = SKILL_DEFS[loadout[category]];
+  if (eligible(player, choice, category, cls)) return choice;
+  return SKILL_DEFS[CATEGORY_DEFAULT[category]];
+}
+
+// ---------------------------------------------------------------------------
+// Cooldowns
+// ---------------------------------------------------------------------------
+export function effectiveCooldown(skillDef, rank, player) {
+  const cdr = Math.min(MAX_COOLDOWN_REDUCTION, Math.max(0, (player && player.stats && player.stats.cooldownReduction) || 0));
+  return skillDef.baseCooldown * Math.pow(RANK_COOLDOWN_MULT, Math.max(1, rank) - 1) * (1 - cdr);
+}
+
+// -> { t, max } (t = seconds remaining, max = the full duration set when it was cast) or null if never cast.
+export function skillCooldown(player, skillId) {
+  const cds = player && player.skillCooldowns;
+  return (cds && cds[skillId]) || null;
 }
 
 // ---------------------------------------------------------------------------
@@ -79,10 +312,12 @@ export function createSkillLoadout() {
 export function useSkill(game, index) {
   const player = game.player;
   if (!player || player.dead) return false;
-  const skill = player.skills && player.skills[index];
+  const skill = activeSkill(player, index);
   if (!skill) return false;
+  const rank = skillRank(player, skill.id);
 
-  if (skill.cooldown > 0) return false;
+  const cd = skillCooldown(player, skill.id);
+  if (cd && cd.t > 0) return false;
 
   if (skill.manaCost > 0 && player.mana < skill.manaCost) {
     if (player._noManaFlashTimer <= 0) {
@@ -93,43 +328,37 @@ export function useSkill(game, index) {
     return false;
   }
 
-  let performed = false;
-  switch (skill.id) {
-    case 'cleave': performed = castCleave(game, player, skill); break;
-    case 'arcaneBolt': performed = castArcaneBolt(game, player, skill); break;
-    case 'frostNova': performed = castFrostNova(game, player, skill); break;
-    case 'shadowDash': performed = castShadowDash(game, player, skill); break;
-    default: performed = false;
-  }
-
-  if (!performed) return false;
+  if (!skill.cast(game, player, skill, rank)) return false;
 
   player.mana = Math.max(0, player.mana - skill.manaCost);
-  skill.cooldown = cooldownForRank(skill.baseCooldown, skill.rank);
-  try { game.bus && game.bus.emit('skillUsed', { skill }); } catch (e) { /* ignore */ }
+  const dur = effectiveCooldown(skill, rank, player);
+  if (!player.skillCooldowns) player.skillCooldowns = {};
+  player.skillCooldowns[skill.id] = { t: dur, max: dur };
+  try { game.bus && game.bus.emit('skillUsed', { skill, rank }); } catch (e) { /* ignore */ }
   return true;
 }
 
 // ---------------------------------------------------------------------------
-// updateSkills — tick cooldowns
+// updateSkills — tick every skill's own cooldown, slotted or not (§17.10)
 // ---------------------------------------------------------------------------
 export function updateSkills(game, dt) {
-  const player = game.player;
-  if (!player || !Array.isArray(player.skills)) return;
-  for (const skill of player.skills) {
-    if (skill.cooldown > 0) skill.cooldown = Math.max(0, skill.cooldown - dt);
+  const cds = game.player && game.player.skillCooldowns;
+  if (!cds) return;
+  for (const id in cds) {
+    if (cds[id].t > 0) cds[id].t = Math.max(0, cds[id].t - dt);
   }
 }
 
 // ---------------------------------------------------------------------------
-// upgradeSkill
+// upgradeSkill — spend 1 skill point on a known skill's own rank (max MAX_SKILL_RANK)
 // ---------------------------------------------------------------------------
-export function upgradeSkill(player, index) {
+export function upgradeSkill(player, skillId) {
   if (!player || player.skillPoints <= 0) return false;
-  const skill = player.skills && player.skills[index];
-  if (!skill) return false;
-  if (skill.rank >= skill.maxRank) return false;
-  skill.rank += 1;
+  if (!SKILL_DEFS[skillId]) return false;
+  const rank = skillRank(player, skillId);
+  if (rank < 1 || rank >= MAX_SKILL_RANK) return false;
+  if (!player.skillState) player.skillState = createSkillState();
+  player.skillState.known[skillId] = rank + 1;
   player.skillPoints -= 1;
   return true;
 }
@@ -137,44 +366,14 @@ export function upgradeSkill(player, index) {
 // ---------------------------------------------------------------------------
 // skillDescription — human string with current numbers
 // ---------------------------------------------------------------------------
-export function skillDescription(skill, player) {
-  const stats = (player && player.stats) || {};
-  const rank = skill.rank;
-  switch (skill.id) {
-    case 'cleave': {
-      const mult = rankMult(rank);
-      const lo = Math.max(1, Math.round((stats.meleeMin ?? 1) * mult));
-      const hi = Math.max(lo + 1, Math.round((stats.meleeMax ?? 3) * mult));
-      const kb = rank >= 3 ? ' Knockback on hit.' : ' Knockback on crit.';
-      return `Deals ${lo}-${hi} damage to 3 tiles in front.${kb}`;
-    }
-    case 'arcaneBolt': {
-      const mult = rankMult(rank);
-      const lo = Math.max(1, Math.round((stats.rangedMin ?? 1) * mult));
-      const hi = Math.max(lo + 1, Math.round((stats.rangedMax ?? 3) * mult));
-      const pierce = rank >= 5 ? 2 : rank >= 3 ? 1 : 0;
-      const pierceStr = pierce > 0 ? ` Pierces ${pierce} enemy${pierce > 1 ? 'ies' : ''}.` : '';
-      return `Fires a bolt dealing ${lo}-${hi} damage.${pierceStr} Costs ${skill.manaCost} mana.`;
-    }
-    case 'frostNova': {
-      const radius = (NOVA_BASE_RADIUS + (rank - 1) * NOVA_RADIUS_PER_RANK).toFixed(2);
-      const mult = rankMult(rank);
-      const power = Math.round((stats.spellPower ?? 5) * mult);
-      const freeze = (NOVA_FROZEN_BASE + (rank - 1) * NOVA_FROZEN_PER_RANK).toFixed(1);
-      return `Deals ~${power} damage to all enemies within ${radius} tiles, freezing them for ${freeze}s and slowing after. Costs ${skill.manaCost} mana.`;
-    }
-    case 'shadowDash': {
-      const tiles = rank >= 4 ? DASH_BASE_TILES + 1 : DASH_BASE_TILES;
-      const invuln = (DASH_INVULN_BASE + (rank - 1) * DASH_INVULN_PER_RANK).toFixed(2);
-      return `Dash up to ${tiles} tiles, gaining ${invuln}s of invulnerability. Costs ${skill.manaCost} mana.`;
-    }
-    default:
-      return skill.description || '';
-  }
+export function skillDescription(skillId, rank, player) {
+  const def = SKILL_DEFS[skillId];
+  if (!def) return '';
+  return typeof def.describe === 'function' ? def.describe(rank, player) : (def.description || '');
 }
 
 // ---------------------------------------------------------------------------
-// Skill implementations
+// Skill implementations — cast(game, player, skill /*def*/, rank) -> bool (false = didn't go off: no cost/cooldown)
 // ---------------------------------------------------------------------------
 
 function facingOf(player) {
@@ -188,7 +387,7 @@ function perpOf(facing) {
   return { x: -facing.y, y: facing.x };
 }
 
-function castCleave(game, player, skill) {
+function castCleave(game, player, skill, rank) {
   const facing = facingOf(player);
   const perp = perpOf(facing);
   const fx = player.x + facing.x, fy = player.y + facing.y;
@@ -198,8 +397,8 @@ function castCleave(game, player, skill) {
     { x: fx - perp.x, y: fy - perp.y },
   ];
 
-  const mult = rankMult(skill.rank);
-  let hitAny = false;
+  const mult = rankMult(rank);
+  const knockbackAlways = perkTotal(skill, rank, 'knockbackAlways') > 0;
   const rng = game.rng;
   const critChance = player.stats.critChance;
   const critMult = player.stats.critMult;
@@ -207,12 +406,10 @@ function castCleave(game, player, skill) {
   for (const t of targets) {
     const enemy = typeof game.enemyAt === 'function' ? game.enemyAt(t.x, t.y) : null;
     if (!enemy) continue;
-    hitAny = true;
     const power = rng.range(player.stats.meleeMin, player.stats.meleeMax) * mult;
     const { amount, crit } = computeDamage(power, enemy.defense, rng, critChance, critMult);
-    const doKnockback = skill.rank >= 3 || crit;
-    const opts = { crit, source: 'melee', element: 'physical' };
-    if (doKnockback) opts.knockback = { x: facing.x, y: facing.y };
+    const opts = { crit, source: 'melee', element: skill.element };
+    if (knockbackAlways || crit) opts.knockback = { x: facing.x, y: facing.y };
     if (typeof game.damageEnemy === 'function') game.damageEnemy(enemy, amount, opts);
   }
 
@@ -220,31 +417,31 @@ function castCleave(game, player, skill) {
   return true; // consumes cooldown/mana even on a whiff, matching a real "swing"
 }
 
-function castArcaneBolt(game, player, skill) {
+function castArcaneBolt(game, player, skill, rank) {
   const facing = facingOf(player);
   const rng = game.rng;
-  const mult = rankMult(skill.rank);
+  const mult = rankMult(rank);
   const power = rng.range(player.stats.rangedMin, player.stats.rangedMax) * mult;
   const critChance = player.stats.critChance;
   const critMult = player.stats.critMult;
-  // Precompute final damage (ignoring target defense — ranged/spell damage bypasses armor per contract note);
+  // Precompute final damage (ignoring target defense — spell damage bypasses armor per contract note);
   // crit is rolled here so main.js/renderer can react to it (e.g. bigger float text) without recomputing.
   const crit = rng.chance(critChance);
   let amount = power * (1 + rng.range(-0.15, 0.15));
   if (crit) amount *= critMult;
   amount = Math.max(1, Math.round(amount));
 
-  const pierce = skill.rank >= 5 ? 2 : skill.rank >= 3 ? 1 : 0;
+  const pierce = perkTotal(skill, rank, 'pierce');
   // Analog stick play aims freely (player.aim) from the free-movement position (fx/fy).
   const ox = player.fx ?? player.x, oy = player.fy ?? player.y;
-  const aim = assistAim(game, player, player.aim || facing, ox, oy);
+  const aim = assistAim(game, player, skill, player.aim || facing, ox, oy);
 
   if (typeof game.spawnProjectile === 'function') {
     game.spawnProjectile({
       x: ox, y: oy,
       dx: aim.x, dy: aim.y,
       speed: BOLT_SPEED,
-      range: BOLT_RANGE,
+      range: skill.range,
       damage: amount,
       crit,
       power: true,
@@ -253,24 +450,24 @@ function castArcaneBolt(game, player, skill) {
       size: 0.22,
       pierce,
       kind: 'bolt',
-      element: 'arcane',
+      element: skill.element,
     });
   }
   return true;
 }
 
-// Generic ranged-skill aim assist: nudges the initial fire direction toward the closest enemy that is in range,
-// inside the forward cone, and in line of sight, by player.stats.autoAimAssist. Not tied to any one skill's
-// identity — any ranged skill's cast function can call this. Returns `aim` unchanged when there is no assist
-// or no target.
-function assistAim(game, player, aim, ox, oy) {
+// Generic aim assist for any skill with aimed:true: nudges the initial fire direction toward the closest enemy
+// that is within that skill's own `range`, inside the forward cone, and in line of sight, by
+// player.stats.autoAimAssist. Returns `aim` unchanged for non-aimed skills, with no assist, or with no target.
+function assistAim(game, player, skill, aim, ox, oy) {
   const assist = (player.stats && player.stats.autoAimAssist) || 0;
+  const range = skill && skill.aimed ? skill.range : 0;
   const alen = Math.hypot(aim.x, aim.y);
-  if (assist <= 0 || alen === 0 || typeof game.enemiesInRadius !== 'function') return aim;
+  if (assist <= 0 || !(range > 0) || alen === 0 || typeof game.enemiesInRadius !== 'function') return aim;
   const ax = aim.x / alen, ay = aim.y / alen;
   const canSee = typeof game.hasLineOfSight === 'function';
   let best = null, bestD = Infinity;
-  for (const e of game.enemiesInRadius(ox, oy, BOLT_RANGE)) {
+  for (const e of game.enemiesInRadius(ox, oy, range)) {
     const ex = e.x - ox, ey = e.y - oy;
     const d = Math.hypot(ex, ey);
     if (d === 0 || d >= bestD) continue;
@@ -285,20 +482,20 @@ function assistAim(game, player, aim, ox, oy) {
   return { x: bx / blen, y: by / blen };
 }
 
-function castFrostNova(game, player, skill) {
-  const radius = NOVA_BASE_RADIUS + (skill.rank - 1) * NOVA_RADIUS_PER_RANK;
-  const mult = rankMult(skill.rank);
+function castFrostNova(game, player, skill, rank) {
+  const radius = NOVA_BASE_RADIUS + (rank - 1) * NOVA_RADIUS_PER_RANK;
+  const mult = rankMult(rank);
   const rng = game.rng;
   const critChance = player.stats.critChance;
   const critMult = player.stats.critMult;
 
   const enemies = typeof game.enemiesInRadius === 'function' ? game.enemiesInRadius(player.x, player.y, radius) : [];
-  const frozen = NOVA_FROZEN_BASE + (skill.rank - 1) * NOVA_FROZEN_PER_RANK;
+  const frozen = NOVA_FROZEN_BASE + (rank - 1) * NOVA_FROZEN_PER_RANK;
 
   for (const enemy of enemies) {
     const power = player.stats.spellPower * mult;
     const { amount, crit } = computeDamage(power, enemy.defense, rng, critChance, critMult);
-    if (typeof game.damageEnemy === 'function') game.damageEnemy(enemy, amount, { crit, source: 'spell', element: 'frost' });
+    if (typeof game.damageEnemy === 'function') game.damageEnemy(enemy, amount, { crit, source: 'spell', element: skill.element });
     // Status-effect durations scale by the target's resist to that effect (enemies.js
     // ENEMY_TYPES.resist) — e.g. Bone Tyrant shrugs off most of the freeze/slow, Slime King
     // barely resists either. Regular enemies have no resist table, so this is a no-op for them.
@@ -310,11 +507,11 @@ function castFrostNova(game, player, skill) {
   return true; // always "goes off" even with 0 targets in range — it's still a mana-spending AoE pulse
 }
 
-function castShadowDash(game, player, skill) {
+function castShadowDash(game, player, skill, rank) {
   const facing = facingOf(player);
   if (facing.x === 0 && facing.y === 0) return false;
 
-  const maxTiles = skill.rank >= 4 ? DASH_BASE_TILES + 1 : DASH_BASE_TILES;
+  const maxTiles = DASH_BASE_TILES + perkTotal(skill, rank, 'dashTiles');
   const oldX = player.x, oldY = player.y;
   let steps = 0;
   let cx = player.x, cy = player.y;
@@ -332,7 +529,7 @@ function castShadowDash(game, player, skill) {
 
   player.x = cx;
   player.y = cy;
-  player.invuln = Math.max(player.invuln || 0, DASH_INVULN_BASE + (skill.rank - 1) * DASH_INVULN_PER_RANK);
+  player.invuln = Math.max(player.invuln || 0, DASH_INVULN_BASE + (rank - 1) * DASH_INVULN_PER_RANK);
 
   if (typeof game.effect === 'function') game.effect('dash', cx, cy, { from: { x: oldX, y: oldY } });
   return true;
