@@ -69,8 +69,9 @@ test('computeValue: 2H weapons x1.4, everything else unchanged', () => {
 test('generated bow: base stats x1.5 and value x1.4', () => {
   const L = 10;
   const bow = generateItem(5, orderRng, { type: 'weapon', weaponKind: 'bow', rarity: 'common', itemLevel: L });
-  // With pool order, the one extra affix on a common bow is Vicious (damage only), so spellPower/dex are pure base.
-  assert.equal(bow.stats.spellPower, Math.round((0.5 + L * 0.3) * TWO_HAND_STAT_MULT));
+  // With pool order, the one extra affix on a common bow is Vicious (damage only), so dex is pure base.
+  // Bows roll no baseline spell power (a pure dex weapon) — only the generic "of Power" affix can add it.
+  assert.equal(bow.stats.spellPower, undefined);
   assert.equal(bow.stats.dex, Math.round((1 + L * 0.5) * TWO_HAND_STAT_MULT * 10) / 10);
   assert.equal(bow.value, computeValue('weapon', L, 'common', 'bow'));
 });

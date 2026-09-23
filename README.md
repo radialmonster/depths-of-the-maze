@@ -47,6 +47,11 @@ Inventory: click = equip/use, right-click = drop, shift-click = salvage for gold
       the merchant, alongside Buyback) would make experimenting with builds less risky.
 - [ ] **More shop depth.** No reroll/reforge on gear affixes yet — could pair well with the existing salvage-to-gold
       path now that Buyback gives selling more of a safety net.
+- [ ] **Magical weapon affixes** (e.g. a "Bow of Fire"), for any weapon kind, not just bows. Likely smaller than it
+      sounds: skills are already element-tagged and enemies already have per-element resist/vulnerability
+      (DESIGN.md §17.6), so this is mostly "let a weapon affix grant/override the wielder's attack-skill element,"
+      not a new system. Needs a decision on whether an elemental weapon hit stays physical (reduced by armor) or
+      acts like a spell (bypasses armor) — see §17.12's armor-vs-spell rule.
 
 ## In-progress design discussion: bows, two-handed weapons, skill loadouts
 Not yet implemented — this is a running log of an ongoing design conversation (with an Opus research agent) so it

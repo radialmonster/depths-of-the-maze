@@ -616,8 +616,9 @@ must be ≥1.1× a same-level wand+orb combo, or wand+orb strictly dominates and
   behaving exactly as before until Phase 5 adds its entry. skills.js derives `WEAPON_CLASSES` and
   `CLASS_DEFAULT_ATTACK` from this table + fallback (the old `KIND_CLASS` shim is gone), and the registry validator
   checks each entry's `defaultAttack` matches its class default.
-- Bow keeps its existing base `spellPower` stat (now ×1.5 like its other base stats) — a small hybrid bonus to
-  Arcane Bolt/Frost Nova; drop it if bows should be purely dex.
+- Bow rolls **no** baseline `spellPower` — decided as a pure dex weapon, to keep str/melee, dex/bow, int/caster a
+  clean three-way split. The generic "of Power" affix can still roll `spellPower` onto a bow (or any weapon) as a
+  random bonus, same as any other item — only the guaranteed base-stat entry was removed.
 - A point-blank hit (§17.12) never crits: it uses the bottom of the roll, so the release crit is dropped for that hit.
 - **Piercing** (bow-only prefix, `kinds:['bow']` on the affix): +1 `pierce` stat → `player.stats.pierce` → added to
   each Bow Shot arrow's existing projectile `pierce` field. Not shown as a Derived row, but counted by `compareGear`.

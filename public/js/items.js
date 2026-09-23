@@ -205,7 +205,7 @@ function weaponBaseStats(kind, lvl) {
     }
     case 'bow': {
       const min = 1 + lvl * 0.8;
-      return { damageMin: min, damageMax: min + (2 + lvl * 0.3), dex: 1 + lvl * 0.5, spellPower: 0.5 + lvl * 0.3 };
+      return { damageMin: min, damageMax: min + (2 + lvl * 0.3), dex: 1 + lvl * 0.5 };
     }
     default:
       return { damageMin: 1, damageMax: 2 };
