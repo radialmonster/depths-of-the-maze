@@ -1734,6 +1734,8 @@ export class UI {
       const row = this.dom.attrRows.find((r) => r.attr.id === attrId);
       if (row) flash(row.value, 'dm-bump');
       this._refreshCharacterPanel();
+    } else {
+      sfx.denied();
     }
   }
 
@@ -1757,13 +1759,14 @@ export class UI {
     d.charXpFill.style.width = `${clamp(p.xp / Math.max(1, need), 0, 1) * 100}%`;
 
     const ap = p.attrPoints || 0;
-    d.attrPoints.textContent = ap > 0 ? `${ap} point${ap === 1 ? '' : 's'}` : '';
-    d.attrPoints.classList.toggle('dm-show', ap > 0);
+    d.attrPoints.textContent = `${ap} point${ap === 1 ? '' : 's'}`;
+    d.attrPoints.classList.toggle('dm-zero', ap <= 0);
 
     for (const row of d.attrRows) {
       const v = String(p.base[row.attr.id]);
       if (row.value.textContent !== v) row.value.textContent = v;
       row.row.classList.toggle('dm-can-spend', ap > 0);
+      row.plusBtn.disabled = ap <= 0;
     }
 
     this._fillDerived(d.derivedRows, p.stats);
@@ -1871,8 +1874,8 @@ export class UI {
     const d = this.dom;
     const cur = this._skillsCursor;
     const sp = p.skillPoints || 0;
-    setText(d.skillListPoints, sp > 0 ? `${sp} point${sp === 1 ? '' : 's'}` : '');
-    d.skillListPoints.classList.toggle('dm-show', sp > 0);
+    setText(d.skillListPoints, `${sp} point${sp === 1 ? '' : 's'}`);
+    d.skillListPoints.classList.toggle('dm-zero', sp <= 0);
 
     const model = this._skillsModel(p);
     const weapon = p.equipment && p.equipment.weapon;
@@ -3021,11 +3024,11 @@ const CSS_TEXT = `
   text-transform: uppercase; letter-spacing: 0.08em; padding-bottom: 6px; margin-bottom: 10px; border-bottom: 2px solid var(--dm-line);
 }
 .dm-points-badge {
-  display: none; font-family: 'Nunito', sans-serif; text-transform: none; letter-spacing: 0; font-size: 12px; font-weight: 900;
+  display: inline-block; font-family: 'Nunito', sans-serif; text-transform: none; letter-spacing: 0; font-size: 12px; font-weight: 900;
   color: #5c3c00; background: linear-gradient(180deg, #ffe066, #fcc419); padding: 1px 9px; border-radius: 999px;
   box-shadow: 0 0 10px rgba(255,212,59,0.7);
 }
-.dm-points-badge.dm-show { display: inline-block; }
+.dm-points-badge.dm-zero { color: var(--dm-text-dim); background: none; box-shadow: none; }
 
 .dm-char-summary { display: flex; align-items: center; gap: 10px; font-weight: 800; font-size: 13px; color: var(--dm-text-dim); }
 .dm-char-level { font-family: 'Fredoka', sans-serif; font-weight: 700; font-size: 16px; color: var(--dm-grape-deep); }
@@ -3045,11 +3048,10 @@ const CSS_TEXT = `
 .dm-plus {
   width: 28px; height: 28px; border-radius: 9px; flex: 0 0 auto; font-weight: 900; font-size: 16px; line-height: 1;
   color: #fff; background: linear-gradient(180deg, #69db7c, #40c057); box-shadow: 0 3px 0 #2f9e44;
-  display: none; align-items: center; justify-content: center; transition: transform 0.08s, filter 0.15s;
+  display: inline-flex; align-items: center; justify-content: center; transition: transform 0.08s, filter 0.15s;
 }
 .dm-plus:hover:not(:disabled) { filter: brightness(1.07); transform: translateY(-1px); }
 .dm-plus:active:not(:disabled) { transform: translateY(2px); box-shadow: 0 1px 0 #2f9e44; }
-.dm-can-spend .dm-plus, .dm-plus-wide { display: inline-flex; }
 .dm-plus-wide { width: auto; padding: 0 12px; font-size: 12px; font-family: 'Fredoka', sans-serif; font-weight: 600; }
 .dm-plus:disabled { background: #e9ecef; color: #adb5bd; box-shadow: 0 3px 0 #dee2e6; cursor: default; }
 .dm-plus.dm-maxed { background: linear-gradient(180deg, #b197fc, #7950f2); color: #fff; box-shadow: 0 3px 0 #5f3dc4; }
