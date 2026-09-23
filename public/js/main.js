@@ -6,7 +6,7 @@ import { Renderer } from './renderer.js';
 import { createPlayer, recalcStats, gainXP, mitigate, updatePlayer } from './character.js';
 import { createSkillLoadout, useSkill, updateSkills } from './skills.js';
 import { spawnEnemies, updateEnemies, createEnemy, getResist } from './enemies.js';
-import { rollLoot, startingGear, addToInventory, useItem, generateItem } from './items.js';
+import { rollLoot, startingGear, addToInventory, useItem, generateItem, activePotion } from './items.js';
 import { Input } from './input.js';
 import { UI, padLabel } from './ui.js';
 import { sfx, wireAudio } from './audio.js';
@@ -367,6 +367,9 @@ function continueGame(data) {
     p.equipment = sp.equipment ? { ...p.equipment, ...sp.equipment } : p.equipment;
     p.inventory = Array.isArray(sp.inventory) ? sp.inventory : p.inventory;
     p.skills = Array.isArray(sp.skills) && sp.skills.length ? sp.skills.map((s) => ({ ...s, cooldown: 0 })) : createSkillLoadout();
+    // Hotbar potion pins (absent in older saves -> null = best-first default).
+    p.activeHealPotionId = sp.activeHealPotionId ?? null;
+    p.activeManaPotionId = sp.activeManaPotionId ?? null;
 
     // Bump the id counter past every id in the restored equipment/inventory so new items,
     // enemies and projectiles created from here on never collide with a saved id.
@@ -711,7 +714,7 @@ function updateDeadEnemies(dt) {
 
 function drinkPotion(kind) {
   const p = game.player;
-  const potion = p.inventory.find((it) => it && it.type === 'potion' && it.potion && it.potion[kind] > 0);
+  const potion = activePotion(p, kind); // pinned stack, else strongest (DESIGN.md §17.8b)
   if (!potion) {
     game.floatText(p.x, p.y, kind === 'heal' ? 'No health potions' : 'No mana potions', '#aaa');
     game.bus.emit('denied');

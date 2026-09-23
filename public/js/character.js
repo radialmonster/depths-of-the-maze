@@ -63,7 +63,7 @@ export function createPlayer() {
     attrPoints: 0,
     skillPoints: 0,
     gold: 0,
-    base: { str: 5, dex: 5, int: 5, vit: 5, def: 3 },
+    base: { str: 5, dex: 5, int: 5, vit: 5, def: 5 },
     hp: 1,
     mana: 1,
     stats: {
@@ -81,6 +81,8 @@ export function createPlayer() {
     },
     equipment: { weapon: null, offhand: null, helm: null, armor: null, boots: null, ring: null, amulet: null },
     inventory: [],
+    activeHealPotionId: null, // hotbar potion pins (items.js activePotion); null = strongest first
+    activeManaPotionId: null,
     skills: [],
     moveTimer: 0,
     invuln: 0,

@@ -7,11 +7,20 @@
 
 import { ATTRIBUTES, xpForLevel, spendAttribute } from './character.js';
 import { upgradeSkill, skillDescription } from './skills.js';
-import { equipItem, unequipItem, useItem, dropItem, sellValue, itemTooltip, compareGear, equipUpgrades, SLOTS, INVENTORY_SIZE } from './items.js';
-import { buyFromMerchant, sellToMerchant, nearbyMerchant, shopPrice } from './shop.js';
+import { equipItem, unequipItem, useItem, dropItem, sellValue, itemTooltip, compareGear, equipUpgrades, SLOTS, INVENTORY_SIZE,
+  activePotion, pinnedPotion, potionHotbarKind, togglePotionPin } from './items.js';
+import { buyFromMerchant, sellToMerchant, buybackFromMerchant, nearbyMerchant, shopPrice } from './shop.js';
 import { RARITY, clamp, TILE, ELEMENTS, ELEMENT_ORDER } from './core.js';
 import { ENEMY_TYPES } from './enemies.js';
 import { sfx } from './audio.js';
+import { depthTheme } from './renderer.js';
+
+// The down-stairs accent for a depth, as an [r,g,b] triple — the same colour as the floating
+// 3D stairs sign (renderer.js `signColor`), so minimap and world always match.
+function exitRGB(depth) {
+  const a = depthTheme(depth).accent;
+  return [(a >> 16) & 255, (a >> 8) & 255, a & 255];
+}
 
 const SKILL_KEY_LABEL = ['1', '2', '3', '4'];
 const SKILL_PAD_LABEL = ['A', 'X', 'Y', 'B'];
@@ -61,7 +70,7 @@ function describeResistHTML(typeId) {
 const POTION_LIQUID = { heal: '#f03e3e', mana: '#1c7ed6' };
 function potionIconSvg(kind) {
   const liquid = POTION_LIQUID[kind] || POTION_LIQUID.heal;
-  return `<svg class="dm-potion-svg" viewBox="0 0 32 32" width="1em" height="1em" aria-hidden="true">`
+  return `<svg class="dm-potion-svg" viewBox="0 0 32 32" width="1.35em" height="1.35em" aria-hidden="true">`
     + `<path d="M13 6.5h6v5.2a9.5 9.5 0 1 1-6 0z" fill="#eef6ff"/>`
     + `<path d="M8.4 15H23.6A9.5 9.5 0 1 1 8.4 15z" fill="${liquid}"/>`
     + `<path d="M13 6.5h6v5.2a9.5 9.5 0 1 1-6 0z" fill="none" stroke="#2b2d42" stroke-width="1.6" stroke-linejoin="round"/>`
@@ -96,8 +105,8 @@ const GEAR_STATS = ['melee', 'spellPower', 'defense', 'maxHp', 'maxMana', 'critC
 const CONTROLS = [
   ['Move', ['W', 'A', 'S', 'D'], ['L-Stick', 'D-pad']],
   ['Skills', ['1', '2', '3', '4'], ['A', 'X', 'Y', 'B']],
-  ['Health potion', ['H'], ['LT']],
-  ['Mana potion', ['M'], ['RT']],
+  ['Health potion', ['5'], ['LT']],
+  ['Mana potion', ['6'], ['RT']],
   ['Trade', ['E'], ['A']],
   ['Character', ['C'], ['LB']],
   ['Inventory', ['I'], ['RB']],
@@ -453,10 +462,13 @@ export class UI {
       const k = mk('div', 'dm-potion-key', btn, key);
       return { btn, count, key: k };
     };
-    const potHeal = mkPotion('dm-potion-heal', 'heal', 'H');
-    const potMana = mkPotion('dm-potion-mana', 'mana', 'M');
-    potHeal.btn.addEventListener('click', () => this._useFirstPotion('heal'));
-    potMana.btn.addEventListener('click', () => this._useFirstPotion('mana'));
+    const potHeal = mkPotion('dm-potion-heal', 'heal', '5');
+    const potMana = mkPotion('dm-potion-mana', 'mana', '6');
+    for (const [pot, kind] of [[potHeal, 'heal'], [potMana, 'mana']]) {
+      pot.btn.addEventListener('click', () => { this._useFirstPotion(kind); this._showPotionSlotTip(pot.btn, kind); });
+      pot.btn.addEventListener('mouseenter', () => this._showPotionSlotTip(pot.btn, kind));
+      pot.btn.addEventListener('mouseleave', () => this._hideTooltip());
+    }
 
     const xpBar = mk('div', 'dm-xpbar', dock);
     const xpFill = mk('div', 'dm-xpbar-fill', xpBar);
@@ -609,12 +621,16 @@ export class UI {
       const icon = mk('div', 'dm-inv-icon', cell, '');
       const stack = mk('div', 'dm-inv-stack', cell, '');
       const cmp = mk('div', 'dm-cmp', cell, '');
+      // Potion-only hotbar pin (same corner as the gear compare badge, which potions never show).
+      // Its own click target: stopPropagation keeps it from also drinking via the cell click.
+      const pin = mk('button', 'dm-pin dm-pin-none', cell, '☆');
+      pin.addEventListener('click', (e) => { e.stopPropagation(); this._togglePinInvCell(i); });
       cell.addEventListener('click', (e) => this._clickInvCell(i, e));
       cell.addEventListener('contextmenu', (e) => { e.preventDefault(); this._dropInvCell(i); });
-      cell.addEventListener('mouseenter', (e) => this._hoverInvCell(i, e));
+      cell.addEventListener('mouseenter', (e) => { this._hoverInvIndex = i; this._hoverInvCell(i, e); });
       cell.addEventListener('mousemove', (e) => this._positionTooltip(e.clientX, e.clientY));
-      cell.addEventListener('mouseleave', () => { this._hideTooltip(); this._previewGear(null); });
-      cellEls.push({ cell, icon, stack, cmp });
+      cell.addEventListener('mouseleave', () => { this._hoverInvIndex = null; this._hideTooltip(); this._previewGear(null); });
+      cellEls.push({ cell, icon, stack, cmp, pin });
     }
 
     mk('div', 'dm-section-title dm-inv-stats-title', right, 'Gear Stats');
@@ -645,8 +661,11 @@ export class UI {
     mk('span', '', tabBuy, '🛒 Buy');
     const tabSell = mk('button', 'dm-tab', tabs);
     mk('span', '', tabSell, '💰 Sell');
+    const tabBuyback = mk('button', 'dm-tab', tabs);
+    mk('span', '', tabBuyback, '↩️ Buyback');
     tabBuy.addEventListener('click', () => this._setShopTab('buy'));
     tabSell.addEventListener('click', () => this._setShopTab('sell'));
+    tabBuyback.addEventListener('click', () => this._setShopTab('buyback'));
 
     const extra = mk('div', 'dm-panel-extra', header);
     mk('div', 'dm-shop-title', extra, '🧙 Merchant');
@@ -657,6 +676,7 @@ export class UI {
 
     const body = mk('div', 'dm-panel-body dm-shop-body', panel);
     const grid = mk('div', 'dm-inv-grid dm-shop-grid', body);
+    const empty = mk('div', 'dm-shop-empty', body, '');
     const cellEls = [];
     for (let i = 0; i < INVENTORY_SIZE; i++) {
       const cell = mk('div', 'dm-inv-cell dm-shop-cell', grid);
@@ -676,8 +696,8 @@ export class UI {
     const foot = mk('div', 'dm-panel-foot', panel);
 
     Object.assign(this.dom, {
-      shopPanel: panel, shopTabBuy: tabBuy, shopTabSell: tabSell,
-      shopGoldText: goldText, shopCells: cellEls, shopFoot: foot,
+      shopPanel: panel, shopTabBuy: tabBuy, shopTabSell: tabSell, shopTabBuyback: tabBuyback,
+      shopGrid: grid, shopEmpty: empty, shopGoldText: goldText, shopCells: cellEls, shopFoot: foot,
     });
   }
 
@@ -780,6 +800,7 @@ export class UI {
     if (this._inventoryOpen) { this._inventoryOpen = false; sfx.uiClick(); }
     else {
       this._characterOpen = false; this._inventoryOpen = true; this._invCursor = { area: 'grid', index: 0 };
+      this._hoverInvIndex = null; // mouseleave never fires if the panel closed under the cursor
       // Gamepad users get the cursor tooltip immediately; keyboard/mouse users only once they move the cursor.
       this._lastInvCursorKey = this.input && this.input.lastDevice === 'gamepad' ? null : 'grid:0';
       sfx.uiOpen();
@@ -795,6 +816,9 @@ export class UI {
     this._shopOpen = true;
     this._shopMerchant = merchant;
     this._shopTab = 'buy';
+    this.dom.shopTabBuy.classList.add('dm-tab-active');
+    this.dom.shopTabSell.classList.remove('dm-tab-active');
+    this.dom.shopTabBuyback.classList.remove('dm-tab-active');
     this._shopCursor = 0;
     // Gamepad users get the cursor tooltip immediately; keyboard/mouse users only once they move the cursor.
     this._lastShopCursorKey = this._initialShopCursorKey();
@@ -1138,8 +1162,57 @@ export class UI {
   _useFirstPotion(kind) {
     const p = this.game && this.game.player;
     if (!p) return;
-    const item = (p.inventory || []).find((it) => it && it.potion && it.potion[kind] > 0);
+    const item = activePotion(p, kind); // pinned stack, else strongest (DESIGN.md §17.8b)
     if (item) useItem(this.game, item);
+  }
+
+  _potionKeyLabel(kind) {
+    const style = (this.input && this.input.padStyle) || 'xbox';
+    const pad = !!(this.input && this.input.lastDevice === 'gamepad');
+    return pad ? padLabel(kind === 'heal' ? 'LT' : 'RT', style) : (kind === 'heal' ? '5' : '6');
+  }
+
+  // HUD potion slot tooltip: which stack the key will drink next and why.
+  _showPotionSlotTip(el, kind) {
+    const p = this.game && this.game.player;
+    if (!p) return;
+    const item = activePotion(p, kind);
+    const label = kind === 'heal' ? 'Health potion' : 'Mana potion';
+    const body = !item ? 'None in your bag.'
+      : `Drinks <b>${item.name}</b> ${pinnedPotion(p, kind) ? '(★ pinned)' : '(strongest)'}`;
+    this._showTooltip(el, `<div class="tt-title">${label} <span class="tt-rank">${this._potionKeyLabel(kind)}</span></div>`
+      + `<div class="tt-body">${body}</div><div class="tt-action">Pin a different potion from the Bag (☆)</div>`, 'above');
+  }
+
+  // Tooltip line for a bag potion: its hotbar status (pinned / auto-active / not active).
+  _potionPinNote(item, p) {
+    const kind = potionHotbarKind(item);
+    if (!kind) return '';
+    const key = this._potionKeyLabel(kind);
+    const pinned = pinnedPotion(p, kind);
+    const active = activePotion(p, kind);
+    if (pinned === item) return `<div class="tt-pin tt-pin-on">★ Pinned: ${key} drinks this first</div>`;
+    if (active === item) return `<div class="tt-pin">${key} drinks this first (strongest)</div>`;
+    return `<div class="tt-pin">${key} drinks ${active ? active.name : 'another potion'} first${pinned ? ' (pinned)' : ''}</div>`;
+  }
+
+  _togglePinInvCell(index, fromCursor = false) {
+    const p = this.game && this.game.player;
+    const item = p && p.inventory[index];
+    const res = togglePotionPin(p, item);
+    if (!res) return;
+    const kind = potionHotbarKind(item);
+    const key = this._potionKeyLabel(kind);
+    if (res === 'pinned') this.log(`${key} will drink ${item.name} first.`, '#fcc419');
+    else {
+      const next = activePotion(p, kind);
+      this.log(`Unpinned. ${key} drinks the strongest potion${next ? ` (${next.name})` : ''}.`, '#9aa3bd');
+    }
+    sfx.uiClick();
+    this._refreshInventoryPanel();
+    // Re-render whichever tooltip is showing for this cell (mouse hover or pad cursor).
+    if (fromCursor) this._lastInvCursorKey = null;
+    else if (this._hoverInvIndex === index) this._showTooltip(null, this._invCellTooltip(item, p));
   }
 
   _skillTooltip(sk, p) {
@@ -1178,8 +1251,8 @@ export class UI {
     const d = this.dom;
     d.btnCKey.textContent = gamepad ? padLabel('LB', style) : 'C';
     d.btnIKey.textContent = gamepad ? padLabel('RB', style) : 'I';
-    d.potHeal.key.textContent = gamepad ? padLabel('LT', style) : 'H';
-    d.potMana.key.textContent = gamepad ? padLabel('RT', style) : 'M';
+    d.potHeal.key.textContent = gamepad ? padLabel('LT', style) : '5';
+    d.potMana.key.textContent = gamepad ? padLabel('RT', style) : '6';
     for (const shell of [d.charShell, d.invShell]) {
       shell.tabKeys[0].textContent = gamepad ? padLabel('LB', style) : 'C';
       shell.tabKeys[1].textContent = gamepad ? padLabel('RB', style) : 'I';
@@ -1196,8 +1269,8 @@ export class UI {
       ? hint([['D-pad ↑↓', 'Navigate'], ['D-pad ←→', 'Attributes / Skills'], [padLabel('A', style), 'Spend point'], [lbrb, 'Switch tab'], [padLabel('B', style), 'Close']])
       : hint([['Click +', 'Spend point'], ['↑↓', 'Navigate'], ['←→', 'Attributes / Skills'], ['Enter', 'Spend'], ['I', 'Inventory'], ['Esc', 'Close']]);
     d.invShell.foot.innerHTML = gamepad
-      ? hint([['D-pad', 'Navigate'], [padLabel('A', style), 'Equip / Use'], [padLabel('Y', style), 'Equip upgrades'], [padLabel('X', style), 'Drop'], [lbrb, 'Switch tab'], [padLabel('B', style), 'Close']])
-      : hint([['Click', 'Equip / Use'], ['R', 'Equip upgrades'], ['Q / Right-click', 'Drop'], ['Shift+Click', 'Salvage for gold'], ['Esc', 'Close']]);
+      ? hint([['D-pad', 'Navigate'], [padLabel('A', style), 'Equip / Use'], [padLabel('Y', style), 'Equip upgrades'], [padLabel('X', style), 'Drop'], [`${padLabel('LT', style)} / ${padLabel('RT', style)}`, 'Pin potion'], [lbrb, 'Switch tab'], [padLabel('B', style), 'Close']])
+      : hint([['Click', 'Equip / Use'], ['R', 'Equip upgrades'], ['Q / Right-click', 'Drop'], ['Shift+Click', 'Salvage for gold'], ['F / ☆', 'Pin potion'], ['Esc', 'Close']]);
     d.invUpBtnKey.textContent = gamepad ? padLabel('Y', style) : 'R';
   }
 
@@ -1270,7 +1343,11 @@ export class UI {
 
     // Top-left.
     const depthStr = `Depth ${game.depth}`;
-    if (c.depthStr !== depthStr) { d.depthText.textContent = depthStr; c.depthStr = depthStr; }
+    if (c.depthStr !== depthStr) {
+      d.depthText.textContent = depthStr; c.depthStr = depthStr;
+      // Minimap legend "Stairs" dot follows the depth theme's accent (matches the 3D sign).
+      d.hud.style.setProperty('--dm-exit', `rgb(${exitRGB(game.depth).join(',')})`);
+    }
     const gold = p.gold || 0;
     if (c.gold !== gold) {
       if (c.gold != null && gold > c.gold) flash(d.goldChip, 'dm-bump');
@@ -1411,23 +1488,24 @@ export class UI {
       }
     }
 
-    // Entrance.
+    // Entrance (teal, matching the up-stairs sign's fixed 0x12b886 in renderer.js).
     if (map.entrance) {
-      ctx.fillStyle = 'rgba(34,184,207,0.95)';
+      ctx.fillStyle = 'rgba(18,184,134,0.95)';
       ctx.fillRect(offX + map.entrance.x * scale - 1, offY + map.entrance.y * scale - 1, cell + 2, cell + 2);
     }
 
     // Exits (pulsing ring).
     const pulse = 0.5 + 0.5 * Math.sin((game.time || 0) * 4);
     if (Array.isArray(map.exits)) {
+      const [er, eg, eb] = exitRGB(game.depth);
       for (const ex of map.exits) {
         const exIdx = map.idx ? map.idx(ex.x, ex.y) : ex.y * map.width + ex.x;
         if (!map.explored[exIdx]) continue;
         const cx = offX + ex.x * scale + cell / 2, cy = offY + ex.y * scale + cell / 2;
-        ctx.strokeStyle = `rgba(247,103,7,${0.35 + 0.4 * pulse})`;
+        ctx.strokeStyle = `rgba(${er},${eg},${eb},${0.35 + 0.4 * pulse})`;
         ctx.lineWidth = 2;
         ctx.beginPath(); ctx.arc(cx, cy, cell * (1.8 + pulse * 1.2), 0, Math.PI * 2); ctx.stroke();
-        ctx.fillStyle = '#f76707';
+        ctx.fillStyle = `rgb(${er},${eg},${eb})`;
         ctx.beginPath(); ctx.arc(cx, cy, Math.max(2.5, cell * 1.2), 0, Math.PI * 2); ctx.fill();
       }
     }
@@ -1641,11 +1719,19 @@ export class UI {
     if (!p) return;
     const item = p.inventory[index];
     if (item) {
-      const action = item.type === 'potion' ? 'Click to drink' : 'Click to equip';
-      this._showTooltip(null, itemTooltip(item, p) + `<div class="tt-action">${action} · Right-click to drop · Shift+click to salvage</div>`);
+      this._showTooltip(null, this._invCellTooltip(item, p));
       this._positionTooltip(e.clientX, e.clientY);
     }
     this._previewGear(item || null);
+  }
+
+  _invCellTooltip(item, p) {
+    if (item.type === 'potion') {
+      const verb = pinnedPotion(p, potionHotbarKind(item)) === item ? 'unpin' : 'pin';
+      return itemTooltip(item, p) + this._potionPinNote(item, p)
+        + `<div class="tt-action">Click to drink · ☆ or F to ${verb} · Right-click to drop · Shift+click to salvage</div>`;
+    }
+    return itemTooltip(item, p) + '<div class="tt-action">Click to equip · Right-click to drop · Shift+click to salvage</div>';
   }
 
   // Gear Stats list under the backpack: show "now → with item" for the hovered/focused bag item.
@@ -1707,9 +1793,22 @@ export class UI {
     }
 
     let upgrades = 0;
+    const hotbar = {
+      heal: { active: activePotion(p, 'heal'), pinned: pinnedPotion(p, 'heal') },
+      mana: { active: activePotion(p, 'mana'), pinned: pinnedPotion(p, 'mana') },
+    };
     for (let i = 0; i < d.invCells.length; i++) {
       const cellDom = d.invCells[i];
       const item = p.inventory[i];
+      // Pin badge: ★ pinned, ☆ solid = hotbar's current auto pick, faint ☆ on hover = pinnable.
+      const hk = potionHotbarKind(item);
+      const pinState = !hk ? 'none' : hotbar[hk].pinned === item ? 'on' : hotbar[hk].active === item ? 'auto' : 'off';
+      if (cellDom.pinState !== pinState) {
+        cellDom.pinState = pinState;
+        cellDom.pin.className = `dm-pin dm-pin-${pinState}`;
+        cellDom.pin.textContent = pinState === 'on' ? '★' : '☆';
+        cellDom.cell.classList.toggle('dm-pinned', pinState === 'on');
+      }
       if (!item) {
         if (cellDom.iconKey) { cellDom.icon.textContent = ''; cellDom.iconKey = ''; }
         if (cellDom.stack.textContent) cellDom.stack.textContent = '';
@@ -1765,6 +1864,7 @@ export class UI {
     this._lastShopCursorKey = this._initialShopCursorKey();
     this.dom.shopTabBuy.classList.toggle('dm-tab-active', tab === 'buy');
     this.dom.shopTabSell.classList.toggle('dm-tab-active', tab === 'sell');
+    this.dom.shopTabBuyback.classList.toggle('dm-tab-active', tab === 'buyback');
     this._hideTooltip();
     sfx.uiClick();
     this._refreshShopPanel();
@@ -1789,15 +1889,52 @@ export class UI {
     return list;
   }
 
+  // Newest sale first, so the most likely misclick is the first cell. `index` is the entry's
+  // position in merchant.buyback (oldest-first), which is what buybackFromMerchant takes.
+  _shopBuybackList() {
+    const bb = (this._shopMerchant && this._shopMerchant.buyback) || [];
+    const list = [];
+    for (let i = bb.length - 1; i >= 0; i--) list.push({ kind: 'buyback', index: i, item: bb[i].item, price: bb[i].price });
+    return list;
+  }
+
+  _shopCurrentList() {
+    if (this._shopTab === 'buy') return this._shopBuyList();
+    if (this._shopTab === 'sell') return this._shopSellList();
+    return this._shopBuybackList();
+  }
+
+  // Buyback entries carry the exact gold the item sold for (stored at sale time, never recomputed).
   _shopEntryPrice(entry) {
+    if (entry.kind === 'buyback') return entry.price;
     return this._shopTab === 'buy' ? shopPrice(entry.kind, entry.item) : sellValue(entry.item);
+  }
+
+  _shopVerb() {
+    return this._shopTab === 'buy' ? 'Buy' : this._shopTab === 'sell' ? 'Sell' : 'Buy back';
   }
 
   _clickShopCell(i) {
     const entry = this._shopList[i];
     if (!entry) return;
     if (this._shopTab === 'buy') this._buyShopEntry(entry);
-    else this._sellShopEntry(entry);
+    else if (this._shopTab === 'sell') this._sellShopEntry(entry);
+    else this._buybackShopEntry(entry);
+  }
+
+  _buybackShopEntry(entry) {
+    const res = buybackFromMerchant(this.game, this._shopMerchant, entry.index);
+    if (res.ok) {
+      this.log(`Bought back ${res.item.name} for ${res.price}g.`, '#2f9e44');
+      this.game.bus.emit('itemBought', { item: res.item, price: res.price });
+    } else {
+      const p = this.game.player;
+      const msg = res.reason === 'full' ? 'Your bag is full' : res.reason === 'gold' ? 'Not enough gold' : 'Sold out';
+      this.game.floatText(p.x, p.y, msg, '#ff9955');
+      this.game.bus.emit('denied');
+    }
+    this._hideTooltip();
+    this._refreshShopPanel();
   }
 
   _buyShopEntry(entry) {
@@ -1816,7 +1953,7 @@ export class UI {
   }
 
   _sellShopEntry(entry) {
-    const res = sellToMerchant(this.game, entry.index);
+    const res = sellToMerchant(this.game, entry.index, this._shopMerchant);
     if (res.ok) {
       this.log(`Sold ${res.item.name} for ${res.price}g.`, '#2f9e44');
       this.game.bus.emit('itemSold', { item: res.item, price: res.price });
@@ -1829,7 +1966,7 @@ export class UI {
     const entry = this._shopList[i];
     if (!entry) return;
     const p = this.game && this.game.player;
-    const label = this._shopTab === 'buy' ? `Buy for ${this._shopEntryPrice(entry)}g` : `Sell for ${this._shopEntryPrice(entry)}g`;
+    const label = `${this._shopVerb()} for ${this._shopEntryPrice(entry)}g`;
     this._showTooltip(null, itemTooltip(entry.item, p) + `<div class="tt-action">${label}</div>`);
     this._positionTooltip(e.clientX, e.clientY);
   }
@@ -1842,9 +1979,17 @@ export class UI {
     const goldStr = `🪙 ${(p.gold || 0).toLocaleString()}`;
     if (d.shopGoldText.textContent !== goldStr) d.shopGoldText.textContent = goldStr;
 
-    const list = this._shopTab === 'buy' ? this._shopBuyList() : this._shopSellList();
+    const list = this._shopCurrentList();
     this._shopList = list;
     const gold = p.gold || 0;
+    // Keep the cursor on a real cell after the list shrinks (buying back / selling the last cell).
+    if (this._shopCursor >= list.length) this._shopCursor = Math.max(0, list.length - 1);
+    const emptyMsg = list.length ? '' : this._shopTab === 'buyback'
+      ? 'Nothing to buy back yet. Items you sell here show up on this tab.'
+      : this._shopTab === 'sell' ? 'Your bag is empty.' : 'Sold out.';
+    if (d.shopEmpty.textContent !== emptyMsg) d.shopEmpty.textContent = emptyMsg;
+    d.shopEmpty.style.display = list.length ? 'none' : '';
+    d.shopGrid.style.display = list.length ? '' : 'none';
 
     for (let i = 0; i < d.shopCells.length; i++) {
       const cellDom = d.shopCells[i];
@@ -1863,12 +2008,12 @@ export class UI {
       cellDom.cell.style.setProperty('--item-glow', rc);
       cellDom.cell.classList.add('dm-filled');
       cellDom.cell.classList.toggle('dm-shop-featured', entry.kind === 'featured');
-      const stack = (this._shopTab === 'sell' && item.stack && item.stack > 1) ? String(item.stack) : '';
+      const stack = (this._shopTab !== 'buy' && item.stack && item.stack > 1) ? String(item.stack) : '';
       cellDom.stack.textContent = stack;
       const price = this._shopEntryPrice(entry);
       cellDom.price.textContent = `${price}g`;
       setCmpBadge(cellDom.cmp, this._shopTab === 'buy' ? compareGear(item, p) : null);
-      const noAfford = this._shopTab === 'buy' && gold < price;
+      const noAfford = this._shopTab !== 'sell' && gold < price;
       cellDom.cell.classList.toggle('dm-shop-noafford', noAfford);
     }
     this._applyShopFocus();
@@ -1880,8 +2025,8 @@ export class UI {
     const style = (this.input && this.input.padStyle) || 'xbox';
     const hint = (pairs) => pairs.map(([k, a]) => `<span class="dm-foot-item"><span class="dm-kbd">${k}</span>${a}</span>`).join('');
     const text = gamepad
-      ? hint([['D-pad', 'Navigate'], [padLabel('A', style), this._shopTab === 'buy' ? 'Buy' : 'Sell'], [`${padLabel('LB', style)} / ${padLabel('RB', style)}`, 'Switch tab'], [padLabel('B', style), 'Close']])
-      : hint([['Click', this._shopTab === 'buy' ? 'Buy' : 'Sell'], ['Arrows', 'Navigate'], ['Enter', this._shopTab === 'buy' ? 'Buy' : 'Sell'], ['Tab', 'Switch tab'], ['Esc', 'Close']]);
+      ? hint([['D-pad', 'Navigate'], [padLabel('A', style), this._shopVerb()], [`${padLabel('LB', style)} / ${padLabel('RB', style)}`, 'Switch tab'], [padLabel('B', style), 'Close']])
+      : hint([['Click', this._shopVerb()], ['Arrows', 'Navigate'], ['Enter', this._shopVerb()], ['Tab', 'Switch tab'], ['Esc', 'Close']]);
     if (this.dom.shopFoot.innerHTML !== text) this.dom.shopFoot.innerHTML = text;
   }
 
@@ -1898,10 +2043,14 @@ export class UI {
   }
 
   _handleShopInput(input) {
-    // LB/RB (tab_prev/tab_next) and the keyboard Inventory key (I / Tab) both cycle Buy/Sell —
-    // the shop has no separate panel to switch to, so that hotkey is repurposed here.
-    if (input.pressed('tab_prev') || input.pressed('tab_next') || input.pressed('inventory')) {
-      this._setShopTab(this._shopTab === 'buy' ? 'sell' : 'buy');
+    // LB/RB (tab_prev/tab_next) and the keyboard Inventory key (I / Tab) cycle Buy -> Sell ->
+    // Buyback -> Buy (LB steps backwards) — the shop has no separate panel to switch to, so that
+    // hotkey is repurposed here.
+    const step = input.pressed('tab_prev') ? -1 : (input.pressed('tab_next') || input.pressed('inventory')) ? 1 : 0;
+    if (step) {
+      const tabs = ['buy', 'sell', 'buyback'];
+      const i = tabs.indexOf(this._shopTab);
+      this._setShopTab(tabs[(i + step + tabs.length) % tabs.length]);
       return;
     }
 
@@ -1924,7 +2073,7 @@ export class UI {
       const cellDom = this.dom.shopCells[this._shopCursor];
       if (entry && cellDom) {
         const p = this.game.player;
-        const label = this._shopTab === 'buy' ? `Buy for ${this._shopEntryPrice(entry)}g` : `Sell for ${this._shopEntryPrice(entry)}g`;
+        const label = `${this._shopVerb()} for ${this._shopEntryPrice(entry)}g`;
         this._showTooltip(cellDom.cell, itemTooltip(entry.item, p) + `<div class="tt-action">${label}</div>`);
       } else this._hideTooltip();
     }
@@ -2068,9 +2217,14 @@ export class UI {
       } else {
         const item = p.inventory[cur.index];
         const el = this.dom.invCells[cur.index] && this.dom.invCells[cur.index].cell;
-        if (item && el) this._showTooltip(el, itemTooltip(item, p)); else this._hideTooltip();
+        if (item && el) this._showTooltip(el, itemTooltip(item, p) + this._potionPinNote(item, p)); else this._hideTooltip();
       }
       this._previewGear(cur.area === 'grid' ? (p.inventory[cur.index] || null) : null);
+    }
+    // F / LT / RT: pin the hovered (mouse) or focused (cursor) potion as its hotbar potion.
+    if (input.pressed('pin_potion')) {
+      if (this._hoverInvIndex != null) this._togglePinInvCell(this._hoverInvIndex);
+      else if (cur.area === 'grid') this._togglePinInvCell(cur.index, true);
     }
     if (input.pressed('quick_equip')) {
       this._quickEquip();
@@ -2191,7 +2345,7 @@ const CSS_TEXT = `
 }
 .dm-mm-key { display: inline-flex; align-items: center; gap: 4px; }
 .dm-mm-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; box-shadow: 0 0 0 1.5px #fff, 0 0 0 2.5px rgba(35,40,56,0.15); }
-.dm-mm-you { background: #1c7ed6; } .dm-mm-foe { background: #e03131; } .dm-mm-exit { background: #f76707; } .dm-mm-merchant { background: #ffd43b; }
+.dm-mm-you { background: #1c7ed6; } .dm-mm-foe { background: #e03131; } .dm-mm-exit { background: var(--dm-exit, #ff4fa0); } .dm-mm-merchant { background: #ffd43b; }
 .dm-mini-buttons { display: flex; flex-direction: column; gap: 6px; pointer-events: auto; }
 .dm-menubtn {
   position: relative; display: flex; align-items: center; gap: 6px; padding: 5px 8px;
@@ -2405,24 +2559,25 @@ const CSS_TEXT = `
 .dm-potions { display: flex; gap: clamp(6px, 1vmin, 10px); }
 .dm-potion-slot {
   position: relative; pointer-events: auto; cursor: pointer;
-  width: clamp(42px, 6.2vmin, 58px); height: clamp(42px, 6.2vmin, 58px);
-  border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  width: clamp(46px, 7vmin, 66px); height: clamp(46px, 7vmin, 66px);
+  border-radius: 14px; background: linear-gradient(180deg, #ffffff, #eef4fc);
+  border: 2px solid #c5d6ea; box-shadow: 0 3px 0 #c5d6ea;
+  display: flex; align-items: center; justify-content: center;
   transition: transform 0.1s, filter 0.2s;
 }
-.dm-potion-heal { background: radial-gradient(circle at 40% 35%, #fff5f5, #ffc9c9); border: 2px solid #ff8787; box-shadow: 0 3px 0 #ff8787; }
-.dm-potion-mana { background: radial-gradient(circle at 40% 35%, #f0f8ff, #bfe0ff); border: 2px solid #4dabf7; box-shadow: 0 3px 0 #4dabf7; }
 .dm-potion-svg { display: block; filter: drop-shadow(0 2px 1px rgba(0,0,0,0.18)); }
 .dm-potion-slot:hover { transform: translateY(-2px); }
 .dm-potion-slot:active { transform: translateY(1px); }
 .dm-potion-slot.dm-empty { filter: grayscale(1); opacity: 0.55; }
-.dm-potion-icon { font-size: clamp(22px, 3.3vmin, 32px); }
+.dm-potion-icon { font-size: clamp(22px, 3.6vmin, 34px); }
 .dm-potion-count {
   position: absolute; bottom: -3px; right: -3px; min-width: 18px; text-align: center; background: var(--dm-ink); border-radius: 999px;
   padding: 0 5px; font-size: 11px; font-weight: 900; color: #fff; border: 2px solid #fff; line-height: 1.35;
 }
 .dm-potion-key {
-  position: absolute; top: -4px; left: -4px; background: var(--dm-ink); border-radius: 5px;
-  padding: 0 4px; font-size: 9px; font-weight: 900; color: #ffe8a3; line-height: 1.5;
+  position: absolute; top: 3px; left: 3px; min-width: 16px; text-align: center;
+  font-size: clamp(9px, 1.2vmin, 11px); color: #ffe8a3; font-weight: 900; background: var(--dm-ink);
+  border-radius: 5px; padding: 0 4px; line-height: 1.5;
 }
 
 .dm-xpbar {
@@ -2530,7 +2685,7 @@ const CSS_TEXT = `
 .dm-plus:disabled { background: #e9ecef; color: #adb5bd; box-shadow: 0 3px 0 #dee2e6; cursor: default; }
 .dm-plus.dm-maxed { background: linear-gradient(180deg, #b197fc, #7950f2); color: #fff; box-shadow: 0 3px 0 #5f3dc4; }
 .dm-attr-row.dm-can-spend { background: #f4fce3; border-color: #c0eb75; }
-.dm-attr-row.dm-focused, .dm-charskill-row.dm-focused { border-color: var(--dm-blue-deep); background: #e7f5ff; }
+.dm-attr-row.dm-focused { border-color: var(--dm-blue-deep); background: #e7f5ff; }
 
 .dm-derived-list { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .dm-derived-row {
@@ -2545,6 +2700,7 @@ const CSS_TEXT = `
   border: 2px solid transparent; transition: background 0.15s, border-color 0.15s;
 }
 .dm-charskill-row.dm-can-spend { background: #f4fce3; border-color: #c0eb75; }
+.dm-charskill-row.dm-focused { border-color: var(--dm-blue-deep); background: #e7f5ff; }
 .dm-charskill-icon {
   position: relative; flex: 0 0 auto; width: 44px; height: 44px; border-radius: 12px; font-size: 22px;
   display: flex; align-items: center; justify-content: center;
@@ -2636,6 +2792,21 @@ const CSS_TEXT = `
 .dm-cmp-up { background: #2f9e44; }
 .dm-cmp-down { background: #e03131; }
 .dm-cmp-mixed { background: #f08c00; }
+/* Hotbar potion pin (bag potion cells only). */
+.dm-pin {
+  position: absolute; top: 1px; left: 2px; width: 19px; height: 19px; border-radius: 6px;
+  font-size: 13px; font-weight: 900; line-height: 19px; text-align: center; pointer-events: auto; cursor: pointer;
+  color: #8a94ab; background: rgba(255,255,255,0.85); box-shadow: 0 1px 0 rgba(0,0,0,0.15);
+  opacity: 0; transition: opacity 0.1s, transform 0.1s;
+}
+.dm-pin:hover { transform: scale(1.15); color: #f08c00; }
+.dm-pin-none { display: none; }
+.dm-inv-cell:hover .dm-pin-off, .dm-inv-cell.dm-focused .dm-pin-off { opacity: 0.9; }
+.dm-pin-auto { opacity: 1; color: #f08c00; }
+.dm-pin-on { opacity: 1; color: #5c3c00; background: linear-gradient(180deg, #ffe066, #fcc419); }
+.dm-inv-cell.dm-pinned { box-shadow: 0 0 0 2px #fcc419, 0 3px 0 color-mix(in srgb, var(--item-glow) 45%, #c5d6ea); }
+.dm-tooltip .tt-pin { margin-top: 6px; color: #ffd43b; font-size: 11px; font-weight: 800; }
+.dm-tooltip .tt-pin-on { color: #ffe066; }
 .dm-derived-value.dm-up { color: #2f9e44; }
 .dm-derived-value.dm-down { color: #e03131; }
 .dm-inv-upbtn {
@@ -2651,6 +2822,10 @@ const CSS_TEXT = `
 .dm-shop-title { font-family: 'Fredoka', sans-serif; font-weight: 700; font-size: clamp(15px, 2vmin, 19px); color: var(--dm-ink); }
 .dm-shop-body { flex-wrap: nowrap; }
 .dm-shop-grid { flex: 1 1 auto; }
+.dm-shop-empty {
+  flex: 1 1 auto; align-self: center; text-align: center; padding: 28px 12px;
+  font-weight: 700; color: var(--dm-ink); opacity: 0.6;
+}
 .dm-shop-cell { padding-bottom: 14px; }
 .dm-shop-price {
   position: absolute; left: 0; right: 0; bottom: 2px; text-align: center;

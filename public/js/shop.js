@@ -3,14 +3,17 @@
 // (public/js/ui.js renders game.npcs / merchant.stock; renderer.js draws them).
 //
 // A merchant is a plain object pushed onto game.npcs (reset to [] every loadDepth()):
-//   { id, type: 'merchant', x, y, fx, fy, stock: { heal, mana, gear: [item...], featured } }
+//   { id, type: 'merchant', x, y, fx, fy, stock: { heal, mana, gear: [item...], featured },
+//     buyback: [{ item, price }...] }
 // `heal`/`mana` are potion templates (unlimited — buying clones one with stack:1); `gear` and
 // `featured` are unique items, each removed from stock once bought. Stock is regenerated fresh
 // every depth and never carries over — enemies don't respawn either, so a player who can't
 // afford something on this depth's shop is choosing to save gold for the next one.
+// `buyback` holds what the player sold to this merchant (a misclick safety net); it lives on the
+// merchant object, so it resets with the stock every depth.
 
 import { uid, TILE, dist, clamp } from './core.js';
-import { generateItem, addToInventory, sellValue, buyPrice } from './items.js';
+import { generateItem, addToInventory, sellValue, buyPrice, INVENTORY_SIZE } from './items.js';
 
 // A merchant shows up on every Nth depth. Kept as one constant/function so it's easy to tune;
 // currently every depth (interval 1).
@@ -28,6 +31,10 @@ export const MERCHANT_ENEMY_CLEARANCE = 3;
 // 4 "regular" magic/rare items (roughly a single depth's income each) plus 1 "featured" premium
 // item (see featuredRarity/featuredPriceMult below).
 const REGULAR_GEAR_COUNT = 4;
+
+// How many recently-sold items the merchant keeps on the Buyback tab. Selling past the cap
+// evicts the oldest entry (FIFO).
+export const MERCHANT_BUYBACK_CAP = 12;
 
 // The featured item is rare at shallow depths, with a rising chance of epic the deeper you go.
 function featuredRarity(depth, rng) {
@@ -127,6 +134,7 @@ export function placeMerchant(game, opts = {}) {
   const merchant = {
     id: uid(), type: 'merchant', x: spot.x, y: spot.y, fx: spot.x, fy: spot.y,
     stock: generateMerchantStock(game.depth, game.rng),
+    buyback: [],
   };
   game.npcs = game.npcs || [];
   game.npcs.push(merchant);
@@ -192,8 +200,9 @@ export function buyFromMerchant(game, merchant, stockKind, index) {
 
 // Sells one bag slot (by inventory index) to the merchant. Equipped items aren't in the bag
 // array so this can never touch them. Mirrors the existing salvage-on-shift-click pricing:
-// the whole stack is removed for a single unit's sellValue.
-export function sellToMerchant(game, invIndex) {
+// the whole stack is removed for a single unit's sellValue. When `merchant` is given, the sold
+// item (whole stack) and the gold it fetched are appended to merchant.buyback (capped FIFO).
+export function sellToMerchant(game, invIndex, merchant) {
   const p = game && game.player;
   if (!p) return { ok: false, reason: 'invalid' };
   const item = p.inventory[invIndex];
@@ -201,5 +210,38 @@ export function sellToMerchant(game, invIndex) {
   const price = sellValue(item);
   p.inventory.splice(invIndex, 1);
   p.gold = (p.gold || 0) + price;
+  if (merchant) {
+    merchant.buyback = merchant.buyback || [];
+    merchant.buyback.push({ item, price });
+    while (merchant.buyback.length > MERCHANT_BUYBACK_CAP) merchant.buyback.shift();
+  }
   return { ok: true, item, price };
+}
+
+function fitsInInventory(p, item) {
+  if (p.inventory.length < INVENTORY_SIZE) return true;
+  if (item.type !== 'potion') return false;
+  let room = 0;
+  for (const it of p.inventory) {
+    if (it.type === 'potion' && it.potionKind === item.potionKind && it.size === item.size) room += Math.max(0, it.maxStack - it.stack);
+  }
+  return room >= (item.stack || 1);
+}
+
+// Buys back merchant.buyback[index] for exactly the gold it sold for (no markup), restoring the
+// same item object (same stack size). Returns { ok: true, item, price } or
+// { ok: false, reason: 'gold'|'full'|'empty'|'invalid' } like buyFromMerchant.
+export function buybackFromMerchant(game, merchant, index) {
+  const p = game && game.player;
+  if (!p || !merchant) return { ok: false, reason: 'invalid' };
+  const entry = (merchant.buyback || [])[index];
+  if (!entry) return { ok: false, reason: 'empty' };
+  if ((p.gold || 0) < entry.price) return { ok: false, reason: 'gold' };
+  // addToInventory can partially merge a potion stack before failing on a full bag, which would
+  // hand over part of the stack for free — so check the whole stack fits before touching anything.
+  if (!fitsInInventory(p, entry.item)) return { ok: false, reason: 'full' };
+  if (!addToInventory(p, entry.item)) return { ok: false, reason: 'full' };
+  p.gold -= entry.price;
+  merchant.buyback.splice(index, 1);
+  return { ok: true, item: entry.item, price: entry.price };
 }

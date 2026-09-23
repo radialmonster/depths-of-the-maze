@@ -23,13 +23,18 @@ const DEATH_POP_AMOUNT = 0.28;    // how much the mesh pops up before it implode
 
 // Bright, cheerful per-depth palettes. `sky` is the background/fog colour that
 // unexplored space fades into, so the dungeon reads as a sunny floating maze.
-const DEPTH_THEMES = [
+// Exported so the HUD minimap can colour the down-stairs marker with the same `accent` as the
+// floating 3D stairs sign (see depthTheme()).
+export const DEPTH_THEMES = [
   { name: 'meadow', floor: 0x8fd46a, wall: 0xf4e4c1, sky: 0xaee3ff, accent: 0xff4fa0, torch: 0xffd27a },
   { name: 'beach',  floor: 0xf7dc8f, wall: 0xff9f80, sky: 0x9fe9ff, accent: 0x14b8ff, torch: 0xffe08a },
   { name: 'candy',  floor: 0xffc6e0, wall: 0xb9a4ff, sky: 0xfff0fa, accent: 0xff3d8b, torch: 0xffb3e0 },
   { name: 'frost',  floor: 0xd4f1ff, wall: 0x7cc6ff, sky: 0xeaf8ff, accent: 0x2f7bff, torch: 0xbfe9ff },
   { name: 'autumn', floor: 0xffc978, wall: 0xe9806a, sky: 0xffe9c7, accent: 0x9b3dff, torch: 0xffc070 },
 ];
+export function depthTheme(depth) {
+  return DEPTH_THEMES[(Math.max(1, depth || 1) - 1) % DEPTH_THEMES.length];
+}
 
 // The themes' pastel skies were too bright behind the map, so the background/fog colour is each
 // theme's sky blended toward a deep dusk tone — and it sinks further toward dusk the deeper you go.
@@ -387,7 +392,7 @@ export class Renderer {
     this._disposeLevel();
     this.map = map;
     this.depth = depth || 1;
-    const theme = DEPTH_THEMES[(this.depth - 1) % DEPTH_THEMES.length];
+    const theme = depthTheme(this.depth);
     this._theme = theme;
     this.scene.fog.color.copy(themeSky(theme, this.depth));
     this.scene.background.copy(themeSky(theme, this.depth));

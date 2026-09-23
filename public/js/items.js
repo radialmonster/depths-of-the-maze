@@ -460,8 +460,68 @@ export function useItem(game, item) {
   }
 
   pot.stack -= 1;
-  if (pot.stack <= 0) player.inventory.splice(idx, 1);
+  if (pot.stack <= 0) {
+    player.inventory.splice(idx, 1);
+    // A drained pinned stack hands its pin to another stack of the same size (a full stack
+    // overflows into a second one), else the pin clears and the hotbar reverts to best-first.
+    const kind = potionHotbarKind(pot);
+    const field = kind && PIN_FIELD[kind];
+    if (field && player[field] === pot.id) {
+      const twin = player.inventory.find((it) => it && it.type === 'potion'
+        && it.potionKind === pot.potionKind && it.size === pot.size);
+      player[field] = twin ? twin.id : null;
+    }
+  }
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Hotbar potion selection (5 / 6, LT / RT). See DESIGN.md §17.8b.
+// A pinned stack (player.activeHealPotionId / activeManaPotionId) wins; otherwise the
+// strongest stack of that kind (largest restore amount, then item level) is drunk first.
+// ---------------------------------------------------------------------------
+const PIN_FIELD = { heal: 'activeHealPotionId', mana: 'activeManaPotionId' };
+
+// 'heal' | 'mana' | null — which hotbar slot a potion belongs to.
+export function potionHotbarKind(item) {
+  if (!item || item.type !== 'potion' || !item.potion) return null;
+  if (item.potion.heal > 0) return 'heal';
+  if (item.potion.mana > 0) return 'mana';
+  return null;
+}
+
+export function bestPotion(player, kind) {
+  let best = null;
+  for (const it of player?.inventory || []) {
+    if (potionHotbarKind(it) !== kind) continue;
+    if (!best || it.potion[kind] > best.potion[kind]
+      || (it.potion[kind] === best.potion[kind] && (it.itemLevel || 0) > (best.itemLevel || 0))) best = it;
+  }
+  return best;
+}
+
+// The pinned stack for this kind if it's still in the bag, else null (stale ids from a
+// drop/sale/old save just fall through to the best-first default).
+export function pinnedPotion(player, kind) {
+  const id = player && player[PIN_FIELD[kind]];
+  if (id == null) return null;
+  return (player.inventory || []).find((it) => it && it.id === id && potionHotbarKind(it) === kind) || null;
+}
+
+// What the hotbar key for `kind` will drink right now.
+export function activePotion(player, kind) {
+  return pinnedPotion(player, kind) || bestPotion(player, kind);
+}
+
+// Pin `item` as its kind's hotbar potion, or unpin it if it already is.
+// Returns 'pinned' | 'unpinned' | null (not a potion).
+export function togglePotionPin(player, item) {
+  const kind = potionHotbarKind(item);
+  if (!kind || !player) return null;
+  const field = PIN_FIELD[kind];
+  if (player[field] === item.id) { player[field] = null; return 'unpinned'; }
+  player[field] = item.id;
+  return 'pinned';
 }
 
 export function dropItem(game, item) {

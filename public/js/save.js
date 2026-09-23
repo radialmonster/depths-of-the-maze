@@ -7,7 +7,8 @@ const SAVE_VERSION = 1;
 
 // Player fields that persist across a save/continue. Transient combat/position state
 // (x/y/fx/fy/aim/facing/moveTimer/invuln/hitFlash/dead/_noManaFlashTimer) is intentionally dropped.
-const PERSIST_FIELDS = ['name', 'level', 'xp', 'attrPoints', 'skillPoints', 'gold', 'base', 'hp', 'mana', 'equipment', 'inventory', 'skills'];
+const PERSIST_FIELDS = ['name', 'level', 'xp', 'attrPoints', 'skillPoints', 'gold', 'base', 'hp', 'mana', 'equipment', 'inventory', 'skills',
+  'activeHealPotionId', 'activeManaPotionId']; // hotbar potion pins; missing in old saves = unpinned
 
 // Saves the current run. No-op if there is no live player or the player is dead (a dead run
 // shouldn't be continuable — playerDied() clears the save instead).

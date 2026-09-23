@@ -27,10 +27,11 @@ const ACTION_KEYS = {
   confirm: ['Enter', 'KeyE', 'Space'],
   cancel: ['Escape'],
   drop: ['KeyQ', 'Delete'],
-  potion: ['KeyH'],
-  mana_potion: ['KeyM'],
-  mute: ['KeyU'], // 'M' is already bound to mana_potion, so mute uses U instead
+  potion: ['Digit5', 'Numpad5'],
+  mana_potion: ['Digit6', 'Numpad6'],
+  mute: ['KeyU'],
   quick_equip: ['KeyR'], // Bag: equip every upgrade
+  pin_potion: ['KeyF'],  // Bag: pin/unpin focused potion as the 5/6 hotbar potion
 };
 
 // Gamepad action -> array of standard-mapping button indices.
@@ -50,6 +51,7 @@ const ACTION_BUTTONS = {
   tab_prev: [4],     // LB — cycles panel tabs while a panel is open
   tab_next: [5],     // RB
   quick_equip: [3],  // Y — Bag: equip every upgrade
+  pin_potion: [6, 7], // LT / RT — Bag: pin focused potion to its hotbar trigger (same buttons drink in play)
 };
 
 // Directional keys used for both orthogonal movement and ui_* navigation.
@@ -171,6 +173,18 @@ export class Input {
       }
     }
 
+    // Synthetic "stick" from held movement keys, so keyboard gets the same free
+    // (non-tile) movement and free aiming as an analog stick — diagonals included,
+    // instead of being locked to 4-way tile steps. Digital keys always push at full
+    // magnitude (mag: 1); this is overridden by an actual gamepad stick, if any.
+    const kbVecX = (kbDir.right ? 1 : 0) - (kbDir.left ? 1 : 0);
+    const kbVecY = (kbDir.down ? 1 : 0) - (kbDir.up ? 1 : 0);
+    this._kbStick = null;
+    if (kbVecX || kbVecY) {
+      const len = Math.hypot(kbVecX, kbVecY);
+      this._kbStick = { x: kbVecX / len, y: kbVecY / len, mag: 1 };
+    }
+
     // --- Poll gamepad ---
     let padDir = { up: false, down: false, left: false, right: false };
     const pads = (typeof navigator !== 'undefined' && navigator.getGamepads) ? navigator.getGamepads() : [];
@@ -278,7 +292,9 @@ export class Input {
   // push strength 0..1, for free (non-tile) movement. Null inside the deadzone.
   // -------------------------------------------------------------------
   analogMove() {
-    return this.stickOverride || this._stick || null; // stickOverride: debug/testing hook
+    // stickOverride: debug/testing hook. Real gamepad stick wins over the keyboard's
+    // synthetic one so plugging in a pad mid-game doesn't fight held WASD.
+    return this.stickOverride || this._stick || this._kbStick || null;
   }
 
   // -------------------------------------------------------------------

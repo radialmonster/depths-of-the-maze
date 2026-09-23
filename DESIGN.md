@@ -32,7 +32,7 @@ level up, spend attribute + skill points (C), manage gear (I). Die → run summa
 | `js/audio.js` | Producer | Procedural Web Audio sound effects, mute, `wireAudio(game)` bus wiring (§17.2) |
 | `js/music.js` | Producer | Procedural adaptive music, owned by audio.js as `sfx.music` (§17.2) |
 | `js/save.js` | Producer | localStorage save/continue (§17.3) |
-| `js/shop.js` | Producer | Merchant placement, stock, pricing, buy/sell transactions (§17.4) |
+| `js/shop.js` | Producer | Merchant placement, stock, pricing, buy/sell/buyback transactions (§17.4) |
 
 ## 4. Coordinates & conventions
 - Grid tiles. Tile `(x, y)` ↔ world `(x, 0, y)` in three.js; 1 world unit per tile. Tile centers are at integer coords.
@@ -214,7 +214,9 @@ export class Input {
 actions: 'skill1'..'skill4' (1-4 / J K L Space? / gamepad A,X,B,Y → 1,2,3,4 respectively: A=skill1 Cleave, X=skill2 Bolt, Y=skill3 Nova, B=skill4 Dash)
          'character' (C / gamepad Back/View or LB), 'inventory' (I / gamepad RB), 'pause' (Esc, P / Start),
          'ui_up','ui_down','ui_left','ui_right' (arrows/WASD/dpad edges), 'confirm' (Enter/E / A), 'cancel' (Esc / B), 'drop' (Q/Delete / X),
-         'potion' (H / R? → use first health potion; gamepad LT), 'mana_potion' (M / gamepad RT)
+         'potion' (5 / gamepad LT), 'mana_potion' (6 / gamepad RT) → drink items.js `activePotion(player, kind)`:
+         the pinned stack if any, else the strongest stack of that kind (see §17.8b),
+         'quick_equip' (R / Y, Bag only), 'pin_potion' (F / gamepad LT or RT, Bag only: pin/unpin focused potion)
 ```
 
 ## 13. UI (ui.js)
@@ -298,7 +300,8 @@ Decisions made with the user while building. Keep this section current — when 
   tiles/s). Box collision (half-size 0.3) slides along walls; a corner assist eases the player into doorways/corridors.
 - Pushing within ~40° toward an adjacent enemy holds position and swings Cleave; a clearly sideways push walks around it.
 - Arcane Bolt fires along the exact stick angle (`player.aim`); Cleave/Dash use the nearest 4-way `facing`.
-- Keys: 1-4 skills · H / LT health potion · M / RT mana potion · C / LB character · I, Tab / RB bag · E, Enter, Space / A
+- Keys: 1-4 skills · 5 / LT health potion · 6 / RT mana potion (H/M are no longer bound) · C / LB character ·
+  I, Tab / RB bag · E, Enter, Space / A
   confirm & **Trade** (near a merchant A trades instead of Cleaving) · U mute · Esc, P / Start pause.
   In the shop, Tab / I or LB / RB switch Buy / Sell.
 - Character panel: D-pad / arrow left-right jumps between Attributes and Skills once per press (no auto-repeat).
@@ -357,6 +360,10 @@ Decisions made with the user while building. Keep this section current — when 
   skip shopping and save for the next depth's merchant.
 - Pricing: buy = value × 1.3, sell = value × 0.35. Featured markup rises with item level so it costs ~2.5-3.5 depths of
   typical income at every depth; regular gear ~1-1.5 depths; potions cheap. Estimated income ≈ 35g (d1), 120g (d5), 260g (d10).
+- **Buyback** tab (Buy / Sell / Buyback; LB/RB or Tab cycle all three): everything sold on the Sell tab lands there,
+  newest first, at exactly what it sold for (no markup — a misclick safety net). Potion stacks come back whole.
+  Capped at the last 12 sales (`MERCHANT_BUYBACK_CAP`, FIFO). Lives on the merchant (`merchant.buyback`), so it resets
+  with the stock every depth (and on Continue). Bag shift+click salvage bypasses it.
 
 ### 17.4b Look & atmosphere
 - The background/fog behind the map is each depth theme's sky colour blended (in sRGB) toward a deep dusk tone
@@ -403,3 +410,16 @@ Decisions made with the user while building. Keep this section current — when 
   Click / A still equips one item.
 - Character/Bag/Shop panels are laid out ~1000px wide and scaled up (never down, max 1.75×) to fit the window
   (`--dm-panel-scale`, measured from the panel's natural height).
+
+### 17.8b Hotbar potion choice (5 / 6)
+- Potion sizes never merge, so a bag can hold several health (or mana) stacks. 5 / LT and 6 / RT (and clicking the HUD
+  slots) drink `activePotion(player, kind)` (items.js): the **pinned** stack if it's still in the bag, else the
+  **strongest** stack (largest restore amount, then item level) — not bag order, so a better pickup is used right away.
+- **Pin** = `player.activeHealPotionId` / `activeManaPotionId` (item id, persisted in the save; missing in old saves = unpinned).
+  Use it to save big potions: pin the small stack and keep drinking it.
+- UI lives on the Bag: potion cells use the compare-badge corner for a ☆ pin button (own click target, so click-to-drink,
+  Shift+click salvage and right-click drop are unchanged). ★ gold = pinned (cell gets a gold ring); solid ☆ = the current
+  auto pick; faint ☆ on hover = pinnable. Toggle with the ☆, F (hovered/focused cell) or gamepad LT / RT (the same
+  triggers that drink). The item tooltip says which potion the key drinks first; the HUD slot tooltip does too.
+- Pinned stack drained → pin moves to another stack of the same size if one exists, else clears (back to strongest).
+  Dropped/sold pinned stack → stale id is ignored, same fallback.
