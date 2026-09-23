@@ -425,6 +425,10 @@ export class Renderer {
       }
     }
 
+    // Unrevealed secret doorways (§17.11) are WALL tiles; give each a hidden floor slab now so revealTile() only
+    // has to flip flags (an InstancedMesh can't grow).
+    for (const sc of map.secrets || []) if (!sc.revealed) floorList.push({ x: sc.x, y: sc.y, t: TILE.DOOR, secret: true });
+
     // Per-level geometry clones carry the per-instance attributes (atlas cell, wall AO masks).
     const nF = Math.max(1, floorList.length), nW = Math.max(1, wallList.length);
     const floorGeo = this._geo.floor.clone();
@@ -451,7 +455,7 @@ export class Renderer {
       ], i * 4);
       return {
         x: f.x, y: f.y, t: f.t, index: i, state: -1,
-        hidden: f.t === TILE.EXIT, // down-stairs pit replaces the floor slab
+        hidden: f.t === TILE.EXIT || !!f.secret, // down-stairs pit replaces the floor slab; secret = still a wall
         rot: Math.floor(tileHash(f.x, f.y, seed + 2) * 4) * Math.PI / 2,
         shade: 0.94 + tileHash(f.x, f.y, seed + 3) * 0.1,
       };
@@ -496,13 +500,27 @@ export class Renderer {
     this._skyColor = themeSky(theme, this.depth);
 
     for (const f of this._floorTiles) {
-      if (f.t === TILE.DOOR) this._buildDoorDecor(map, f.x, f.y);
+      if (f.t === TILE.DOOR && !f.hidden) this._buildDoorDecor(map, f.x, f.y);
     }
 
     if (map.entrance) this._entranceMarker = this._buildStairs(map.entrance, false);
     if (map.exits) for (const e of map.exits) this._exitMarkers.push(this._buildStairs(e, true));
 
     this._placeTorches(map, wallList);
+  }
+
+  // A secret doorway was found (§17.11): drop its wall block, show the floor slab prepared in buildMap, add a door
+  // frame, and play a golden shimmer. The map tile is already a DOOR (map.revealSecret).
+  revealTile(x, y) {
+    const wt = (this._wallTiles || []).find((w) => w.x === x && w.y === y);
+    if (wt) { wt.gone = true; wt.state = -1; }
+    const ft = (this._floorTiles || []).find((f) => f.x === x && f.y === y);
+    if (ft) { ft.hidden = false; ft.state = -1; }
+    if (this.map) this._buildDoorDecor(this.map, x, y);
+    this._fxNova(x, y, { radius: 1.6, color: 0xffe08a });
+    this._fxBurst(x, y, { color: '#ffe8a0', count: 30, speed: 1.3, size: 0.1, duration: 1.2, gravity: -0.9 });
+    this._fxBurst(x, y, { color: '#ffffff', count: 12, speed: 0.6, size: 0.07, duration: 1.4, gravity: -1.3 });
+    this.shake(0.12);
   }
 
   _tileMatrix(tile) {
@@ -762,7 +780,7 @@ export class Renderer {
       if (state === wt.state) continue;
       wt.state = state;
       wallChanged = true;
-      this._wallMesh.setMatrixAt(wt.index, state === FLOOR_STATE.HIDDEN ? TMP_MATRIX.makeScale(0, 0, 0) : this._tileMatrix(wt));
+      this._wallMesh.setMatrixAt(wt.index, state === FLOOR_STATE.HIDDEN || wt.gone ? TMP_MATRIX.makeScale(0, 0, 0) : this._tileMatrix(wt));
       TMP_COLOR.copy(wallColor).multiplyScalar(wt.shade);
       if (state !== FLOOR_STATE.LIT) TMP_COLOR.lerp(this._skyColor, 0.55);
       this._wallMesh.setColorAt(wt.index, TMP_COLOR);
@@ -1127,7 +1145,7 @@ export class Renderer {
   // A travelling merchant (models.js): feathered hat, overstuffed backpack, swinging lantern, wares on
   // a rug, and a bobbing/spinning coin above so the tile reads as "shop" from the top-down camera.
   _buildNpcVisual(npc) {
-    const entry = this.models.buildMerchant();
+    const entry = npc.type === 'chest' ? this.models.buildChest() : this.models.buildMerchant();
     entry.root.scale.setScalar(ENTITY_SCALE);
     return entry;
   }
@@ -1148,7 +1166,8 @@ export class Renderer {
       const visible = this._tileVisible(map, npc.x, npc.y);
       entry.root.visible = visible;
       if (!visible) continue;
-      this.models.animateMerchant(entry, npc, game.player, dt);
+      if (npc.type === 'chest') { entry.root.rotation.y = npc.rot || 0; this.models.animateChest(entry, npc, dt); }
+      else this.models.animateMerchant(entry, npc, game.player, dt);
     }
     for (const [id, entry] of this.npcEntries) {
       if (!seen.has(id)) { this._removeEntry(entry); this.npcEntries.delete(id); }
@@ -1231,6 +1250,12 @@ export class Renderer {
 
     const kind = item && (item.weaponKind || item.offhandKind);
     switch (kind || type) {
+      case 'skillbook':
+        add(geo.box, accent, [0.42, 0.1, 0.52], [0, 0, 0]);             // cover
+        add(geo.box, this._newMat(0xf4ead0, { roughness: 0.9 }, materials), [0.38, 0.07, 0.49], [0.02, 0, 0]); // pages
+        add(geo.box, dark, [0.05, 0.11, 0.53], [-0.2, 0, 0]);           // spine
+        add(geo.box, gold, [0.12, 0.02, 0.12], [0.02, 0.06, 0]);         // clasp gem
+        break;
       case 'gold':
         for (let i = 0; i < 6; i++) {
           const a = i * 2.1;
@@ -1470,6 +1495,14 @@ export class Renderer {
         if (this.playerEntry) this.playerEntry.swingT = SWING_DURATION;
         break;
       case 'dash': this._fxDash(x, y, opts); break;
+      case 'chain': this._fxChain(opts.points || [{ x, y }], opts.color || '#ffe066'); break; // Chain Lightning arcs
+      case 'blink': { // Blink: a violet puff where you left, a flash where you land
+        const from = opts.from || { x, y };
+        this._fxBurst(from.x, from.y, { color: '#c9a6ff', count: 14, speed: 1.2, size: 0.09, duration: 0.4, gravity: -0.5 });
+        this._fxBurst(x, y, { color: '#e5d4ff', count: 18, speed: 1.8, size: 0.09, duration: 0.45, gravity: 0 });
+        this._fxNova(x, y, { radius: 0.9, color: 0xc9a6ff });
+        break;
+      }
       case 'hit': {
         const crit = !!opts.crit;
         this._fxBurst(x, y, {
@@ -1628,7 +1661,7 @@ export class Renderer {
       const t0 = i / (steps - 1);
       const gx = THREE.MathUtils.lerp(from.x, x, t0);
       const gy = THREE.MathUtils.lerp(from.y, y, t0);
-      const m = new THREE.MeshBasicMaterial({ color: 0x66aaff, transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending, depthWrite: false });
+      const m = new THREE.MeshBasicMaterial({ color: opts.color !== undefined ? opts.color : 0x66aaff, transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending, depthWrite: false });
       const mesh = new THREE.Mesh(this._geo.box, m);
       mesh.scale.set(0.3, 0.5, 0.22);
       mesh.position.set(gx, 0.3, gy);
@@ -1643,6 +1676,38 @@ export class Renderer {
           const lt = THREE.MathUtils.clamp((t - g.delay) / (1 - g.delay + 0.001), 0, 1);
           g.mat.opacity = 0.5 * (1 - lt);
         }
+      },
+    });
+  }
+
+  // Jagged lightning bolts between consecutive points (tile coords), flickering out over ~0.3s.
+  _fxChain(points, color) {
+    if (points.length < 2) return;
+    const group = new THREE.Group();
+    const mat = new THREE.MeshBasicMaterial({ color: new THREE.Color(color), transparent: true, opacity: 1, blending: THREE.AdditiveBlending, depthWrite: false });
+    for (let i = 1; i < points.length; i++) {
+      const a = points[i - 1], b = points[i];
+      const segs = 5;
+      let px = a.x, py = a.y;
+      for (let k = 1; k <= segs; k++) {
+        const t = k / segs;
+        const jitter = k < segs ? 0.22 : 0;
+        const nx = a.x + (b.x - a.x) * t + (Math.random() - 0.5) * jitter * 2;
+        const ny = a.y + (b.y - a.y) * t + (Math.random() - 0.5) * jitter * 2;
+        const len = Math.hypot(nx - px, ny - py) || 0.01;
+        const seg = new THREE.Mesh(this._geo.box, mat);
+        seg.scale.set(0.06, 0.06, len);
+        seg.position.set((px + nx) / 2, 0.5, (py + ny) / 2);
+        seg.rotation.y = Math.atan2(nx - px, ny - py);
+        group.add(seg);
+        px = nx; py = ny;
+      }
+      this._fxBurst(b.x, b.y, { color, count: 8, speed: 1.6, size: 0.08, duration: 0.3, gravity: 0 });
+    }
+    this.scene.add(group);
+    this.effects.push({
+      obj: group, mats: [mat], age: 0, duration: 0.32, update: (t) => {
+        mat.opacity = (1 - t) * (0.6 + 0.4 * Math.random());
       },
     });
   }

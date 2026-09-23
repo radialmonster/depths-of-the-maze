@@ -1349,6 +1349,48 @@ export class Models {
     return { root, materials, extraMats, body, head, armL, armR, lanternPivot, lanternGlow, coinPivot, coinGlow, phase: Math.random() * Math.PI * 2 };
   }
 
+  // ================================================================== TREASURE CHEST (§17.11)
+  // A full-size version of the little chest on the merchant's rug (same wood box + rounded lid + gold latch), with the
+  // lid on a hinge pivot so it can swing open, and a soft gold glow while it's still closed.
+  buildChest() {
+    const materials = [];
+    const extraMats = [];
+    const root = new THREE.Group();
+    const mat = this.vmat(materials, { roughness: 0.75 });
+    const metal = this.vmat(materials, { roughness: 0.35, metalness: 0.55 });
+    const LEATHER = 0x8a5a34, LEATHER_D = 0x5e3b20, GOLD = 0xf0c040, IRON = 0x4a4f5e;
+    this.mesh('ch_body', [
+      P('box', LEATHER, [0.62, 0.34, 0.42], [0, 0.19, 0]),
+      P('box', LEATHER_D, [0.66, 0.05, 0.46], [0, 0.025, 0]),
+    ], mat, root);
+    this.mesh('ch_bands', [
+      P('box', IRON, [0.05, 0.35, 0.44], [-0.2, 0.19, 0]),
+      P('box', IRON, [0.05, 0.35, 0.44], [0.2, 0.19, 0]),
+      P('box', GOLD, [0.09, 0.11, 0.03], [0, 0.29, 0.22]),
+    ], metal, root);
+    // Hinge along the back top edge; the lid (half-buried rounded cylinder) sits forward of it.
+    const lid = this.pivot(root, 0, 0.36, -0.21);
+    this.mesh('ch_lid', [
+      P('cylinder', LEATHER_D, [0.3, 0.62, 0.42], [0, 0, 0.21], [0, 0, Math.PI / 2]),
+    ], mat, lid);
+    this.mesh('ch_lid_bands', [
+      P('cylinder', IRON, [0.32, 0.05, 0.44], [-0.2, 0, 0.21], [0, 0, Math.PI / 2]),
+      P('cylinder', IRON, [0.32, 0.05, 0.44], [0.2, 0, 0.21], [0, 0, Math.PI / 2]),
+      P('box', GOLD, [0.08, 0.08, 0.03], [0, 0.02, 0.43]),
+    ], metal, lid);
+    const glow = this.glow(0xffd23f, 1.1, 0.35, extraMats, root, [0, 0.45, 0]);
+    root.add(this.r._makeBlobShadow(0.7));
+    return { root, materials, extraMats, lid, glow, phase: Math.random() * Math.PI * 2 };
+  }
+
+  animateChest(entry, npc, dt) {
+    entry.phase += dt;
+    const target = npc.opened ? -1.9 : 0;
+    entry.lid.rotation.x = lerp(entry.lid.rotation.x, target, Math.min(1, dt * 7));
+    const base = npc.opened ? 0 : 0.28 + 0.12 * Math.sin(entry.phase * 2.2);
+    entry.glow.material.opacity = lerp(entry.glow.material.opacity, base, Math.min(1, dt * 5));
+  }
+
   animateMerchant(entry, npc, player, dt) {
     entry.phase += dt;
     const t = entry.phase;

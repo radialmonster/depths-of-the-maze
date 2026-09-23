@@ -11,7 +11,7 @@ import { upgradeSkill, skillDescription, activeSkill, skillRank, skillCooldown, 
   SLOT_CATEGORIES } from './skills.js';
 import { equipItem, unequipItem, useItem, dropItem, sellValue, itemTooltip, compareGear, equipUpgrades, SLOTS, INVENTORY_SIZE, isTwoHanded,
   activePotion, pinnedPotion, potionHotbarKind, togglePotionPin } from './items.js';
-import { buyFromMerchant, sellToMerchant, buybackFromMerchant, nearbyMerchant, shopPrice } from './shop.js';
+import { buyFromMerchant, sellToMerchant, buybackFromMerchant, nearbyMerchant, nearbyChest, shopPrice } from './shop.js';
 import { RARITY, clamp, TILE, ELEMENTS, ELEMENT_ORDER } from './core.js';
 import { ENEMY_TYPES } from './enemies.js';
 import { sfx } from './audio.js';
@@ -1195,9 +1195,14 @@ export class UI {
     if (this._shopOpen) this._refreshShopPanel();
   }
 
-  // Small floating HUD prompt shown while standing near a merchant and no panel is open.
+  // Small floating HUD prompt shown while standing near a merchant ("Trade") or a closed treasure chest ("Open",
+  // §17.11) and no panel is open.
   _updateTradePrompt(game) {
-    const near = !this.isModalOpen() && !!nearbyMerchant(game);
+    const modal = this.isModalOpen();
+    const merchant = !modal && nearbyMerchant(game);
+    const chest = !modal && !merchant && nearbyChest(game);
+    const near = !!(merchant || chest);
+    const verb = merchant ? 'Trade' : 'Open';
     if (this._cache.tradePromptShow !== near) {
       this.dom.tradePrompt.classList.toggle('dm-show', near);
       this._cache.tradePromptShow = near;
@@ -1205,7 +1210,7 @@ export class UI {
     if (near) {
       const gamepad = !!(this.input && this.input.lastDevice === 'gamepad');
       const style = (this.input && this.input.padStyle) || 'xbox';
-      const text = gamepad ? `Trade — ${padLabel('A', style)}` : 'Trade — E';
+      const text = gamepad ? `${verb} — ${padLabel('A', style)}` : `${verb} — E`;
       if (this._cache.tradePromptText !== text) {
         this.dom.tradePrompt.textContent = text;
         this._cache.tradePromptText = text;
@@ -2041,8 +2046,8 @@ export class UI {
       p.gold = (p.gold || 0) + value;
       p.inventory.splice(index, 1);
       this.log(`Salvaged ${item.name} for ${value}g.`, '#f08c00');
-    } else if (item.type === 'potion') {
-      useItem(this.game, item);
+    } else if (item.type === 'potion' || item.type === 'skillbook') {
+      useItem(this.game, item); // a skill book is read (learn / +1 rank) — §17.11
     } else if (equipItem(p, item, (t, c) => this.log(t, c))) {
       const slot = this.dom.eqSlots.find((s) => s.slotDef.id === item.slot);
       if (slot) flash(slot.el, 'dm-bump');
@@ -2080,6 +2085,9 @@ export class UI {
       const verb = pinnedPotion(p, potionHotbarKind(item)) === item ? 'unpin' : 'pin';
       return itemTooltip(item, p) + this._potionPinNote(item, p)
         + `<div class="tt-action">Click to drink · ☆ or F to ${verb} · Right-click to drop · Shift+click to salvage</div>`;
+    }
+    if (item.type === 'skillbook') {
+      return itemTooltip(item, p) + '<div class="tt-action">Click to read · Right-click to drop · Shift+click to salvage</div>';
     }
     return itemTooltip(item, p) + '<div class="tt-action">Click to equip · Right-click to drop · Shift+click to salvage</div>';
   }

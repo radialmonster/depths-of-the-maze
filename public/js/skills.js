@@ -12,7 +12,7 @@
 
 import { computeDamage } from './character.js';
 import { applyResist, applySlow } from './enemies.js';
-import { WEAPON_KIND_INFO, FALLBACK_WEAPON_INFO, weaponClassOf, setAttackSkillResolver } from './items.js';
+import { WEAPON_KIND_INFO, FALLBACK_WEAPON_INFO, weaponClassOf, setAttackSkillResolver, setSkillBookHooks } from './items.js';
 
 // ---------------------------------------------------------------------------
 // Tuning constants
@@ -78,6 +78,62 @@ const DASH_MANA = 5;
 const DASH_BASE_TILES = 3;
 const DASH_INVULN_BASE = 0.4;
 const DASH_INVULN_PER_RANK = 0.05;
+
+// --- Unlockable skills (§17.11): never known by default, learned from skill books. ---
+// Volley (bow attack): a fan of arrows at ~60% damage each. All arrows of one volley share one "already hit" set, so
+// an enemy is hit by at most one arrow of it (no point-blank triple-dip) — it's a crowd shot, not a single-target nuke.
+const VOLLEY_BASE_CD = 0.7;
+const VOLLEY_DAMAGE_MULT = 0.6;
+const VOLLEY_ARROWS = 3;
+const VOLLEY_SPREAD = 14 * Math.PI / 180;   // angle between neighbouring arrows
+const VOLLEY_ARROWS_PERK = 2;               // rank 3: +2 arrows (5 total)
+
+// Fireball (spell, fire): a slower shot that bursts on impact (enemy, wall or max range), hitting everything within a
+// small radius. Same spell-power damage as Arcane Bolt per target, but no pierce; costs more, slower cadence.
+const FIREBALL_BASE_CD = 1.4;
+const FIREBALL_MANA = 12;
+const FIREBALL_SPEED = 11;
+const FIREBALL_RANGE = 9;
+const FIREBALL_RADIUS = 1.5;
+const FIREBALL_RADIUS_PERK = 0.5;           // rank 3
+
+// Chain Lightning (special, lightning): strikes the nearest enemy in sight, then jumps to the nearest un-struck enemy
+// near the last one, losing some damage per jump. Armor applies like Frost Nova's (the special-slot precedent).
+const CHAIN_BASE_CD = 4.0;
+const CHAIN_MANA = 16;
+const CHAIN_RANGE = 6;                      // first target, from the player
+const CHAIN_JUMP_RANGE = 3.5;               // each jump, from the previous target
+const CHAIN_JUMPS = 3;                      // extra targets after the first (+1 at rank 3, +1 at rank 5)
+const CHAIN_SP_MULT = 1.0;
+const CHAIN_FALLOFF = 0.8;                  // damage multiplier per jump
+
+// Glob Burst (special, poison; Slime King's book): a player-sized echo of the King's Glob Spray — a ring of slow
+// poison globs from the player that slow what they hit. Globs share one hit set (an enemy is hit once per burst).
+const GLOB_BASE_CD = 7.0;
+const GLOB_MANA = 18;
+const GLOB_COUNT = 8;
+const GLOB_COUNT_PERK = 4;                  // rank 3: 12 globs
+const GLOB_SPEED = 6;
+const GLOB_RANGE = 5;
+const GLOB_SP_MULT = 0.7;
+const GLOB_SLOW_PCT = 0.35;                 // weaker than Frost Nova's 50%, stronger than Bow Shot's 22%
+const GLOB_SLOW_DUR = 2.0;
+
+// Bone Charge (movement, physical; Bone Tyrant's book): an echo of the Tyrant's charge — rush up to 4 tiles along
+// facing, striking every enemy in the lane with weapon damage and shoving it aside; stops in front of anything it
+// can't shove (a boss, a wedged enemy). Unlike Shadow Dash it deals damage and grants NO invulnerability.
+const CHARGE_BASE_CD = 5.0;
+const CHARGE_MANA = 8;
+const CHARGE_TILES = 4;
+const CHARGE_TILES_PERK = 1;                // rank 3
+const CHARGE_DAMAGE_MULT = 0.9;
+
+// Blink (movement, arcane): an instant short teleport along the free aim angle to the farthest free tile in sight —
+// it hops OVER enemies (Shadow Dash stops at them) but is shorter, gives no invulnerability, and is cheap/fast.
+const BLINK_BASE_CD = 1.2;
+const BLINK_MANA = 6;
+const BLINK_RANGE = 2;
+const BLINK_RANGE_PERK = 1;                 // rank 3
 
 const NO_MANA_FLASH_THROTTLE = 0.6; // seconds between "No mana" float texts
 
@@ -256,7 +312,159 @@ export const SKILL_DEFS = {
       return `Dash up to ${tiles} tiles, gaining ${invuln}s of invulnerability. Costs ${this.manaCost} mana.`;
     },
   },
+
+  // ---- Unlockable (§17.11). `unlock` = 'generic' (generic book pool: treasure chests, repeat boss kills) or
+  // { boss: enemyTypeId } (that boss's unique book). Never known by default; never a slot/class default. ----
+  volley: {
+    id: 'volley', name: 'Volley', icon: '🎯',
+    description: 'Looses a fan of arrows. Each enemy can be struck by only one arrow of a volley.',
+    category: 'attack', classes: ['bow'], aimed: true, range: BOW_RANGE, element: 'physical',
+    baseCooldown: VOLLEY_BASE_CD, manaCost: 0, unlock: 'generic',
+    rankPerks: { 3: { extraArrows: VOLLEY_ARROWS_PERK, text: `+${VOLLEY_ARROWS_PERK} arrows.` } },
+    cast: castVolley,
+    describe(rank, player) {
+      const stats = (player && player.stats) || {};
+      const n = volleyArrows(this, rank);
+      const pct = Math.round(VOLLEY_DAMAGE_MULT * 100);
+      if (stats.rangedMin == null || !heldBy(this, player)) return `Fires ${n} arrows in a fan, each for ${pct}% bow damage (reduced by armor). An enemy is hit by at most one arrow per volley.`;
+      const mult = rankMult(rank) * VOLLEY_DAMAGE_MULT;
+      const lo = Math.max(1, Math.round(stats.rangedMin * mult));
+      const hi = Math.max(lo + 1, Math.round(stats.rangedMax * mult));
+      return `Fires ${n} arrows in a fan, each dealing ${lo}-${hi} damage, reduced by armor. An enemy is hit by at most one arrow per volley.`;
+    },
+  },
+  fireball: {
+    id: 'fireball', name: 'Fireball', icon: '🔥',
+    description: 'Hurls a ball of fire that bursts on impact, burning everything nearby.',
+    category: 'spell', aimed: true, range: FIREBALL_RANGE, element: 'fire',
+    baseCooldown: FIREBALL_BASE_CD, manaCost: FIREBALL_MANA, unlock: 'generic',
+    rankPerks: { 3: { radius: FIREBALL_RADIUS_PERK, text: `Blast radius +${FIREBALL_RADIUS_PERK}.` } },
+    cast: castFireball,
+    describe(rank, player) {
+      const { min, max } = boltDamageRange(player);
+      const mult = rankMult(rank);
+      const lo = Math.max(1, Math.round(min * mult));
+      const hi = Math.max(lo + 1, Math.round(max * mult));
+      return `Bursts on impact, dealing ${lo}-${hi} fire damage to every enemy within ${fireballRadius(this, rank)} tiles. Costs ${this.manaCost} mana.`;
+    },
+  },
+  chainLightning: {
+    id: 'chainLightning', name: 'Chain Lightning', icon: '🌩️',
+    description: 'Strikes the nearest enemy in sight, then arcs to enemies near it.',
+    category: 'special', aimed: false, element: 'lightning',
+    baseCooldown: CHAIN_BASE_CD, manaCost: CHAIN_MANA, unlock: 'generic',
+    rankPerks: {
+      3: { jumps: 1, text: 'Arcs to +1 enemy.' },
+      5: { jumps: 1, text: 'Arcs to +1 more enemy.' },
+    },
+    cast: castChainLightning,
+    describe(rank, player) {
+      const stats = (player && player.stats) || {};
+      const power = Math.round((stats.spellPower ?? 5) * CHAIN_SP_MULT * rankMult(rank));
+      const targets = 1 + chainJumps(this, rank);
+      return `Strikes an enemy within ${CHAIN_RANGE} tiles for ~${power} damage, then arcs to up to ${targets - 1} more nearby (−${Math.round((1 - CHAIN_FALLOFF) * 100)}% per jump). Costs ${this.manaCost} mana.`;
+    },
+  },
+  globBurst: {
+    id: 'globBurst', name: 'Glob Burst', icon: '🟢',
+    description: "The Slime King's gift: a ring of poison globs that slow whatever they hit.",
+    category: 'special', aimed: false, element: 'poison',
+    baseCooldown: GLOB_BASE_CD, manaCost: GLOB_MANA, unlock: { boss: 'slime_king' },
+    rankPerks: { 3: { extraGlobs: GLOB_COUNT_PERK, text: `+${GLOB_COUNT_PERK} globs.` } },
+    cast: castGlobBurst,
+    describe(rank, player) {
+      const stats = (player && player.stats) || {};
+      const power = Math.round((stats.spellPower ?? 5) * GLOB_SP_MULT * rankMult(rank));
+      return `Sprays ${globCount(this, rank)} poison globs in a ring, each dealing ~${power} damage and slowing by ${Math.round(GLOB_SLOW_PCT * 100)}% for ${GLOB_SLOW_DUR}s. An enemy is hit once per burst. Costs ${this.manaCost} mana.`;
+    },
+  },
+  boneCharge: {
+    id: 'boneCharge', name: 'Bone Charge', icon: '🦴',
+    description: "The Bone Tyrant's gift: charge forward, battering enemies aside. No invulnerability.",
+    category: 'movement', aimed: false, element: 'physical',
+    baseCooldown: CHARGE_BASE_CD, manaCost: CHARGE_MANA, unlock: { boss: 'bone_tyrant' },
+    rankPerks: { 3: { chargeTiles: CHARGE_TILES_PERK, text: `Charge ${CHARGE_TILES_PERK} tile further.` } },
+    cast: castBoneCharge,
+    describe(rank, player) {
+      const tiles = CHARGE_TILES + perkTotal(this, rank, 'chargeTiles');
+      const r = weaponRow(player);
+      const dmg = r ? (() => {
+        const mult = rankMult(rank) * CHARGE_DAMAGE_MULT;
+        const lo = Math.max(1, Math.round(r.min * mult));
+        return ` for ${lo}-${Math.max(lo + 1, Math.round(r.max * mult))} damage`;
+      })() : ` for ${Math.round(CHARGE_DAMAGE_MULT * 100)}% weapon damage`;
+      return `Charge up to ${tiles} tiles, striking every enemy in your path${dmg} and shoving it aside. Stops at anything too heavy to move. Costs ${this.manaCost} mana.`;
+    },
+  },
+  blink: {
+    id: 'blink', name: 'Blink', icon: '✨',
+    description: 'Instantly teleport a short distance, even past enemies. No invulnerability.',
+    category: 'movement', aimed: false, element: 'arcane',
+    baseCooldown: BLINK_BASE_CD, manaCost: BLINK_MANA, unlock: 'generic',
+    rankPerks: { 3: { range: BLINK_RANGE_PERK, text: `Blink ${BLINK_RANGE_PERK} tile further.` } },
+    cast: castBlink,
+    describe(rank) {
+      return `Teleport up to ${blinkRange(this, rank)} tiles where you aim, over enemies (never through walls). Costs ${this.manaCost} mana.`;
+    },
+  },
 };
+
+// ---------------------------------------------------------------------------
+// Skill books (§17.11). Pools derived from each definition's `unlock` field.
+// ---------------------------------------------------------------------------
+// Generic book pool: treasure-room chests and repeat boss kills pick uniformly from it.
+export const GENERIC_BOOK_POOL = Object.freeze(Object.keys(SKILL_DEFS).filter((id) => SKILL_DEFS[id].unlock === 'generic'));
+// Boss type id (enemies.js ENEMY_TYPES) -> that boss's unique book's skill id.
+export const BOSS_SKILL_BOOKS = Object.freeze(Object.fromEntries(Object.values(SKILL_DEFS)
+  .filter((d) => d.unlock && typeof d.unlock === 'object' && d.unlock.boss).map((d) => [d.unlock.boss, d.id])));
+// Repeat kill of an already-defeated boss (first possible at depth 15/20): these independent chances.
+export const REPEAT_BOSS_GENERIC_BOOK_CHANCE = 0.2;
+export const REPEAT_BOSS_UNIQUE_BOOK_CHANCE = 0.03;
+
+// Which skill books (skill ids) a boss of `bossType` drops, given the boss types already defeated this run (checked
+// BEFORE recording this kill). First kill: its unique book, guaranteed. Repeat kill: ~20% a random generic-pool book,
+// plus a separate ~3% another copy of its unique book. Pure (only `rng` draws).
+export function bossBookDrops(bossType, bossesDefeated, rng) {
+  const unique = BOSS_SKILL_BOOKS[bossType] || null;
+  const first = !(Array.isArray(bossesDefeated) && bossesDefeated.includes(bossType));
+  if (first) return unique ? [unique] : [];
+  const out = [];
+  if (GENERIC_BOOK_POOL.length && rng.chance(REPEAT_BOSS_GENERIC_BOOK_CHANCE)) out.push(rng.pick(GENERIC_BOOK_POOL));
+  if (unique && rng.chance(REPEAT_BOSS_UNIQUE_BOOK_CHANCE)) out.push(unique);
+  return out;
+}
+
+// A random generic-pool book (treasure chest). null if the pool is empty.
+export function randomGenericBook(rng) {
+  return GENERIC_BOOK_POOL.length ? rng.pick(GENERIC_BOOK_POOL) : null;
+}
+
+const CATEGORY_LABELS = { attack: 'Attack', spell: 'Spell', special: 'Special', movement: 'Movement' };
+
+// Tooltip data for a skill book (items.js renders it; it can't import this module).
+export function skillBookInfo(skillId, player) {
+  const def = SKILL_DEFS[skillId];
+  if (!def) return null;
+  const classes = Array.isArray(def.classes) ? def.classes : [];
+  return {
+    id: def.id, name: def.name, icon: def.icon, category: def.category,
+    categoryLabel: CATEGORY_LABELS[def.category] || def.category,
+    requires: classes.length ? classes.map(weaponClassName).join(' / ') : null,
+    description: def.description || '',
+    unique: !!(def.unlock && typeof def.unlock === 'object'),
+    rank: player ? skillRank(player, skillId) : 0,
+    maxRank: MAX_SKILL_RANK,
+  };
+}
+
+// Reading a book: learnSkill() plus what happened, for the log. -> { ok, isNew, rank, name, reason? }
+export function readSkillBook(player, skillId) {
+  const def = SKILL_DEFS[skillId];
+  if (!def) return { ok: false, reason: 'unknown', isNew: false, rank: 0, name: skillId };
+  const before = skillRank(player, skillId);
+  const ok = learnSkill(player, skillId);
+  return { ok, isNew: ok && before === 0, rank: skillRank(player, skillId), name: def.name, reason: ok ? null : 'max' };
+}
 
 // ---------------------------------------------------------------------------
 // Registry validation (guaranteed-skill rule). Returns a list of error strings; [] = valid.
@@ -301,6 +509,11 @@ export function validateSkillRegistry() {
       errors.push(`category "${cat}" default "${id}" is weapon-restricted — a slot default must be unconditional`);
     }
   }
+  // Unlockable skills (skill books, §17.11) must never be a default — defaults are always known, unlockables never.
+  const defaults = defaultSkillIds();
+  for (const id in SKILL_DEFS) {
+    if (SKILL_DEFS[id].unlock && defaults.includes(id)) errors.push(`${id}: a default skill can't also be unlockable`);
+  }
   return errors;
 }
 
@@ -313,6 +526,8 @@ export function validateSkillRegistry() {
 
 // items.js compareGear's "Switches your attack to {skill}" text (items.js can't import this module: cycle).
 setAttackSkillResolver((player, cls) => attackSkillForClass(player, cls));
+// items.js skill books: tooltip info, reading (learnSkill), and the boss-kill book drops inside rollLoot (§17.11).
+setSkillBookHooks({ info: skillBookInfo, read: readSkillBook, bossDrops: bossBookDrops });
 
 // ---------------------------------------------------------------------------
 // Skill state (known ranks + loadout)
@@ -579,9 +794,10 @@ export function boltDamageRange(player) {
 // pointBlankDamage = the bottom of the roll (rangedMin x rank), never more than the rolled damage.
 // Release roll shared by every weapon-role shot off the ranged row (Bow Shot, Spark): rangedMin/Max x rank, +-15%
 // variance, crit at release. pointBlankDamage = the bottom of the roll, never more than the rolled damage (§17.12).
-export function rollWeaponShot(player, rank, rng) {
+// `dmgMult` scales the whole roll (Volley's per-arrow 60%), including the point-blank floor.
+export function rollWeaponShot(player, rank, rng, dmgMult = 1) {
   const s = player.stats;
-  const mult = rankMult(rank);
+  const mult = rankMult(rank) * dmgMult;
   const lo = s.rangedMin * mult, hi = s.rangedMax * mult;
   const crit = rng.chance(s.critChance);
   let amount = rng.range(lo, hi) * (1 + rng.range(-0.15, 0.15));
@@ -792,4 +1008,216 @@ function castShadowDash(game, player, skill, rank) {
 
   if (typeof game.effect === 'function') game.effect('dash', cx, cy, { from: { x: oldX, y: oldY } });
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Unlockable skills (§17.11)
+// ---------------------------------------------------------------------------
+function unit(v) {
+  const len = Math.hypot(v.x, v.y) || 1;
+  return { x: v.x / len, y: v.y / len };
+}
+function rotate(v, a) {
+  const c = Math.cos(a), s = Math.sin(a);
+  return { x: v.x * c - v.y * s, y: v.x * s + v.y * c };
+}
+
+// The damage row of whatever weapon is held (melee row for melee-role weapons, ranged row for bows/wands) — for
+// skills that aren't tied to one weapon class but hit with the weapon (Bone Charge). null if neither row exists.
+function weaponRow(player) {
+  const s = player && player.stats;
+  if (!s) return null;
+  if (s.meleeMin != null) return { min: s.meleeMin, max: s.meleeMax };
+  if (s.rangedMin != null) return { min: s.rangedMin, max: s.rangedMax };
+  return null;
+}
+
+// A spell-style release roll off `power` (spell power based): +-15% variance, crit at release, no armor applied.
+function rollSpell(player, power, rng) {
+  const crit = rng.chance(player.stats.critChance);
+  let amount = power * (1 + rng.range(-0.15, 0.15));
+  if (crit) amount *= player.stats.critMult;
+  return { amount: Math.max(1, Math.round(amount)), crit };
+}
+
+function volleyArrows(def, rank) { return VOLLEY_ARROWS + perkTotal(def, rank, 'extraArrows'); }
+
+// Volley: Bow Shot's release roll (x0.6) fanned into N arrows around the (assisted) facing. The arrows share ONE hit
+// set: main.js skips an enemy already in a projectile's `hit` set, so a sibling arrow flies past instead of stacking.
+function castVolley(game, player, skill, rank) {
+  const s = player.stats;
+  if (s.rangedMin == null) return false; // can't normally happen: volley is bow-class only
+  const { amount, crit, pointBlankDamage } = rollWeaponShot(player, rank, game.rng, VOLLEY_DAMAGE_MULT);
+  const ox = player.fx ?? player.x, oy = player.fy ?? player.y;
+  const aim = unit(assistAim(game, player, skill, facingOf(player), ox, oy));
+  const n = volleyArrows(skill, rank);
+  const shared = new Set();
+  if (typeof game.spawnProjectile === 'function') {
+    for (let i = 0; i < n; i++) {
+      const d = rotate(aim, (i - (n - 1) / 2) * VOLLEY_SPREAD);
+      game.spawnProjectile({
+        x: ox, y: oy, ox, oy, dx: d.x, dy: d.y,
+        speed: BOW_SPEED, range: skill.range,
+        damage: amount, pointBlankDamage, applyDefense: true, crit,
+        owner: 'player', color: '#f2e2b6', size: 0.18, pierce: s.pierce || 0,
+        kind: 'arrow', element: skill.element, hit: shared,
+      });
+    }
+  }
+  return true;
+}
+
+function fireballRadius(def, rank) { return FIREBALL_RADIUS + perkTotal(def, rank, 'radius'); }
+
+// Fireball: a spell projectile (no armor) carrying `explode`; main.js bursts it where it stops (first enemy, a wall or
+// max range) and applies `damage` to every enemy in the radius (in line of sight of the blast) — the struck enemy too.
+function castFireball(game, player, skill, rank) {
+  const { min, max } = boltDamageRange(player);
+  const { amount, crit } = rollSpell(player, game.rng.range(min, max) * rankMult(rank), game.rng);
+  const ox = player.fx ?? player.x, oy = player.fy ?? player.y;
+  const aim = assistAim(game, player, skill, player.aim || facingOf(player), ox, oy);
+  if (typeof game.spawnProjectile === 'function') {
+    game.spawnProjectile({
+      x: ox, y: oy, dx: aim.x, dy: aim.y,
+      speed: FIREBALL_SPEED, range: skill.range,
+      damage: amount, crit, owner: 'player', color: '#ff7a2e', size: 0.3, pierce: 0,
+      kind: 'fireball', element: skill.element,
+      explode: { radius: fireballRadius(skill, rank), color: '#ff8a3d' },
+    });
+  }
+  return true;
+}
+
+function chainJumps(def, rank) { return CHAIN_JUMPS + perkTotal(def, rank, 'jumps'); }
+
+// Chain Lightning targets: nearest living enemy within CHAIN_RANGE in sight of the player, then repeatedly the nearest
+// not-yet-struck enemy within CHAIN_JUMP_RANGE of (and in sight of) the previous target. Exported for tests.
+export function chainTargets(game, player, maxTargets) {
+  const see = (x0, y0, x1, y1) => typeof game.hasLineOfSight !== 'function' || game.hasLineOfSight(x0, y0, x1, y1);
+  const nearest = (x, y, r, from, skip) => {
+    let best = null, bestD = Infinity;
+    for (const e of game.enemiesInRadius(x, y, r)) {
+      if (e.dead || skip.has(e)) continue;
+      const d = Math.hypot(e.x - x, e.y - y);
+      if (d < bestD && see(from.x, from.y, e.x, e.y)) { best = e; bestD = d; }
+    }
+    return best;
+  };
+  const out = [];
+  const struck = new Set();
+  let cur = nearest(player.x, player.y, CHAIN_RANGE, player, struck);
+  while (cur && out.length < maxTargets) {
+    out.push(cur);
+    struck.add(cur);
+    cur = nearest(cur.x, cur.y, CHAIN_JUMP_RANGE, cur, struck);
+  }
+  return out;
+}
+
+function castChainLightning(game, player, skill, rank) {
+  if (typeof game.enemiesInRadius !== 'function') return false;
+  const targets = chainTargets(game, player, 1 + chainJumps(skill, rank));
+  if (!targets.length) {
+    if (typeof game.floatText === 'function') game.floatText(player.x, player.y, 'No target', '#ffe066');
+    return false; // nothing in range: no mana/cooldown spent
+  }
+  const rng = game.rng;
+  const { critChance, critMult } = player.stats;
+  const points = [{ x: player.fx ?? player.x, y: player.fy ?? player.y }];
+  let power = player.stats.spellPower * CHAIN_SP_MULT * rankMult(rank);
+  for (const enemy of targets) {
+    points.push({ x: enemy.x, y: enemy.y });
+    const { amount, crit } = computeDamage(power, enemy.defense, rng, critChance, critMult);
+    if (typeof game.damageEnemy === 'function') game.damageEnemy(enemy, amount, { crit, source: 'spell', element: skill.element });
+    power *= CHAIN_FALLOFF;
+  }
+  if (typeof game.effect === 'function') game.effect('chain', points[0].x, points[0].y, { points, color: '#ffe066' });
+  return true;
+}
+
+function globCount(def, rank) { return GLOB_COUNT + perkTotal(def, rank, 'extraGlobs'); }
+
+// Glob Burst: the Slime King's ring, scaled down to a player spell — slow poison globs in every direction that each
+// slow what they hit (applySlow, via the projectile `slow` field). One shared hit set, like Volley.
+function castGlobBurst(game, player, skill, rank) {
+  const n = globCount(skill, rank);
+  const { amount, crit } = rollSpell(player, player.stats.spellPower * GLOB_SP_MULT * rankMult(rank), game.rng);
+  const ox = player.fx ?? player.x, oy = player.fy ?? player.y;
+  const shared = new Set();
+  // Spokes start on the grid axis, so enemies straight or diagonally out from the player are always in a lane (a
+  // random offset left axis-aligned enemies between spokes). Rank 3's 12 globs still include the 4 axes.
+  if (typeof game.spawnProjectile === 'function') {
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2;
+      game.spawnProjectile({
+        x: ox, y: oy, dx: Math.cos(a), dy: Math.sin(a),
+        speed: GLOB_SPEED, range: GLOB_RANGE,
+        damage: amount, crit, owner: 'player', color: '#7be89a', size: 0.22, pierce: 0,
+        slow: { pct: GLOB_SLOW_PCT, dur: GLOB_SLOW_DUR },
+        kind: 'glob', element: skill.element, hit: shared,
+      });
+    }
+  }
+  if (typeof game.effect === 'function') game.effect('nova', player.x, player.y, { radius: 1.2, color: 0x7be89a });
+  return true;
+}
+
+// Bone Charge: tile-by-tile along facing. An enemy in the lane takes weapon damage (armor applies) and is shoved to a
+// free side tile; if it can't be moved (boss, boxed in) and survives, the charge stops in front of it. Walls/NPCs stop
+// it too. Returns false (no cost) only if it neither moved nor hit anything.
+function castBoneCharge(game, player, skill, rank) {
+  const facing = facingOf(player);
+  if (facing.x === 0 && facing.y === 0) return false;
+  const row = weaponRow(player);
+  const perp = perpOf(facing);
+  const maxTiles = CHARGE_TILES + perkTotal(skill, rank, 'chargeTiles');
+  const rng = game.rng;
+  const { critChance, critMult } = player.stats;
+  const mult = rankMult(rank) * CHARGE_DAMAGE_MULT;
+  const free = (x, y) => (typeof game.isFree === 'function' ? game.isFree(x, y) : true);
+  const oldX = player.x, oldY = player.y;
+  let cx = player.x, cy = player.y, hits = 0;
+  for (let i = 0; i < maxTiles; i++) {
+    const nx = cx + facing.x, ny = cy + facing.y;
+    if (typeof game.isWalkable === 'function' && !game.isWalkable(nx, ny)) break;
+    const enemy = typeof game.enemyAt === 'function' ? game.enemyAt(nx, ny) : null;
+    if (enemy) {
+      const side = [perp, { x: -perp.x, y: -perp.y }].find((s) => free(nx + s.x, ny + s.y)) || null;
+      const power = row ? rng.range(row.min, row.max) * mult : 1;
+      const { amount, crit } = computeDamage(power, enemy.defense, rng, critChance, critMult);
+      if (typeof game.damageEnemy === 'function') {
+        game.damageEnemy(enemy, amount, { crit, source: 'melee', element: skill.element, knockback: side });
+      }
+      hits++;
+      if (!enemy.dead && enemy.x === nx && enemy.y === ny) break; // too heavy / boxed in: stop in front of it
+    } else if (!free(nx, ny)) break; // an NPC (merchant, chest)
+    cx = nx; cy = ny;
+  }
+  if (cx === oldX && cy === oldY && !hits) return false;
+  player.x = cx;
+  player.y = cy;
+  if (typeof game.effect === 'function') game.effect('dash', cx, cy, { from: { x: oldX, y: oldY }, color: 0xe8e2c8 });
+  return true;
+}
+
+function blinkRange(def, rank) { return BLINK_RANGE + perkTotal(def, rank, 'range'); }
+
+// Blink: instant teleport along the free aim angle to the FARTHEST free tile within range that the player can see —
+// enemies in between don't block it (only walls do, via line of sight). false (no cost) if no tile qualifies.
+function castBlink(game, player, skill, rank) {
+  const aim = unit(player.aim || facingOf(player));
+  const ox = player.fx ?? player.x, oy = player.fy ?? player.y;
+  const range = blinkRange(skill, rank);
+  for (let d = range; d >= 0.75; d -= 0.25) {
+    const tx = Math.round(ox + aim.x * d), ty = Math.round(oy + aim.y * d);
+    if (tx === player.x && ty === player.y) continue;
+    if (typeof game.isFree === 'function' && !game.isFree(tx, ty)) continue;
+    if (typeof game.hasLineOfSight === 'function' && !game.hasLineOfSight(player.x, player.y, tx, ty)) continue;
+    const from = { x: player.x, y: player.y };
+    player.x = tx; player.y = ty;
+    player.fx = tx; player.fy = ty;
+    if (typeof game.effect === 'function') game.effect('blink', tx, ty, { from });
+    return true;
+  }
+  return false;
 }

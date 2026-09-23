@@ -165,6 +165,20 @@ export function nearbyMerchant(game) {
   return null;
 }
 
+// The closed treasure chest (§17.11 — a `{ type: 'chest', opened }` NPC in a hidden treasure room) the player is close
+// enough to open, or null. Same range rule as trading with a merchant.
+export function nearbyChest(game) {
+  const p = game.player;
+  const npcs = game.npcs;
+  if (!p || !npcs || !npcs.length) return null;
+  const px = p.fx ?? p.x, py = p.fy ?? p.y;
+  for (const n of npcs) {
+    if (n.type !== 'chest' || n.opened) continue;
+    if (dist(px, py, n.x, n.y) <= MERCHANT_RANGE) return n;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Transactions
 // ---------------------------------------------------------------------------

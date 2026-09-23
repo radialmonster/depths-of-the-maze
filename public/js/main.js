@@ -4,14 +4,14 @@ import { RNG, EventBus, uid, bumpUid, TILE, dist, clamp, ELEMENTS, RARITY } from
 import { generateDungeon, computeFOV } from './map.js';
 import { Renderer } from './renderer.js';
 import { createPlayer, recalcStats, gainXP, mitigate, updatePlayer, projectileHitDamage } from './character.js';
-import { createSkillState, normalizeSkillState, useSkill, updateSkills } from './skills.js';
+import { createSkillState, normalizeSkillState, useSkill, updateSkills, randomGenericBook } from './skills.js';
 import { spawnEnemies, updateEnemies, createEnemy, getResist, applySlow } from './enemies.js';
-import { rollLoot, startingGear, addToInventory, useItem, generateItem, activePotion, enforceTwoHanded, refreshItemIcon } from './items.js';
+import { rollLoot, startingGear, addToInventory, useItem, generateItem, activePotion, enforceTwoHanded, refreshItemIcon, createSkillBook } from './items.js';
 import { Input } from './input.js';
 import { UI, padLabel } from './ui.js';
 import { sfx, wireAudio } from './audio.js';
 import { saveRun, loadRun, clearSave } from './save.js';
-import { isMerchantDepth, placeMerchant, nearbyMerchant, MERCHANT_ENEMY_CLEARANCE } from './shop.js';
+import { isMerchantDepth, placeMerchant, nearbyMerchant, nearbyChest, MERCHANT_ENEMY_CLEARANCE } from './shop.js';
 
 const FOV_RADIUS = 9;
 const PROJECTILE_STEP = 0.25; // tiles per collision substep
@@ -147,7 +147,17 @@ const game = {
     }
     this.floatText(enemy.x, enemy.y - 0.4, `+${enemy.xp} XP`, '#b18cff');
     gainXP(this, enemy.xp);
-    this.dropLoot(enemy.x, enemy.y, rollLoot(enemy, this.depth, this.rng));
+    // Boss loot also rolls skill books off the run's defeated-boss list (§17.11), checked BEFORE recording this kill.
+    const p = this.player;
+    const loot = rollLoot(enemy, this.depth, this.rng, { bossesDefeated: (p && p.bossesDefeated) || [] });
+    if (enemy.behavior === 'boss' && p) {
+      if (!Array.isArray(p.bossesDefeated)) p.bossesDefeated = [];
+      if (!p.bossesDefeated.includes(enemy.type)) p.bossesDefeated.push(enemy.type);
+      for (const it of loot) {
+        if (it.type === 'skillbook') this.log(`${enemy.name} dropped ${it.name}!`, RARITY[it.rarity]?.color || '#ffd43b');
+      }
+    }
+    this.dropLoot(enemy.x, enemy.y, loot);
     this.bus.emit('enemyKilled', { enemy });
   },
 
@@ -204,7 +214,8 @@ const game = {
       for (let k = 0; k < spots.length; k++) {
         const [ox, oy] = spots[(i + k) % spots.length];
         const t = this.map.get(x + ox, y + oy);
-        if (this.isWalkable(x + ox, y + oy) && t !== TILE.EXIT && t !== TILE.ENTRANCE) { sx = x + ox; sy = y + oy; break; }
+        // Never under an NPC (merchant / chest): its tile can't be walked onto, so the item couldn't be picked up.
+        if (this.isWalkable(x + ox, y + oy) && t !== TILE.EXIT && t !== TILE.ENTRANCE && !this.npcAt(x + ox, y + oy)) { sx = x + ox; sy = y + oy; break; }
       }
       i++;
       this.groundItems.push({ id: uid(), x: sx, y: sy, item, noPickup: false });
@@ -312,6 +323,26 @@ window.__dbg = {
     }
     computeFOV(map, p.x, p.y, FOV_RADIUS);
     return spawned;
+  },
+  // Skill-unlock testing (§17.11): put a skill book in the bag; stand 2 tiles from this depth's hidden doorway.
+  giveBook(skillId) {
+    const book = createSkillBook(skillId, game.depth);
+    if (!addToInventory(game.player, book)) return null;
+    return book;
+  },
+  gotoSecret() {
+    const map = game.map, p = game.player;
+    const sc = map && (map.secrets || []).find((s) => !s.revealed);
+    if (!sc) return null;
+    for (const [dx, dy] of [[2, 0], [-2, 0], [0, 2], [0, -2]]) {
+      const x = sc.x + dx, y = sc.y + dy;
+      if (game.isFree(x, y) && map.isWalkable(sc.x + dx / 2, sc.y + dy / 2)) {
+        p.x = x; p.y = y; p.fx = x; p.fy = y; p.facing = { x: -Math.sign(dx), y: -Math.sign(dy) };
+        computeFOV(map, x, y, FOV_RADIUS);
+        return { secret: { x: sc.x, y: sc.y }, player: { x, y } };
+      }
+    }
+    return null;
   },
   clearGallery() {
     game.enemies = (game.enemies || []).filter((e) => !e._gallery);
@@ -431,9 +462,10 @@ function loadDepth(depth) {
   p.facing = ent.dir ? { x: ent.dir.x, y: ent.dir.y } : { x: 0, y: 1 };
 
   game.enemies = spawnEnemies(game);
+  game.npcs = [];
+  placeHiddenRoomChests(); // before seedTreasure so its loot scatters around the chest, not under it
   seedTreasure();
 
-  game.npcs = [];
   if (isMerchantDepth(depth)) {
     const merchant = placeMerchant(game);
     // Keep the immediate area walkable and safe: no enemies loitering right on top of the stall.
@@ -462,6 +494,86 @@ function seedTreasure() {
     loot.push({ type: 'gold', amount: game.rng.int(20, 40) * game.depth });
     game.dropLoot(room.cx, room.cy, loot);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Hidden treasure rooms (§17.11): map.js seals one dead-end room's doorway (map.secrets). Each gets a chest (an NPC,
+// opened like trading: confirm when adjacent) and is kept free of enemies; the doorway reveals when the player is
+// within 1 tile of it and it's in view.
+
+// Floor tiles of a sealed room: flood fill from its centre (the doorway is a wall, so it can't leak out).
+function sealedRoomTiles(room) {
+  const map = game.map;
+  const seen = new Set([map.idx(room.cx, room.cy)]);
+  const out = [];
+  const queue = [[room.cx, room.cy]];
+  while (queue.length) {
+    const [x, y] = queue.shift();
+    if (!map.isWalkable(x, y)) continue;
+    out.push({ x, y });
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const nx = x + dx, ny = y + dy;
+      if (!map.inBounds(nx, ny) || seen.has(map.idx(nx, ny))) continue;
+      seen.add(map.idx(nx, ny));
+      if (map.isWalkable(nx, ny)) queue.push([nx, ny]);
+    }
+  }
+  return out;
+}
+
+function placeHiddenRoomChests() {
+  const map = game.map;
+  for (const room of map.rooms) {
+    if (!room.hidden || !room.secretDoor) continue;
+    const cells = sealedRoomTiles(room);
+    if (!cells.length) continue;
+    const inRoom = new Set(cells.map((c) => map.idx(c.x, c.y)));
+    // Nothing is sealed in with the treasure (spawn candidates already skip the room; this catches stragglers).
+    game.enemies = game.enemies.filter((e) => !inRoom.has(map.idx(e.x, e.y)));
+    // The back of the room (farthest from the doorway), on a tile with open floor around it for the loot to land.
+    const door = room.secretDoor;
+    const openAround = (c) => [[1, 0], [-1, 0], [0, 1], [0, -1]].filter(([dx, dy]) => inRoom.has(map.idx(c.x + dx, c.y + dy))).length;
+    let best = null, bestScore = -Infinity;
+    for (const c of cells) {
+      const score = dist(c.x, c.y, door.x, door.y) + (openAround(c) >= 3 ? 100 : 0);
+      if (score > bestScore) { bestScore = score; best = c; }
+    }
+    game.npcs.push({
+      id: uid(), type: 'chest', x: best.x, y: best.y, fx: best.x, fy: best.y, opened: false, roomId: room.id,
+      rot: Math.atan2(door.x - best.x, door.y - best.y), // lid/latch faces the doorway
+    });
+  }
+}
+
+// Reveal any secret doorway within 1 tile (Chebyshev) of the player that is currently in view.
+function checkSecrets() {
+  const map = game.map, p = game.player;
+  if (!map || !map.secrets || !p) return;
+  for (const sc of map.secrets) {
+    if (sc.revealed) continue;
+    if (Math.max(Math.abs(sc.x - p.x), Math.abs(sc.y - p.y)) > 1) continue;
+    if (!map.visible[map.idx(sc.x, sc.y)]) continue;
+    if (!map.revealSecret(sc.x, sc.y)) continue;
+    renderer.revealTile(sc.x, sc.y);
+    computeFOV(map, p.x, p.y, FOV_RADIUS);
+    game.floatText(sc.x, sc.y, 'Hidden passage!', '#ffe08a', { size: 16 });
+    game.log('You found a hidden passage.', '#ffe08a');
+    game.bus.emit('secretFound', { x: sc.x, y: sc.y });
+  }
+}
+
+// Opens a chest: one random generic-pool skill book, dropped beside it (dropLoot skips the chest's own tile).
+function openChest(chest) {
+  if (!chest || chest.opened) return;
+  chest.opened = true;
+  const id = randomGenericBook(game.rng);
+  game.dropLoot(chest.x, chest.y, id ? [createSkillBook(id, game.depth)] : [{ type: 'gold', amount: game.rng.int(20, 40) * game.depth }]);
+  game.effect('pickup', chest.x, chest.y, { color: '#ffd34f' });
+  game.effect('levelup', chest.x, chest.y);
+  game.log('The chest creaks open.', '#ffd34f');
+  game.bus.emit('chestOpened', { chest });
+  const p = game.player;
+  pickupAt(p.x, p.y); // in case the book landed on the player's own tile
 }
 
 function descend() {
@@ -644,6 +756,7 @@ function onPlayerMoved() {
   const p = game.player;
   sfx.footstep(); // one soft step per tile moved (throttled), so it follows movement speed
   computeFOV(game.map, p.x, p.y, FOV_RADIUS);
+  checkSecrets();
   pickupAt(p.x, p.y);
   if (game.map.get(p.x, p.y) === TILE.EXIT) descend();
 }
@@ -700,11 +813,18 @@ function updateProjectiles(dt) {
       const tx = Math.round(pr.x), ty = Math.round(pr.y);
       if (!game.isWalkable(tx, ty)) {
         game.effect('hit', pr.x - pr.dx * 0.3, pr.y - pr.dy * 0.3, { color: pr.color });
+        if (pr.explode) explodeProjectile(pr, pr.x - pr.dx * step, pr.y - pr.dy * step);
         alive = false;
         break;
       }
       if (pr.owner === 'player') {
         const e = game.enemyAt(tx, ty);
+        if (e && !pr.hit.has(e.id) && pr.explode) {
+          // Fireball-style: the blast (which includes the struck enemy) replaces the direct hit.
+          explodeProjectile(pr, e.x, e.y);
+          alive = false;
+          break;
+        }
         if (e && !pr.hit.has(e.id)) {
           pr.hit.add(e.id);
           // Hit-time resolution (§17.12): point-blank + target defense for applyDefense shots; others unchanged.
@@ -722,10 +842,27 @@ function updateProjectiles(dt) {
         game.effect('hit', p.x, p.y, { color: pr.color });
         alive = false;
       }
-      if (pr.traveled >= pr.range) alive = false;
+      if (pr.traveled >= pr.range) {
+        if (pr.explode) explodeProjectile(pr, pr.x, pr.y);
+        alive = false;
+      }
     }
     if (!alive) game.projectiles.splice(i, 1);
   }
+}
+
+// An `explode` projectile (Fireball, §9) bursting at (x, y): its rolled damage (spell — no armor) to every living
+// enemy within the radius that the blast point can see.
+function explodeProjectile(pr, x, y) {
+  const r = pr.explode.radius || 1.5;
+  const bx = Math.round(x), by = Math.round(y);
+  for (const e of game.enemiesInRadius(x, y, r)) {
+    if (!game.hasLineOfSight(bx, by, e.x, e.y)) continue;
+    game.damageEnemy(e, pr.damage, { crit: pr.crit, source: 'spell', element: pr.element, knockback: null });
+  }
+  game.effect('nova', x, y, { radius: r, color: pr.explode.color || pr.color });
+  game.effect('hit', x, y, { color: pr.explode.color || pr.color, crit: true });
+  sfx.explosion();
 }
 
 function updateDeadEnemies(dt) {
@@ -766,6 +903,12 @@ function handleGameplayInput(dt) {
   let suppressSkill1 = false;
   if (merchant && input.pressed('confirm')) {
     ui.openShop(merchant);
+    suppressSkill1 = true;
+  }
+  // A closed chest in range: confirm opens it (same confirm-when-adjacent rule as trading, §17.11).
+  const chest = merchant ? null : nearbyChest(game);
+  if (chest && input.pressed('confirm')) {
+    openChest(chest);
     suppressSkill1 = true;
   }
 

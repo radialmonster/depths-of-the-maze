@@ -95,7 +95,9 @@ game = {
   applyDefense /*bool — true = reduced by target defense like a melee hit (weapon shots); false = ignores defense (spells)*/,
   slow:{pct,dur}|null /*applied to the enemy on hit, via applySlow(), see §17.6*/,
   owner:'player'|'enemy', color:'#hex', size /*0.1-0.5*/, pierce:0,
-  kind:'arrow'|'spark'|'bolt'|'fireball'|'enemyBolt', hit:Set }
+  explode:{radius,color}|null /*bursts where it stops (enemy, wall, max range): `damage` to every enemy in radius + LOS*/,
+  kind:'arrow'|'spark'|'bolt'|'fireball'|'glob'|'enemyBolt',
+  hit:Set /*may be SHARED by several projectiles of one cast (Volley, Glob Burst): an enemy is hit once per cast*/ }
 ```
 main.js moves projectiles, stops them at walls, and calls damageEnemy / damagePlayer on hit. Damage and crit are rolled
 when the projectile is fired (so the crit feel happens at release); `applyDefense` and the point-blank check are
@@ -111,10 +113,13 @@ map = {
   tiles: Uint8Array(width*height),       // TILE values
   visible: Uint8Array(width*height),     // 1 = currently in FOV
   explored: Uint8Array(width*height),    // 1 = ever seen
-  rooms: [{ id, x, y, w, h, cx, cy, size:'small'|'medium'|'large', doors:[{x,y}], kind:'normal'|'start'|'exit'|'treasure'|'boss' }],
+  rooms: [{ id, x, y, w, h, cx, cy, size:'small'|'medium'|'large', doors:[{x,y}], kind:'normal'|'start'|'exit'|'treasure'|'boss',
+             hidden?, secretDoor?:{x,y} /*hidden treasure room only*/ }],
   entrance: {x, y, dir, front, freestanding?}, // ENTRANCE tile: a cubby in the start room's wall (up-stairs);
                                // dir = unit step from the cubby into the room, front = floor tile in front (player spawn)
   exits: [{x, y, dir, front, freestanding?}],  // 1-3 EXIT cubbies (down-stairs), far from entrance; walking in descends
+  secrets: [{x, y, roomId, revealed}],   // hidden treasure-room doorways: WALL tiles until revealed (§17.11)
+  secretAt(x,y), revealSecret(x,y) -> secret|null,  // reveal = WALL -> DOOR (main.js calls it, then renderer.revealTile)
   idx(x,y), inBounds(x,y), get(x,y), isWalkable(x,y), isOpaque(x,y),
   spawnCandidates(rng, count, minDistFromEntrance) -> [{x,y,roomId}] // floor tiles for enemies/loot
   hasLineOfSight(x0,y0,x1,y1)
@@ -210,6 +215,12 @@ export function skillEligible(player, def, category, cls) -> bool  // the eligib
 export function skillDescription(skillId, rank, player) -> string  // for tooltips / Skills tab
 export function effectiveCooldown(skillDef, rank, player) -> number  // base * 0.95^(rank-1) * (1 - clamp(cooldownReduction,0,0.4))
 export function boltDamageRange(player) -> {min,max}   // Arcane Bolt's pre-rank damage from spellPower (x0.8 / x1.2), §17.9
+// Skill books (§17.11):
+export const GENERIC_BOOK_POOL, BOSS_SKILL_BOOKS          // derived from each def's `unlock`
+export function bossBookDrops(bossType, bossesDefeated, rng) -> [skillId]  // first kill: unique; repeat: 20% generic / 3% unique
+export function randomGenericBook(rng) -> skillId|null   // treasure chests
+export function readSkillBook(player, skillId) -> {ok, isNew, rank, name, reason}  // learnSkill + what happened
+export function skillBookInfo(skillId, player) -> {name, icon, categoryLabel, requires, description, unique, rank, maxRank}
 ```
 `useSkill`/the HUD/the bump-attack in main.js only ever go through `activeSkill()` — none of them know which concrete
 skill id is in a slot.
@@ -236,6 +247,18 @@ along `player.aim` like Arcane Bolt), **Staff Sweep** (staff, int; hits all 8 su
 away from the player on crit — every hit from rank 3, like Cleave; 0.6s base cooldown).
 Spell/special/movement at launch: **Arcane Bolt** (projectile, piercing at higher ranks), **Frost Nova** (AoE radius
 ~2.5, damage + slow/freeze, mana heavy), **Shadow Dash** (dash up to 3 tiles through free tiles, 0.4s invuln, short CD).
+**Unlockable skills** (§17.11 — never known by default, never a default; learned from skill books; each definition
+has `unlock: 'generic' | { boss: enemyTypeId }`): **Volley** (attack, bow — 3-arrow fan at 60% bow damage, one shared
+hit set per volley, 0.7s CD; rank 3: 5 arrows), **Fireball** (spell, fire — bursts on impact, radius 1.5 (+0.5 at rank 3),
+Arcane Bolt's spell-power damage to each target, 12 mana, 1.4s CD), **Chain Lightning** (special, lightning — nearest
+enemy in sight within 6, then up to 3 jumps (+1 at rank 3 and 5) of ≤3.5 tiles, −20% per jump, armor applies like
+Frost Nova; no target = no cost), **Blink** (movement, arcane — instant teleport up to 2 tiles (+1 at rank 3) along the
+free aim, over enemies but never through walls, no invulnerability, 6 mana, 1.2s CD) — the generic pool, one per slot
+category; and the boss-unique **Glob Burst** (special, poison, Slime King — a ring of 8 (12 at rank 3) axis-aligned
+globs, spell-power ×0.7, each slowing 35% for 2s, one shared hit set, 18 mana, 7s CD) and **Bone Charge** (movement,
+physical, Bone Tyrant — charge up to 4 tiles (+1 at rank 3) along facing, 90% weapon damage to each enemy in the
+lane and shoving it to a free side tile; stops in front of anything it can't move (bosses); no invulnerability, 8 mana,
+5s CD).
 See §17.10 for the loadout/unlock system these plug into.
 
 ## 10. Enemies (enemies.js)
@@ -259,7 +282,9 @@ Enemies attack adjacent (orthogonal) player via `game.damagePlayer(amount, enemy
 ```js
 export const INVENTORY_SIZE = 24
 export function generateItem(depth, rng, opts={}) -> item   // opts {slot, rarity, type}
-export function rollLoot(enemy, depth, rng) -> [item|{type:'gold',amount}]
+export function rollLoot(enemy, depth, rng, opts={}) -> [item|{type:'gold',amount}]  // opts.bossesDefeated: boss skill-book drops (§17.11)
+export function createSkillBook(skillId, depth) -> item  // type 'skillbook'; boss-unique = legendary, generic = rare
+export function setSkillBookHooks({info, read, bossDrops})  // registered by skills.js (import cycle, like setAttackSkillResolver)
 export function equipItem(player, item, log?) -> bool // from inventory; swaps with equipped; handles 2H off-hand eviction (§17.9); recalcStats.
                                                   //   optional log(text,color) gets the 2H refusal / eviction messages
 export function equipCheck(player, item) -> {ok, reason?, evicts?}  // the 2H equip rules without side effects
@@ -358,7 +383,8 @@ export class Renderer {
   update(game, dt)              // sync meshes to game.player / enemies / groundItems / projectiles (Map<obj.id, mesh>; create/remove as needed),
                                 // lerp positions, facing rotation, hit flash, death anim, fog-of-war from map.visible/explored, camera follow
   render()
-  spawnEffect(type, x, y, opts) // 'slash'(opts.dir), 'nova'(opts.radius), 'sweep' (Staff Sweep ring + hero swing), 'dash'(opts.from),
+  spawnEffect(type, x, y, opts) // 'slash'(opts.dir), 'nova'(opts.radius), 'sweep' (Staff Sweep ring + hero swing), 'dash'(opts.from, opts.color),
+                                //   'chain'(opts.points [{x,y}], opts.color — Chain Lightning arcs), 'blink'(opts.from),
                                 //   'hit', 'death', 'levelup', 'heal', 'pickup', 'exit'
   floatText(x, y, text, color)  // rising fading damage numbers (DOM or sprite)
   shake(intensity)
@@ -393,7 +419,8 @@ reserved for attack telegraphs, so no model uses red floor decals. Debug: `__dbg
 `itemPickedUp {item}` · `goldPickedUp {amount}` · `depthChanged {depth}` · `skillUsed {skill}` · `statsChanged` ·
 `potionUsed {kind:'heal'|'mana'}` · `denied` (no mana / no potion / bag full / can't afford) · `bossSlam` ·
 `itemBought {item, price}` · `itemSold {item, price}` · `bossIntro {enemy}` · `bossPhase2 {enemy}` ·
-`bossTelegraph {enemy, attack}` (a boss begins a telegraphed attack)
+`bossTelegraph {enemy, attack}` (a boss begins a telegraphed attack) · `skillLearned {skillId, isNew, rank}` (a skill
+book was read) · `secretFound {x, y}` (a hidden doorway revealed) · `chestOpened {chest}`
 
 ## 16. Balance targets
 - Depth 1 enemies die in 2–3 Cleaves; player survives ~8–10 hits from depth-appropriate enemies.
@@ -517,8 +544,8 @@ Decisions made with the user while building. Keep this section current — when 
   (no skill name, no numbers); its icon is 🧭 (moved off 🏹 once Ranged got its own stat row — see §17.9).
 
 ### 17.6 Elements & resistances
-- Damage has an **element**: physical, arcane, frost, fire, poison, lightning (fire/poison/lightning reserved for future
-  skills and gear). Skills are tagged with an element (Cleave physical, Arcane Bolt arcane, Frost Nova frost) — resistances
+- Damage has an **element**: physical, arcane, frost, fire, poison, lightning (fire/poison/lightning first used by the
+  Phase 6 unlockable skills — Fireball, Glob Burst, Chain Lightning; still unused on gear). Skills are tagged with an element (Cleave physical, Arcane Bolt arcane, Frost Nova frost) — resistances
   never refer to specific skills.
 - Status effects are separate keys: freeze, slow (future: burn, poison). Slow has a **strength** (`slowPct`, §10):
   applying a new slow only overwrites the current one if it's stronger (or equal but longer) — see `applySlow()` in §17.12.
@@ -725,6 +752,37 @@ No random enemy drops. Three sources, all via the `skillbook` item type (§11):
   strictly-better rather than different).
 - Books are tooltip-labeled with category + weapon requirement (e.g. "Attack · requires Bow") and can be learned
   (used) even without the required weapon equipped — they just show greyed out in the Skills tab until you equip it.
+
+**Implementation notes (Phase 6):**
+- Six unlockable skills (§9): generic pool Volley / Fireball / Chain Lightning / Blink (one per slot category, so no
+  picker is ever empty once something is unlocked), boss-unique Glob Burst (Slime King) / Bone Charge (Bone Tyrant).
+  Boss type ids are the `ENEMY_TYPES` keys (`slime_king`, `bone_tyrant`) — that is what `player.bossesDefeated` holds.
+  The registry validator now also rejects a default that is marked unlockable.
+- `learnSkill` already did new = rank 1 + 1 skill point / duplicate = +1 rank / refuse at rank 5 (Phase 2); unchanged.
+  A max-rank book is **not consumed** (the log says it's mastered, the tooltip says "sell it").
+- Skill book item: `createSkillBook` in items.js, icon 📕, value 60 + 4×lvl (generic) / 120 + 4×lvl (unique), `stats:{}`.
+  Reading goes through `useItem` (Bag click / A). skills.js registers `setSkillBookHooks` (items.js can't import it).
+- Boss drops ride the existing boss loot path: `rollLoot(enemy, depth, rng, { bossesDefeated })` appends the books
+  after the guaranteed rare+ item and health potion; `killEnemy` then records the boss type and logs
+  "{boss} dropped Skill Book: …".
+- Treasure rooms: previously any small room, 50% of depths. Now **only dead ends** (exactly one door AND exactly one
+  non-wall tile touching the room's floor in the 8-neighbourhood — also catches any safety-net carve), any size,
+  preferring small. **Deviation:** ~25% of layouts have no dead-end candidate, so the hidden roll is 45%
+  (`HIDDEN_ROOM_CHANCE`) to land ~35% of depths ≥ 2 actually having a hidden room (measured 34% over 1000 layouts);
+  otherwise the old 50% (visible) treasure roll applies. Hidden rooms get no spawn candidates, and main.js removes any
+  enemy standing in one; `seedTreasure` loot still spawns there, on top of the chest.
+- Reveal: checked in `onPlayerMoved` after FOV — Chebyshev distance ≤ 1 from the player's tile and `map.visible`.
+  `renderer.revealTile` works because buildMap gives each unrevealed secret a hidden floor slab up front (an
+  InstancedMesh can't grow); reveal drops the wall instance, shows the slab, adds the door frame, gold ring + motes.
+- Chest: **deviation** — `models.js` had no standalone chest, only a tiny one baked into the merchant's rug; `buildChest()`
+  is a full-size version of that same design (wood box, iron bands, rounded lid on a hinge that swings open, gold latch,
+  soft glow while closed), turned to face the doorway. It's a `{type:'chest', opened}` NPC; `nearbyChest` (shop.js,
+  next to `nearbyMerchant`) + confirm opens it; the HUD prompt reads "Open — E / A". `dropLoot` now never places an
+  item on an NPC's tile, so the book lands beside the chest (and is picked up at once if that's the player's tile).
+- Glob Burst's ring is axis-aligned (not randomly offset like the King's alternating ring): with a random offset,
+  enemies straight out from the player sat between spokes, which felt broken on a tile grid.
+- New sounds (procedural, audio.js): one per new skill, a Fireball burst, hidden passage (stone grind + chime), chest
+  open, skill learned.
 
 ### 17.12 Combat: armor on weapon shots, point-blank, and slow strength
 - **Weapon-role projectiles** (Bow Shot, Volley, Spark — Spark is `element:'arcane'` but still a weapon attack) set `applyDefense:true` and are reduced by the target's

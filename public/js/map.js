@@ -25,13 +25,22 @@
 //  6. Start room (entrance) is chosen, BFS distances computed, then 1-3 exit rooms are chosen
 //     from the farthest third of rooms. Each stair tile is a one-tile cubby cut into the
 //     room's wall (findNiche), preferring the camera-facing north wall; every 5th depth tags the largest far room 'boss';
-//     a small room may be tagged 'treasure'.
+//     a dead-end room (one doorway) may be tagged 'treasure', and from depth 2 hidden behind a
+//     secret doorway (map.secrets / revealSecret, §17.11).
 
 import { TILE } from './core.js';
 
 const DIR4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
 const LINK_CAP = { small: 2, medium: 3, large: 4 }; // max rooms linked to one room
 const DIR8 = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+
+// Treasure rooms (§17.11): a dead-end room, 50% of depths; from depth 2 on, some depths get a HIDDEN treasure room
+// instead (secret doorway + chest). The hidden roll comes first. ~1 in 4 layouts has no eligible dead-end room at
+// all, so the roll is 45% to land the design target of a hidden room on ~35% of depths (measured: ~34% over 1000
+// layouts at depths 2-26).
+export const TREASURE_ROOM_CHANCE = 0.5;
+export const HIDDEN_ROOM_CHANCE = 0.45;
+export const HIDDEN_ROOM_MIN_DEPTH = 2;
 
 function computeMapSize(depth) {
   let s = 54 + Math.round((depth - 1) * 2.5);
@@ -536,6 +545,30 @@ export function generateDungeon(depth, rng) {
     return best;
   }
 
+  // Every non-WALL tile touching (8-neighbourhood) a room's floor from outside it. A dead end has exactly one: its
+  // single doorway. Uses the post-crop roomIdGrid (room._cells indices are pre-crop), so it also catches any opening
+  // the BFS safety net carved without registering a door.
+  function roomOpenings(room) {
+    const out = new Set();
+    for (let y = room.y; y < room.y + room.h; y++) {
+      for (let x = room.x; x < room.x + room.w; x++) {
+        if (!inBounds(x, y) || roomIdGrid[idx(x, y)] !== room.id) continue;
+        for (const [dx, dy] of DIR8) {
+          const nx = x + dx, ny = y + dy;
+          if (!inBounds(nx, ny) || roomIdGrid[idx(nx, ny)] === room.id || tiles[idx(nx, ny)] === TILE.WALL) continue;
+          out.add(idx(nx, ny));
+        }
+      }
+    }
+    return out;
+  }
+  function isDeadEndRoom(room) {
+    if (room.doors.length !== 1) return false;
+    const open = roomOpenings(room);
+    const d = room.doors[0];
+    return open.size === 1 && open.has(idx(d.x, d.y)) && tiles[idx(d.x, d.y)] === TILE.DOOR;
+  }
+
   // ---------- 6. Start room / entrance ----------
   const startCandidates = rooms.filter(r => r.size !== 'large');
   const startRoom = rng.pick(startCandidates.length ? startCandidates : rooms);
@@ -596,14 +629,33 @@ export function generateDungeon(depth, rng) {
       best.kind = 'boss';
     }
   }
-  if (rng.chance(0.5)) {
-    const smallPool = rooms.filter(r => r.kind === 'normal' && r.size === 'small');
-    if (smallPool.length) rng.pick(smallPool).kind = 'treasure';
+  // Treasure room (§17.11): always a dead end — a still-'normal' room (so never start/exit/boss; the merchant only
+  // ever picks 'normal' rooms, so never the merchant's either) whose ONLY opening is a single doorway — so hiding
+  // that doorway can never cut off any other floor. From HIDDEN_ROOM_MIN_DEPTH, HIDDEN_ROOM_CHANCE of depths hide it:
+  // its doorway becomes a WALL tile listed in map.secrets until the player finds it (main.js -> revealSecret).
+  const secrets = [];
+  {
+    const deadEnds = rooms.filter(r => r.kind === 'normal' && isDeadEndRoom(r));
+    const hide = depth >= HIDDEN_ROOM_MIN_DEPTH && rng.chance(HIDDEN_ROOM_CHANCE);
+    if (deadEnds.length && (hide || rng.chance(TREASURE_ROOM_CHANCE))) {
+      const small = deadEnds.filter(r => r.size === 'small');
+      const room = rng.pick(small.length ? small : deadEnds);
+      room.kind = 'treasure';
+      if (hide) {
+        const d = room.doors[0];
+        tiles[idx(d.x, d.y)] = TILE.WALL;
+        room.hidden = true;
+        room.secretDoor = { x: d.x, y: d.y };
+        secrets.push({ x: d.x, y: d.y, roomId: room.id, revealed: false });
+      }
+    }
   }
 
   for (const r of otherRooms) delete r._dist;
 
   // ---------- 10. Spawn candidate caches ----------
+  // Hidden treasure rooms get no enemy/loot spawn candidates: nothing should be sealed in there (§17.11).
+  const hiddenRoomIds = new Set(secrets.map(sc => sc.roomId));
   const roomFloors = [];
   const corridorFloors = [];
   for (let y = 1; y < height - 1; y++) {
@@ -612,7 +664,7 @@ export function generateDungeon(depth, rng) {
       if (tiles[i] !== TILE.FLOOR) continue;
       const rid = roomIdGrid[i];
       if (rid === -1) corridorFloors.push({ x, y, roomId: null });
-      else if (rid !== startRoom.id) roomFloors.push({ x, y, roomId: rid });
+      else if (rid !== startRoom.id && !hiddenRoomIds.has(rid)) roomFloors.push({ x, y, roomId: rid });
     }
   }
 
@@ -622,6 +674,8 @@ export function generateDungeon(depth, rng) {
 
   const map = {
     width, height, tiles, visible, explored, rooms, entrance, exits,
+    // Hidden treasure-room doorways (§17.11): WALL tiles until revealed. [{ x, y, roomId, revealed }]
+    secrets,
     idx(x, y) { return y * width + x; },
     inBounds(x, y) { return x >= 0 && y >= 0 && x < width && y < height; },
     get(x, y) { return this.inBounds(x, y) ? tiles[this.idx(x, y)] : TILE.WALL; },
@@ -643,6 +697,16 @@ export function generateDungeon(depth, rng) {
       return chosen.slice(0, count).map(p => ({ x: p.x, y: p.y, roomId: p.roomId }));
     },
     hasLineOfSight(x0, y0, x1, y1) { return computeLineOfSight(this, x0, y0, x1, y1); },
+    // The unrevealed secret doorway at (x,y), or null.
+    secretAt(x, y) { return secrets.find(sc => !sc.revealed && sc.x === x && sc.y === y) || null; },
+    // Opens a secret doorway: WALL -> DOOR. Returns the secret, or null if there is none (or it's already open).
+    revealSecret(x, y) {
+      const sc = this.secretAt(x, y);
+      if (!sc) return null;
+      sc.revealed = true;
+      tiles[this.idx(x, y)] = TILE.DOOR;
+      return sc;
+    },
   };
 
   return map;

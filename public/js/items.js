@@ -421,7 +421,59 @@ export function generateItem(depth, rng = new RNG(), opts = {}) {
   return item;
 }
 
-export function rollLoot(enemy, depth, rng) {
+// ---------------------------------------------------------------------------
+// Skill books (DESIGN §11, §17.11). skills.js registers these hooks (items.js can't import skills.js: cycle):
+//   info(skillId, player) -> { name, icon, category, categoryLabel, requires, description, unique, rank, maxRank } | null
+//   read(player, skillId) -> { ok, isNew, rank, name, reason }       (learnSkill + what happened)
+//   bossDrops(bossType, bossesDefeated, rng) -> [skillId]            (first kill / repeat kill book rolls)
+// ---------------------------------------------------------------------------
+let skillBookHooks = null;
+export function setSkillBookHooks(hooks) { skillBookHooks = hooks || null; }
+
+export const SKILL_BOOK_ICON = '📕';
+// A skill book item. Boss-unique books are legendary-coloured, generic-pool books rare-coloured. Never merchant stock
+// (generateItem never rolls this type), but sellable / buy-back-able like any bag item.
+export function createSkillBook(skillId, depth = 1) {
+  const info = skillBookHooks ? skillBookHooks.info(skillId, null) : null;
+  const unique = !!(info && info.unique);
+  const itemLevel = clamp(Math.floor(depth) || 1, 1, 60);
+  const name = `Skill Book: ${(info && info.name) || skillId}`;
+  return {
+    id: uid(), name, baseName: name, type: 'skillbook', slot: null,
+    rarity: unique ? 'legendary' : 'rare', icon: SKILL_BOOK_ICON,
+    itemLevel, skillId, stats: {},
+    value: Math.round((unique ? 120 : 60) + itemLevel * 4),
+  };
+}
+
+// Reads a skill book from the bag: learns the skill (+1 skill point) or, if known, +1 rank. Not consumed (returns
+// false) at max rank or for an unknown skill id.
+function readSkillBookItem(game, item) {
+  const player = game.player;
+  const idx = player.inventory.findIndex((i) => i.id === item.id);
+  if (idx === -1 || !skillBookHooks) return false;
+  const res = skillBookHooks.read(player, item.skillId);
+  if (!res.ok) {
+    game.log?.(res.reason === 'max' ? `${res.name} is already mastered (rank ${res.rank}).` : 'The pages are unreadable.', '#aaaaaa');
+    game.bus?.emit('denied');
+    return false;
+  }
+  player.inventory.splice(idx, 1);
+  recalcStats(player);
+  if (res.isNew) {
+    game.log?.(`Learned ${res.name}! +1 skill point. Assign it in the Skills tab (K).`, '#ffd43b');
+    game.floatText?.(player.x, player.y, `New skill: ${res.name}`, '#ffd43b', { size: 18 });
+  } else {
+    game.log?.(`${res.name} rises to rank ${res.rank}!`, '#ffd43b');
+    game.floatText?.(player.x, player.y, `${res.name} rank ${res.rank}`, '#ffd43b', { size: 16 });
+  }
+  game.effect?.('levelup', player.x, player.y);
+  game.bus?.emit('skillLearned', { skillId: item.skillId, isNew: res.isNew, rank: res.rank });
+  return true;
+}
+
+// `opts.bossesDefeated` (the player's list, before this kill is recorded) enables a boss's skill-book drops (§17.11).
+export function rollLoot(enemy, depth, rng, opts = {}) {
   const drops = [];
   const isBoss = enemy?.behavior === 'boss' || enemy?.type === 'boss';
   const isElite = !!enemy?.elite;
@@ -456,6 +508,10 @@ export function rollLoot(enemy, depth, rng) {
     }
     // Bosses always leave a health potion behind, on top of the mob potion roll below.
     drops.push(generateItem(depth, rng, { type: 'potion', potionKind: 'health' }));
+    // Skill books (§17.11): first kill of this boss type this run = its unique book; repeat kills = small chances.
+    if (skillBookHooks && Array.isArray(opts.bossesDefeated) && enemy?.type) {
+      for (const id of skillBookHooks.bossDrops(enemy.type, opts.bossesDefeated, rng)) drops.push(createSkillBook(id, depth));
+    }
   } else {
     const dropChance = isElite ? 0.6 : 0.18;
     if (rng.chance(dropChance)) drops.push(generateItem(depth, rng, { elite: isElite }));
@@ -545,6 +601,7 @@ export function unequipItem(player, slot) {
 
 export function useItem(game, item) {
   const player = game.player;
+  if (item.type === 'skillbook') return readSkillBookItem(game, item);
   if (item.type !== 'potion') return equipItem(player, item, typeof game.log === 'function' ? (t, c) => game.log(t, c) : null);
 
   const idx = player.inventory.findIndex((i) => i.id === item.id);
@@ -706,6 +763,7 @@ function typeLabel(item) {
   if (item.type === 'weapon') return `Weapon (${cap(item.weaponKind)}${isTwoHanded(item) ? ', Two-handed' : ''})`;
   if (item.type === 'offhand') return `Off-Hand (${cap(item.offhandKind)})`;
   if (item.type === 'potion') return 'Potion';
+  if (item.type === 'skillbook') return 'Skill Book';
   return cap(item.type);
 }
 
@@ -869,12 +927,40 @@ function verdictNote(gc, player) {
   return bits.join(' ');
 }
 
+// Skill book body: "Attack · Requires Bow", what the skill does, and what reading it would do right now (§17.11).
+function skillBookTooltipLines(item, player) {
+  const info = skillBookHooks ? skillBookHooks.info(item.skillId, player || null) : null;
+  if (!info) return ['<div class="tt-primary">An unreadable book.</div>'];
+  const lines = [];
+  const req = info.requires ? `Requires ${info.requires}` : 'Any weapon';
+  lines.push(`<div class="tt-primary">${escapeHtml(`${info.icon} ${info.name} — ${info.categoryLabel} · ${req}`)}</div>`);
+  if (info.description) lines.push(`<div class="tt-stat">${escapeHtml(info.description)}</div>`);
+  if (info.unique) lines.push('<div class="tt-stat" style="color:#ff9f43;">Boss-unique skill</div>');
+  let use;
+  if (!player) use = ['#9aa3bd', 'Read to learn this skill.'];
+  else if (info.rank <= 0) use = ['#51cf66', 'Read: learn this skill (rank 1) and gain 1 free skill point.'];
+  else if (info.rank < info.maxRank) use = ['#51cf66', `Known at rank ${info.rank}. Read: rank ${info.rank + 1}.`];
+  else use = ['#9aa3bd', `Mastered (rank ${info.maxRank}). Reading it does nothing — sell it.`];
+  lines.push(`<div class="tt-verdict" style="color:${use[0]};">${escapeHtml(use[1])}</div>`);
+  if (info.requires && player && info.category === 'attack') {
+    lines.push(`<div class="tt-verdict-note" style="color:#9aa3bd;">Usable in slot 1 while a ${escapeHtml(info.requires.toLowerCase())} is equipped; can be learned with any weapon.</div>`);
+  }
+  return lines;
+}
+
 export function itemTooltip(item, player) {
   const rc = RARITY[item.rarity]?.color || '#ffffff';
   const parts = [];
   parts.push('<div class="tt-item">');
   parts.push(`<div class="tt-name" style="color:${rc};font-weight:bold;">${escapeHtml(item.name)}</div>`);
   parts.push(`<div class="tt-rarity" style="color:${rc};">${escapeHtml(RARITY[item.rarity]?.name || item.rarity)} ${escapeHtml(typeLabel(item))}</div>`);
+
+  if (item.type === 'skillbook') {
+    parts.push(...skillBookTooltipLines(item, player));
+    parts.push(`<div class="tt-value">Value: ${item.value}g</div>`);
+    parts.push('</div>');
+    return parts.join('');
+  }
 
   const primary = primaryStatLine(item);
   if (primary) parts.push(`<div class="tt-primary">${escapeHtml(primary)}</div>`);

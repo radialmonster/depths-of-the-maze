@@ -468,6 +468,129 @@ class Sfx {
     } catch (e) { /* ignore */ }
   }
 
+  // ---- Unlockable skills (§17.11) ----
+  // Volley: Bow Shot's twang, layered a hair apart so it reads as several strings.
+  volley() {
+    if (!this._gate('volley', 60, 0.25)) return;
+    try {
+      const t0 = this.ctx.currentTime;
+      for (let k = 0; k < 3; k++) {
+        const f = this._pitch(230, 0.1);
+        this._tone('triangle', t0 + k * 0.025, f * 1.6, f, 0.09, 0.14, { attack: 0.002, release: 0.08 });
+      }
+      this._noise(t0 + 0.01, 0.2, 'bandpass', this._pitch(4000, 0.15), 2200, 0.1, { q: 1.0, attack: 0.01, release: 0.12 });
+    } catch (e) { /* ignore */ }
+  }
+
+  // Fireball cast: a low whooshing roar rising in pitch.
+  fireball() {
+    if (!this._gate('fireball', 60, 0.35)) return;
+    try {
+      const t0 = this.ctx.currentTime;
+      this._noise(t0, 0.3, 'bandpass', 300, 1400, 0.22, { q: 0.7, attack: 0.03, release: 0.2 });
+      this._tone('sawtooth', t0, this._pitch(110, 0.08), 220, 0.22, 0.07, { release: 0.15, lowpass: 900 });
+    } catch (e) { /* ignore */ }
+  }
+
+  // Fireball burst: a dull boom + crackling noise tail.
+  explosion() {
+    if (!this._gate('explosion', 60, 0.6)) return;
+    try {
+      const t0 = this.ctx.currentTime;
+      this._tone('sine', t0, 120, 40, 0.3, 0.4, { attack: 0.003, release: 0.3 });
+      this._noise(t0, 0.45, 'lowpass', 2400, 300, 0.26, { release: 0.35, send: 0.25 });
+      for (let k = 0; k < 4; k++) {
+        this._noise(t0 + this._rand(0.05, 0.35), 0.02, 'highpass', 3000, undefined, 0.05, { attack: 0.001, release: 0.03 });
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  // Chain Lightning: a sharp electric crack with a buzzing square tail.
+  chainLightning() {
+    if (!this._gate('chainLightning', 60, 0.4)) return;
+    try {
+      const t0 = this.ctx.currentTime;
+      this._noise(t0, 0.06, 'highpass', 3000, 6000, 0.25, { attack: 0.001, release: 0.05 });
+      this._tone('square', t0, this._pitch(90, 0.1), 60, 0.25, 0.06, { attack: 0.002, release: 0.2, lowpass: 2500 });
+      this._tone('sawtooth', t0 + 0.02, 1800, 600, 0.12, 0.04, { release: 0.1, send: 0.2 });
+    } catch (e) { /* ignore */ }
+  }
+
+  // Glob Burst: a wet splat and bubbling pops (the Slime King's spray, player-sized).
+  globBurst() {
+    if (!this._gate('globBurst', 60, 0.45)) return;
+    try {
+      const t0 = this.ctx.currentTime;
+      this._noise(t0, 0.18, 'lowpass', 1600, 300, 0.2, { attack: 0.005, release: 0.14 });
+      for (let k = 0; k < 4; k++) {
+        const f = this._rand(250, 520);
+        this._tone('sine', t0 + 0.04 + k * 0.05, f, f * 1.8, 0.05, 0.08, { attack: 0.003, release: 0.05 });
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  // Bone Charge: a heavy stomping rush with a bony clatter.
+  boneCharge() {
+    if (!this._gate('boneCharge', 60, 0.35)) return;
+    try {
+      const t0 = this.ctx.currentTime;
+      this._noise(t0, 0.25, 'bandpass', 300, 1800, 0.24, { q: 0.8, attack: 0.02, release: 0.14 });
+      this._tone('sine', t0, 70, 40, 0.18, 0.28, { attack: 0.005, release: 0.15 });
+      for (let k = 0; k < 3; k++) {
+        this._noise(t0 + 0.05 + k * 0.05, 0.02, 'bandpass', this._rand(1400, 2600), undefined, 0.08, { q: 3, release: 0.03 });
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  // Blink: a quick reversed-sounding shimmer blip.
+  blink() {
+    if (!this._gate('blink', 40, 0.2)) return;
+    try {
+      const t0 = this.ctx.currentTime;
+      const f = this._pitch(700, 0.08);
+      this._tone('sine', t0, f * 2.5, f, 0.1, 0.07, { attack: 0.002, release: 0.08, detune: 10, send: 0.3 });
+      this._tone('sine', t0 + 0.02, f * 3.2, f * 1.4, 0.1, 0.04, { attack: 0.002, release: 0.08, detune: -10, send: 0.3 });
+    } catch (e) { /* ignore */ }
+  }
+
+  // Hidden passage found: a stone grind followed by a bright rising chime.
+  secretFound() {
+    if (!this._gate('secretFound', 300, 1.0)) return;
+    try {
+      const t0 = this.ctx.currentTime;
+      this._noise(t0, 0.35, 'lowpass', 500, 200, 0.18, { attack: 0.02, release: 0.2 });
+      [659.25, 830.61, 987.77, 1318.5].forEach((f, i) => {
+        this._tone('triangle', t0 + 0.25 + i * 0.08, f, undefined, 0.1, 0.07, { attack: 0.005, release: 0.4, send: 0.35 });
+      });
+    } catch (e) { /* ignore */ }
+  }
+
+  // Chest opening: a wooden creak + a clink of treasure.
+  chestOpen() {
+    if (!this._gate('chestOpen', 300, 0.8)) return;
+    try {
+      const t0 = this.ctx.currentTime;
+      this._tone('sawtooth', t0, 180, 260, 0.25, 0.05, { attack: 0.03, release: 0.1, filter: { type: 'bandpass', freq: 900, q: 4 } });
+      this._noise(t0 + 0.25, 0.05, 'lowpass', 900, 300, 0.12, { release: 0.05 });
+      for (let k = 0; k < 3; k++) {
+        const f = this._rand(1800, 2600);
+        this._tone('sine', t0 + 0.32 + k * 0.06, f, undefined, 0.02, 0.05, { attack: 0.002, release: 0.2, send: 0.25 });
+      }
+    } catch (e) { /* ignore */ }
+  }
+
+  // A skill book read: a short magical fanfare (smaller than level up).
+  skillLearned() {
+    if (!this._gate('skillLearned', 200, 0.9)) return;
+    try {
+      const t0 = this.ctx.currentTime;
+      [587.33, 880, 1174.66].forEach((f, i) => {
+        this._tone('sine', t0 + i * 0.09, f, undefined, 0.18, 0.1, { attack: 0.01, release: 0.4, detune: 6, send: 0.35 });
+      });
+      this._noise(t0 + 0.15, 0.4, 'highpass', 6000, 9000, 0.035, { attack: 0.15, release: 0.4, send: 0.3 });
+    } catch (e) { /* ignore */ }
+  }
+
   // Thud + a short filtered "grunt" + scrape.
   playerHurt() {
     if (!this._gate('playerHurt', 40, 0.18)) return;
@@ -740,6 +863,12 @@ export function wireAudio(game) {
       case 'arcaneBolt': sfx.bolt(); break;
       case 'frostNova': sfx.nova(); break;
       case 'shadowDash': sfx.dash(); break;
+      case 'volley': sfx.volley(); break;
+      case 'fireball': sfx.fireball(); break;
+      case 'chainLightning': sfx.chainLightning(); break;
+      case 'globBurst': sfx.globBurst(); break;
+      case 'boneCharge': sfx.boneCharge(); break;
+      case 'blink': sfx.blink(); break;
       default: break;
     }
   });
@@ -770,4 +899,8 @@ export function wireAudio(game) {
   bus.on('levelUp', () => { sfx.levelUp(); duck('levelUp'); });
   bus.on('playerDied', () => { sfx.playerDeath(); duck('playerDeath'); });
   bus.on('denied', () => sfx.denied());
+  // Skill unlocking (§17.11).
+  bus.on('secretFound', () => sfx.secretFound());
+  bus.on('chestOpened', () => sfx.chestOpen());
+  bus.on('skillLearned', () => sfx.skillLearned());
 }
