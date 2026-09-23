@@ -72,11 +72,25 @@ test('default slots resolve to Cleave / Arcane Bolt / Frost Nova / Shadow Dash',
   assert.deepEqual([0, 1, 2, 3].map((i) => activeSkill(p, i).id), ['cleave', 'arcaneBolt', 'frostNova', 'shadowDash']);
 });
 test('slot 1 resolves for every existing weapon kind and unarmed', () => {
-  for (const kind of [null, 'sword', 'axe', 'mace', 'dagger', 'bow', 'staff', 'someFutureKind']) {
+  const expected = { sword: 'cleave', axe: 'cleave', mace: 'cleave', dagger: 'cleave', bow: 'bowShot', staff: 'cleave', someFutureKind: 'cleave' };
+  for (const kind of [null, ...Object.keys(expected)]) {
     const p = freshPlayer(kind);
     assert.ok(WEAPON_CLASSES.includes(weaponClass(p)), `class for ${kind}`);
-    assert.equal(activeSkill(p, 0).id, 'cleave', `slot 1 with ${kind}`);
+    assert.equal(activeSkill(p, 0).id, kind ? expected[kind] : 'cleave', `slot 1 with ${kind}`);
   }
+});
+test('bow is its own class with Bow Shot as its always-known default', () => {
+  assert.equal(CLASS_DEFAULT_ATTACK.bow, 'bowShot');
+  const p = freshPlayer('bow');
+  assert.equal(weaponClass(p), 'bow');
+  assert.equal(skillRank(p, 'bowShot'), 1);
+  const bare = createPlayer(); bare.skillState = undefined;
+  bare.equipment.weapon = { id: 1, type: 'weapon', slot: 'weapon', weaponKind: 'bow', stats: { damageMin: 2, damageMax: 4 } };
+  assert.equal(activeSkill(bare, 0).id, 'bowShot', 'no skillState at all still resolves');
+});
+test('unlisted weapon kinds (staff, for now) fall back to melee1h / Cleave', () => {
+  assert.equal(weaponClass(freshPlayer('staff')), 'melee1h');
+  assert.equal(weaponClass(freshPlayer('someFutureKind')), 'melee1h');
 });
 test('every slot resolves even with a bare/empty skillState (defaults implicitly known)', () => {
   const p = createPlayer();
@@ -188,7 +202,7 @@ test('normalizeSkillState drops unknown ids, clamps ranks, re-seeds defaults', (
   assert.equal(s.known.shadowDash, 1);
   assert.ok(!('removedSkill' in s.known));
   assert.equal(s.loadout.attack.melee1h, 'cleave');
-  assert.ok(!('bow' in s.loadout.attack), 'wrong-category attack assignment dropped');
+  assert.equal(s.loadout.attack.bow, 'bowShot', 'wrong-category attack assignment dropped (class default kept)');
   assert.equal(s.loadout.spell, 'arcaneBolt');
   assert.equal(s.loadout.special, 'frostNova');
   assert.equal(s.loadout.movement, 'shadowDash');
@@ -257,9 +271,9 @@ test('learnSkill: new skill -> rank 1 + 1 free skill point; duplicate -> +1 rank
 test('knownSkills lists only known skills of that category', () => {
   withTempDefs({ tAlt: fakeAttack('tAlt', ['bow']) }, () => {
     const p = freshPlayer();
-    assert.deepEqual(knownSkills(p, 'attack').map((d) => d.id), ['cleave']);
+    assert.deepEqual(knownSkills(p, 'attack').map((d) => d.id), ['cleave', 'bowShot']);
     p.skillState.known.tAlt = 1;
-    assert.deepEqual(knownSkills(p, 'attack').map((d) => d.id), ['cleave', 'tAlt']);
+    assert.deepEqual(knownSkills(p, 'attack').map((d) => d.id), ['cleave', 'bowShot', 'tAlt']);
     assert.deepEqual(knownSkills(p, 'movement').map((d) => d.id), ['shadowDash']);
   });
 });

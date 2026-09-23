@@ -313,8 +313,10 @@ class Sfx {
   }
 
   // Layered impact: transient click + body thud + mid crunch, flavoured by element.
-  hit(crit, element) {
+  // `dull` = point-blank weapon shot (§17.12): a quieter, muffled thud with no bright layers.
+  hit(crit, element, dull = false) {
     if (this.music) this.music.notifyCombat();
+    if (dull) { this._dullHit(); return; }
     if (!this._gate(crit ? 'crit' : 'hit', 40, 0.2)) return;
     try {
       const t0 = this.ctx.currentTime;
@@ -342,6 +344,28 @@ class Sfx {
         this._tone('sine', t0, f * 2.76, undefined, 0.02, 0.035, { attack: 0.002, release: 0.18 });
         this._tone('square', t0 + 0.01, 900, 1800, 0.05, 0.03, { attack: 0.003, release: 0.05, lowpass: 3000 });
       }
+    } catch (e) { /* ignore */ }
+  }
+
+  _dullHit() {
+    if (!this._gate('hitDull', 40, 0.12)) return;
+    try {
+      const t0 = this.ctx.currentTime;
+      const base = this._pitch(110, 0.1);
+      this._tone('sine', t0, base, base * 0.5, 0.06, 0.2, { attack: 0.003, release: 0.05 });
+      this._noise(t0, 0.04, 'lowpass', this._pitch(700, 0.15), 300, 0.08, { release: 0.03 });
+    } catch (e) { /* ignore */ }
+  }
+
+  // Bow Shot release: a plucked-string twang (quick downward pitch) + a short airy arrow hiss.
+  bowShot() {
+    if (!this._gate('bowShot', 40, 0.18)) return;
+    try {
+      const t0 = this.ctx.currentTime;
+      const f = this._pitch(220, 0.08);
+      this._tone('triangle', t0, f * 1.6, f, 0.09, 0.2, { attack: 0.002, release: 0.08 });
+      this._tone('sawtooth', t0, f * 3.2, f * 2, 0.05, 0.035, { attack: 0.002, release: 0.05, lowpass: 2200 });
+      this._noise(t0 + 0.01, 0.14, 'bandpass', this._pitch(4200, 0.15), 2400, 0.09, { q: 1.1, attack: 0.01, release: 0.1 });
     } catch (e) { /* ignore */ }
   }
 
@@ -682,6 +706,7 @@ export function wireAudio(game) {
   bus.on('skillUsed', ({ skill }) => {
     switch (skill && skill.id) {
       case 'cleave': sfx.swing(); break;
+      case 'bowShot': sfx.bowShot(); break;
       case 'arcaneBolt': sfx.bolt(); break;
       case 'frostNova': sfx.nova(); break;
       case 'shadowDash': sfx.dash(); break;

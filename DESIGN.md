@@ -81,7 +81,7 @@ game = {
   damagePlayer(amount, source),// raw incoming damage; main applies player defense via character.mitigate() and invuln
   spawnProjectile(p),          // see §6.1
   effect(type, x, y, opts),    // forwards to renderer.spawnEffect
-  floatText(x, y, text, color),// forwards to renderer.floatText
+  floatText(x, y, text, color, opts), // forwards to renderer.floatText; opts.size (px) optional
   log(text, color),            // forwards to ui.log
   dropLoot(x, y, list),        // push items/gold to groundItems near (x,y)
   hasLineOfSight(x0,y0,x1,y1), // uses map
@@ -99,7 +99,8 @@ game = {
 ```
 main.js moves projectiles, stops them at walls, and calls damageEnemy / damagePlayer on hit. Damage and crit are rolled
 when the projectile is fired (so the crit feel happens at release); `applyDefense` and the point-blank check are
-resolved at hit time (see §17.12).
+resolved at hit time (see §17.12). The point-blank distance is measured from `ox,oy` to the **target's tile**, not the
+projectile's current position (with 0.25-tile substeps an arrow enters a tile 2 away at exactly 1.5 tiles).
 
 ## 7. Map (map.js)
 ```js
@@ -152,7 +153,8 @@ player = {
            spellPower, defense, critChance, critMult,
            moveCooldown /*s per tile, ~0.14*/, hpRegen, manaRegen /*per s*/, dodgeChance,
            cooldownReduction /*0..0.4, clamps effectiveCooldown() — see §17.10*/,
-           autoAimAssist /*0..0.20, dex-driven aim nudge for any skill with aimed:true, see §17.5*/ },
+           autoAimAssist /*0..0.20, dex-driven aim nudge for any skill with aimed:true, see §17.5*/,
+           pierce /*extra enemies each Bow Shot arrow passes through — bow-only Piercing affix, §17.9*/ },
   equipment: { weapon:null, offhand:null, helm:null, armor:null, boots:null, ring:null, amulet:null },
   inventory: [],               // max 24 item objects (INVENTORY_SIZE exported)
   skillState: {
@@ -207,6 +209,7 @@ export function knownSkills(player, category) -> skillDef[]  // known skills of 
 export function skillEligible(player, def, category, cls) -> bool  // the eligibility rule activeSkill and the Skills tab share
 export function skillDescription(skillId, rank, player) -> string  // for tooltips / Skills tab
 export function effectiveCooldown(skillDef, rank, player) -> number  // base * 0.95^(rank-1) * (1 - clamp(cooldownReduction,0,0.4))
+export function boltDamageRange(player) -> {min,max}   // Arcane Bolt's pre-rank damage from spellPower (x0.8 / x1.2), §17.9
 ```
 `useSkill`/the HUD/the bump-attack in main.js only ever go through `activeSkill()` — none of them know which concrete
 skill id is in a slot.
@@ -255,7 +258,11 @@ Enemies attack adjacent (orthogonal) player via `game.damagePlayer(amount, enemy
 export const INVENTORY_SIZE = 24
 export function generateItem(depth, rng, opts={}) -> item   // opts {slot, rarity, type}
 export function rollLoot(enemy, depth, rng) -> [item|{type:'gold',amount}]
-export function equipItem(player, item) -> bool   // from inventory; swaps with equipped; handles 2H off-hand eviction (§17.9); recalcStats
+export function equipItem(player, item, log?) -> bool // from inventory; swaps with equipped; handles 2H off-hand eviction (§17.9); recalcStats.
+                                                  //   optional log(text,color) gets the 2H refusal / eviction messages
+export function equipCheck(player, item) -> {ok, reason?, evicts?}  // the 2H equip rules without side effects
+export function enforceTwoHanded(player) -> item|null  // legacy saves (bow + off-hand): off-hand -> bag; returned if the bag is full
+export const WEAPON_KIND_INFO; weaponKindInfo(kind); weaponInfo(item); weaponClassOf(item); isTwoHanded(item)  // §17.9
 export function unequipItem(player, slot) -> bool
 export function useItem(game, item) -> bool       // potions: heal/mana; skillbook: learnSkill(); consumed
 export function dropItem(game, item)              // from inventory to ground at player
@@ -264,7 +271,7 @@ export function itemTooltip(item, player) -> HTML string (with compare vs equipp
 export function startingGear() -> {equipment, inventory}
 item = { id, name, type:'weapon'|'offhand'|'helm'|'armor'|'boots'|'ring'|'amulet'|'potion'|'skillbook',
          slot, rarity, icon /*emoji*/,
-         itemLevel, stats:{ str, dex, int, vit, def, armor, damageMin, damageMax, spellPower, maxHp, maxMana, critChance, hpRegen, manaRegen, moveSpeed },
+         itemLevel, stats:{ str, dex, int, vit, def, armor, damageMin, damageMax, spellPower, maxHp, maxMana, critChance, hpRegen, manaRegen, moveSpeed, pierce },
          potion:{ heal, mana } (potions only), stack (potions), value,
          weaponKind:'sword'|'axe'|'mace'|'dagger'|'staff'|'bow'|'wand',  // ('spear' reserved for later, not itemized yet — §17.9
          skillId (skillbook only) }             // which skill this book teaches; unique-boss books are legendary-coloured
@@ -530,13 +537,16 @@ Decisions made with the user while building. Keep this section current — when 
 
 ### 17.8 Item compare & quick-equip (Bag)
 - `compareGear(item, player)` (items.js) simulates wearing the item via `recalcStats` on a copy of the player and diffs the
-  stats you actually play with (melee avg, spell power, defense, max HP/mana, crit, dodge, move speed, regen) — not raw
+  stats you actually play with (melee avg, ranged avg, arrow pierce, spell power, defense, max HP/mana, crit, dodge, move speed, regen) — not raw
   affixes. Each stat's change is relative to its current value (with a floor so tiny bases don't explode).
 - Verdict: **▲ Upgrade** (all gains, or mixed with net > +3%), **▼ Downgrade** (mirror), **↕ Trade-off** (mixed, within ±3%).
-  Mixed-but-clear verdicts say "(with trade-offs)" in the tooltip.
+  Mixed-but-clear verdicts say "(with trade-offs)" in the tooltip. Two more (§17.9): **⇄** (a weapon of a different
+  class — never ranked up/down) and `blocked` (an off-hand while a two-handed weapon is held: no badge, a 🔒 verdict
+  line). A damage row that is `null` on either side (melee with a bow, ranged with a sword) is "not applicable" and
+  skipped, never compared as a real 0.
 - Shown as a corner badge on Bag cells and on shop **Buy** cells (not Sell), a verdict line in the item tooltip, and a
   live `now → after` preview (green/red) in the Bag's Gear Stats list for the hovered / gamepad-focused item.
-- Bag's Gear Stats list = the Character screen's Derived list: all 11 stats, same order, both built from `DERIVED`
+- Bag's Gear Stats list = the Character screen's Derived list: all 12 stats, same order, both built from `DERIVED`
   (ui.js) — the only stat key list, so the two can't drift. No curated subset.
 - **Quick-equip**: R / gamepad Y in the Bag, or the "▲ Equip upgrades" button, equips the single best ▲ item per slot.
   Click / A still equips one item.
@@ -599,6 +609,22 @@ must be ≥1.1× a same-level wand+orb combo, or wand+orb strictly dominates and
 - **Quick-equip** (R/Y) only ever considers weapons of the currently-equipped weapon's *class* (sword→axe fine,
   sword→bow never auto-swaps), and skips the off-hand step entirely while a 2H weapon is equipped — this also avoids
   the weapon-then-offhand quick-equip steps undoing each other.
+
+**Implementation notes (Phase 4 — bow):**
+- `WEAPON_KIND_INFO` has real entries only for sword/axe/mace/dagger (`melee1h`) and bow. Any kind not in the table —
+  today only **staff** — and unarmed use `FALLBACK_WEAPON_INFO` (1H, melee, str, `melee1h`, Cleave), i.e. staff keeps
+  behaving exactly as before until Phase 5 adds its entry. skills.js derives `WEAPON_CLASSES` and
+  `CLASS_DEFAULT_ATTACK` from this table + fallback (the old `KIND_CLASS` shim is gone), and the registry validator
+  checks each entry's `defaultAttack` matches its class default.
+- Bow keeps its existing base `spellPower` stat (now ×1.5 like its other base stats) — a small hybrid bonus to
+  Arcane Bolt/Frost Nova; drop it if bows should be purely dex.
+- A point-blank hit (§17.12) never crits: it uses the bottom of the roll, so the release crit is dropped for that hit.
+- **Piercing** (bow-only prefix, `kinds:['bow']` on the affix): +1 `pierce` stat → `player.stats.pierce` → added to
+  each Bow Shot arrow's existing projectile `pierce` field. Not shown as a Derived row, but counted by `compareGear`.
+- The swap text names the class's *current* attack pick (`attackSkillForClass`), which skills.js registers into
+  items.js via `setAttackSkillResolver` (items.js can't import skills.js without an import cycle).
+- Saves from before bows were two-handed can hold bow + off-hand: Continue moves the off-hand to the bag
+  (`enforceTwoHanded`), or drops it at the player's feet if the bag is full.
 
 ### 17.10 Skill slots & the loadout system
 Slots keep a fixed category (attack/spell/special/movement, §9) but which concrete skill occupies each one is
@@ -680,6 +706,8 @@ No random enemy drops. Three sources, all via the `skillbook` item type (§11):
   one shared helper, `reduceByDefense()` in character.js (used by `computeDamage`, `mitigate`, and projectile hits);
   `projectileHitDamage(pr, hitX, hitY, def)` + `POINT_BLANK_RANGE` (1.5, inclusive, straight-line from `ox,oy`) resolve
   a projectile hit. A weapon shot with no `pointBlankDamage` just uses `damage` up close. main.js passes
-  `opts.pointBlank` to `damageEnemy`, but the duller sound / smaller grey number is not built yet (bow phase).
+  `opts.pointBlank` to `damageEnemy`: a point-blank hit shows a smaller (12px) grey number, plays `sfx.hit(..., dull)`
+  (a quiet muffled thud) and never crits. Phase 4 changed the distance check to use the target enemy's tile, not the
+  projectile position (see §6.1) — otherwise every 2-tile shot counted as point-blank.
   "Fully stuck" (§17.1) uses the 4-way `facing`, so in a diagonal wedge it only attacks when the push is at least as
   much toward the enemy's axis as toward the wall (push mostly into the wall = facing the wall = no attack).

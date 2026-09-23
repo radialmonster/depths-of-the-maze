@@ -29,6 +29,50 @@ export const SLOTS = [
 const ALL_EQUIP = ['weapon', 'offhand', 'helm', 'armor', 'boots', 'ring', 'amulet'];
 const WEAPON_KINDS = ['sword', 'axe', 'mace', 'dagger', 'staff', 'bow'];
 const OFFHAND_KINDS = ['shield', 'orb', 'tome'];
+
+// ---------------------------------------------------------------------------
+// Weapon kinds -> hands / role / class (DESIGN §17.9). The single source of truth: character.js's damage rows,
+// skills.js's slot-1 class (and the class list + default attacks it derives), the equip rules, compareGear and the
+// held-weapon model all read this — never a kind-by-kind check elsewhere.
+//   hands  1 | 2              2 = off-hand slot locked + two-handed itemization tier (TWO_HAND_*)
+//   role   'melee' | 'ranged' which damage row (meleeMin/Max or rangedMin/Max) the weapon's damage feeds
+//   cls    weapon class: what slot-1 attack eligibility and per-class loadout memory key off (§17.10)
+//   scale  attribute added to that damage row (x0.8, character.js WEAPON_ATTR_SCALE)
+//   defaultAttack  the class's always-known attack skill id (guaranteed-skill rule)
+// ---------------------------------------------------------------------------
+const MELEE_1H = Object.freeze({ hands: 1, cls: 'melee1h', role: 'melee', scale: 'str', defaultAttack: 'cleave' });
+export const WEAPON_KIND_INFO = Object.freeze({
+  sword: MELEE_1H,
+  axe: MELEE_1H,
+  mace: MELEE_1H,
+  dagger: MELEE_1H,
+  bow: Object.freeze({ hands: 2, cls: 'bow', role: 'ranged', scale: 'dex', defaultAttack: 'bowShot' }),
+});
+// Fallback for unarmed AND for any weapon kind without an entry above. Today that's only `staff`, which isn't
+// itemized as its own class yet — Phase 5 adds a real `staff` entry and this fallback simply stops applying to it.
+// An unlisted kind behaves exactly like a one-handed melee weapon: feeds meleeMin/Max (str), no off-hand
+// restriction, melee1h class (Cleave).
+export const FALLBACK_WEAPON_INFO = MELEE_1H;
+
+export function weaponKindInfo(kind) {
+  return (kind && Object.prototype.hasOwnProperty.call(WEAPON_KIND_INFO, kind)) ? WEAPON_KIND_INFO[kind] : FALLBACK_WEAPON_INFO;
+}
+// Info for an equipped/bag weapon item (null/undefined = unarmed -> fallback).
+export function weaponInfo(weaponItem) { return weaponKindInfo(weaponItem && weaponItem.weaponKind); }
+export function weaponClassOf(weaponItem) { return weaponInfo(weaponItem).cls; }
+export function isTwoHanded(weaponItem) { return !!weaponItem && weaponInfo(weaponItem).hands === 2; }
+
+// Two-handed itemization tier (§17.9), compensating for the locked off-hand. Applied per weapon kind at generation,
+// so value-derived prices (shop buy / Featured / sell / buyback) follow automatically.
+export const TWO_HAND_STAT_MULT = 1.5;
+export const TWO_HAND_EXTRA_AFFIXES = 1;
+export const TWO_HAND_VALUE_MULT = 1.4;
+
+// Stat multiplier / extra affix count for a weapon kind's tier (1H: none; 2H: TWO_HAND_*).
+export function weaponTier(weaponKind) {
+  const two = weaponKindInfo(weaponKind).hands === 2;
+  return { statMult: two ? TWO_HAND_STAT_MULT : 1, extraAffixes: two ? TWO_HAND_EXTRA_AFFIXES : 0 };
+}
 const TYPE_WEIGHTS = { weapon: 20, offhand: 12, helm: 12, armor: 16, boots: 12, ring: 14, amulet: 14 };
 
 const ICONS = {
@@ -42,7 +86,7 @@ const STAT_LABELS = {
   str: 'Strength', dex: 'Dexterity', int: 'Intellect', vit: 'Vitality', def: 'Defense',
   armor: 'Armor', damageMin: 'Min Damage', damageMax: 'Max Damage', spellPower: 'Spell Power',
   maxHp: 'Max HP', maxMana: 'Max Mana', critChance: 'Crit Chance', hpRegen: 'HP Regen',
-  manaRegen: 'Mana Regen', moveSpeed: 'Move Speed',
+  manaRegen: 'Mana Regen', moveSpeed: 'Move Speed', pierce: 'Arrow Pierce',
 };
 
 const PRIMARY_KEYS = new Set(['damageMin', 'damageMax', 'armor']);
@@ -92,10 +136,14 @@ const POTION_SIZES = {
 const TYPE_BASE_VALUE = { weapon: 10, offhand: 8, helm: 7, armor: 9, boots: 6, ring: 8, amulet: 8 };
 const RARITY_VALUE_MULT = { common: 1, magic: 1.8, rare: 3.2, epic: 6, legendary: 14 };
 
-// Affix pool. `types` lists which item.type values may roll this affix.
+// Affix pool. `types` lists which item.type values may roll this affix; an optional `kinds` further restricts a
+// weapon affix to those weaponKinds (Piercing is bow-only).
 const AFFIX_POOL = [
   { id: 'vicious', kind: 'prefix', word: 'Vicious', types: ['weapon'],
     roll: (lvl, rng) => ({ damageMin: 1 + lvl * 0.3, damageMax: 2 + lvl * 0.4 }) },
+  // Each arrow passes through +1 more enemy: Bow Shot adds stats.pierce to its projectile's existing `pierce` field.
+  { id: 'piercing', kind: 'prefix', word: 'Piercing', types: ['weapon'], kinds: ['bow'],
+    roll: () => ({ pierce: 1 }) },
   { id: 'sturdy', kind: 'prefix', word: 'Sturdy', types: ['offhand', 'helm', 'armor', 'boots'],
     roll: (lvl, rng) => ({ armor: 2 + lvl * 0.5 }) },
   { id: 'keen', kind: 'prefix', word: 'Keen', types: ['weapon', 'ring', 'amulet'],
@@ -212,9 +260,9 @@ function finalizeStats(stats) {
   }
 }
 
-function rollAffixes(rng, type, itemLevel, count, statsOut) {
+function rollAffixes(rng, type, itemLevel, count, statsOut, weaponKind = null) {
   if (count <= 0) return { prefixWords: [], suffixPhrases: [] };
-  let eligible = rng.shuffle(AFFIX_POOL.filter((a) => a.types.includes(type)));
+  let eligible = rng.shuffle(AFFIX_POOL.filter((a) => a.types.includes(type) && (!a.kinds || a.kinds.includes(weaponKind))));
   let chosen = eligible.slice(0, Math.min(count, eligible.length));
   if (count >= 2 && !chosen.some((a) => a.kind === 'prefix')) {
     const prefixOptions = eligible.filter((a) => a.kind === 'prefix' && !chosen.includes(a));
@@ -248,9 +296,10 @@ function buildName(rarity, baseName, affixResult, type, rng) {
   return name;
 }
 
-function computeValue(type, itemLevel, rarity) {
+export function computeValue(type, itemLevel, rarity, weaponKind = null) {
   const base = (TYPE_BASE_VALUE[type] || 8) + itemLevel * 4;
-  return Math.round(base * (RARITY_VALUE_MULT[rarity] || 1));
+  const hands = type === 'weapon' && weaponKindInfo(weaponKind).hands === 2 ? TWO_HAND_VALUE_MULT : 1;
+  return Math.round(base * (RARITY_VALUE_MULT[rarity] || 1) * hands);
 }
 
 function rollRarity(rng, depth, { elite = false, boss = false, minRarity = null } = {}) {
@@ -333,15 +382,17 @@ export function generateItem(depth, rng = new RNG(), opts = {}) {
     raw = SLOT_BASE_STATS[type](itemLevel, rng);
   }
 
-  const mult = RARITY[rarity].statMult;
+  // Two-handed weapons (§17.9): base stats x1.5 and +1 affix at every rarity (price x1.4 in computeValue).
+  const tier = type === 'weapon' ? weaponTier(weaponKind) : { statMult: 1, extraAffixes: 0 };
+  const mult = RARITY[rarity].statMult * tier.statMult;
   const stats = {};
   for (const [k, v] of Object.entries(raw)) stats[k] = v * mult;
 
-  const affixResult = rollAffixes(rng, type, itemLevel, RARITY[rarity].affixes, stats);
+  const affixResult = rollAffixes(rng, type, itemLevel, RARITY[rarity].affixes + tier.extraAffixes, stats, weaponKind || null);
   finalizeStats(stats);
 
   const name = buildName(rarity, baseName, affixResult, type, rng);
-  const value = computeValue(type, itemLevel, rarity);
+  const value = computeValue(type, itemLevel, rarity, weaponKind || null);
 
   const item = { id: uid(), name, baseName, type, slot, rarity, icon, itemLevel, stats, value };
   if (weaponKind) item.weaponKind = weaponKind;
@@ -398,18 +449,60 @@ export function rollLoot(enemy, depth, rng) {
   return drops;
 }
 
-export function equipItem(player, item) {
+// Two-handed equip rules (§17.9), without changing anything -> { ok, reason?, evicts? }.
+// `evicts` = the off-hand a 2H weapon would push into the bag; `reason` = the refusal message.
+export function equipCheck(player, item) {
+  if (!player || !player.equipment || !item || item.type === 'potion') return { ok: false };
+  if (!Object.prototype.hasOwnProperty.call(player.equipment, item.slot)) return { ok: false };
+  const weapon = player.equipment.weapon;
+  if (item.slot === 'offhand' && isTwoHanded(weapon)) {
+    return { ok: false, reason: `Can't equip: ${weapon.name} is two-handed` };
+  }
+  const off = player.equipment.offhand;
+  if (item.slot === 'weapon' && isTwoHanded(item) && off) {
+    // Bag after the swap: -1 (this item leaves it) +1 (the old weapon, if any) +1 (the evicted off-hand).
+    const inBag = (player.inventory || []).some((i) => i && i.id === item.id) ? 1 : 0;
+    const after = (player.inventory || []).length - inBag + (weapon ? 1 : 0) + 1;
+    if (after > INVENTORY_SIZE) return { ok: false, reason: `Bag full: no room for your ${off.name}` };
+    return { ok: true, evicts: off };
+  }
+  return { ok: true };
+}
+
+// `log(text, color)` (optional) receives the two-handed refusal / off-hand eviction messages.
+export function equipItem(player, item, log = null) {
   const idx = player.inventory.findIndex((i) => i.id === item.id);
   if (idx === -1) return false;
   if (item.type === 'potion') return false;
   const slot = item.slot;
   if (!Object.prototype.hasOwnProperty.call(player.equipment, slot)) return false;
+  const check = equipCheck(player, item);
+  if (!check.ok) {
+    if (check.reason && typeof log === 'function') log(check.reason, '#ff8787');
+    return false;
+  }
   const prev = player.equipment[slot] || null;
   player.inventory.splice(idx, 1);
   player.equipment[slot] = item;
   if (prev) player.inventory.splice(idx, 0, prev);
+  if (check.evicts) {
+    player.equipment.offhand = null;
+    player.inventory.push(check.evicts);
+    if (typeof log === 'function') log(`${check.evicts.name} unequipped (two-handed weapon)`, '#9aa3bd');
+  }
   recalcStats(player);
   return true;
+}
+
+// Saves from before bows were two-handed can hold a bow AND an off-hand. Moves the off-hand to the bag and returns
+// null, or returns it (already unequipped) when the bag is full so the caller can drop it on the ground.
+export function enforceTwoHanded(player) {
+  const off = player && player.equipment && player.equipment.offhand;
+  if (!off || !isTwoHanded(player.equipment.weapon)) return null;
+  player.equipment.offhand = null;
+  recalcStats(player);
+  if (player.inventory.length < INVENTORY_SIZE) { player.inventory.push(off); return null; }
+  return off;
 }
 
 export function unequipItem(player, slot) {
@@ -424,7 +517,7 @@ export function unequipItem(player, slot) {
 
 export function useItem(game, item) {
   const player = game.player;
-  if (item.type !== 'potion') return equipItem(player, item);
+  if (item.type !== 'potion') return equipItem(player, item, typeof game.log === 'function' ? (t, c) => game.log(t, c) : null);
 
   const idx = player.inventory.findIndex((i) => i.id === item.id);
   if (idx === -1) return false;
@@ -582,7 +675,7 @@ function formatStatValue(key, val) {
 }
 
 function typeLabel(item) {
-  if (item.type === 'weapon') return `Weapon (${cap(item.weaponKind)})`;
+  if (item.type === 'weapon') return `Weapon (${cap(item.weaponKind)}${isTwoHanded(item) ? ', Two-handed' : ''})`;
   if (item.type === 'offhand') return `Off-Hand (${cap(item.offhandKind)})`;
   if (item.type === 'potion') return 'Potion';
   return cap(item.type);
@@ -636,8 +729,12 @@ function compareLines(item, equipped) {
 
 // Derived stats that decide better/worse. `floor` keeps tiny bases (e.g. 0 regen) from turning a small gain
 // into a huge relative change. Crit/dodge are compared in absolute points against a 20% floor.
+// A metric whose `get` returns null is "not applicable" on that side (e.g. melee with a bow equipped) and is skipped,
+// never treated as a real 0.
 const CMP_METRICS = [
-  { k: 'melee', get: (s) => (s.meleeMin + s.meleeMax) / 2, floor: 6 },
+  { k: 'melee', get: (s) => (s.meleeMin == null ? null : (s.meleeMin + s.meleeMax) / 2), floor: 6 },
+  { k: 'ranged', get: (s) => (s.rangedMin == null ? null : (s.rangedMin + s.rangedMax) / 2), floor: 6 },
+  { k: 'pierce', get: (s) => s.pierce || 0, floor: 4 },
   { k: 'spellPower', get: (s) => s.spellPower, floor: 6 },
   { k: 'defense', get: (s) => s.defense, floor: 6 },
   { k: 'maxHp', get: (s) => s.maxHp, floor: 60 },
@@ -650,43 +747,73 @@ const CMP_METRICS = [
 ];
 const CMP_TIE = 0.03; // net relative change below this on a mixed item = no clear winner
 
-function simStats(player, slot, item) {
-  const sim = { ...player, equipment: { ...player.equipment, [slot]: item }, hp: player.hp, mana: player.mana };
+// Stats with some equipment slots replaced (`overrides` = { slot: item|null }), on a throwaway copy of the player.
+function simStats(player, overrides) {
+  const sim = { ...player, equipment: { ...player.equipment, ...overrides }, hp: player.hp, mana: player.mana };
   return recalcStats(sim);
 }
 
-// -> null for potions/unequippable, else { verdict:'up'|'down'|'mixed'|'same', tradeoff, score, before, after }
-// `before`/`after` are full player.stats objects (current gear vs. wearing `item`).
+// Which attack skill a weapon class would put in slot 1 — skills.js registers this (items.js can't import skills.js
+// without an import cycle). Used only for the "Switches your attack to {skill}" text.
+let attackSkillResolver = null;
+export function setAttackSkillResolver(fn) { attackSkillResolver = typeof fn === 'function' ? fn : null; }
+function attackSkillName(player, cls) {
+  const def = attackSkillResolver ? attackSkillResolver(player, cls) : null;
+  return (def && def.name) || 'a different attack';
+}
+
+// -> null for potions/unequippable, else
+//   { verdict:'up'|'down'|'mixed'|'same'|'swap'|'blocked', tradeoff, score, before, after, evicts, classSwap, toClass, blockedBy }
+// `before`/`after` are full player.stats objects (current gear vs. wearing `item`). Two-handed weapons are compared
+// as "weapon + empty off-hand" vs "current weapon + current off-hand" (`evicts` = the off-hand that would come off).
+// A weapon of a different class (§17.9: melee<->ranged<->caster) is never an up/downgrade: verdict 'swap' (⇄).
+// An off-hand while a two-handed weapon is held: verdict 'blocked' (it can't be equipped).
 export function compareGear(item, player) {
   if (!item || item.type === 'potion' || !player?.equipment) return null;
-  if (!Object.prototype.hasOwnProperty.call(player.equipment, item.slot)) return null;
-  const current = player.equipment[item.slot] || null;
+  const eq = player.equipment;
+  if (!Object.prototype.hasOwnProperty.call(eq, item.slot)) return null;
+  const current = eq[item.slot] || null;
   if (current && current.id === item.id) return null;
-  const before = simStats(player, item.slot, current);
-  const after = simStats(player, item.slot, item);
+  const before = simStats(player, {});
+  if (item.slot === 'offhand' && isTwoHanded(eq.weapon)) {
+    return { verdict: 'blocked', tradeoff: false, score: 0, before, after: before, evicts: null, classSwap: false, blockedBy: eq.weapon };
+  }
+  const overrides = { [item.slot]: item };
+  const evicts = item.slot === 'weapon' && isTwoHanded(item) ? (eq.offhand || null) : null;
+  if (evicts) overrides.offhand = null;
+  const after = simStats(player, overrides);
   let score = 0, gains = 0, losses = 0;
   for (const m of CMP_METRICS) {
     const a = m.get(before), b = m.get(after);
+    if (a == null || b == null) continue; // not applicable on one side (role change) — not a real 0
     const rel = (b - a) / Math.max(Math.abs(a), m.floor);
     if (Math.abs(rel) < 0.005) continue;
     score += rel;
     if (rel > 0) gains++; else losses++;
   }
+  const toClass = item.slot === 'weapon' ? weaponClassOf(item) : null;
+  const classSwap = item.slot === 'weapon' && toClass !== weaponClassOf(eq.weapon);
   let verdict;
-  if (!gains && !losses) verdict = 'same';
+  if (classSwap) verdict = 'swap';
+  else if (!gains && !losses) verdict = 'same';
   else if (!losses) verdict = 'up';
   else if (!gains) verdict = 'down';
   else verdict = score > CMP_TIE ? 'up' : score < -CMP_TIE ? 'down' : 'mixed';
-  return { verdict, tradeoff: gains > 0 && losses > 0, score, before, after };
+  return { verdict, tradeoff: gains > 0 && losses > 0, score, before, after, evicts, classSwap, toClass };
 }
 
 // Quick-equip: for each slot, wear the bag item that is the biggest upgrade. Returns the items equipped.
+// Weapons: only the equipped weapon's own class is considered (sword->axe yes, sword->bow never — a class swap is
+// never 'up' anyway). The off-hand step is skipped while a two-handed weapon is held (§17.9).
 export function equipUpgrades(player) {
   const equipped = [];
   for (const { id: slot } of SLOTS) {
+    if (slot === 'offhand' && isTwoHanded(player.equipment.weapon)) continue;
+    const cls = weaponClassOf(player.equipment.weapon);
     let best = null, bestScore = 0;
     for (const item of player.inventory) {
       if (!item || item.slot !== slot) continue;
+      if (slot === 'weapon' && weaponClassOf(item) !== cls) continue;
       const gc = compareGear(item, player);
       if (gc && gc.verdict === 'up' && gc.score > bestScore) { best = item; bestScore = gc.score; }
     }
@@ -700,7 +827,19 @@ const VERDICT_LINE = {
   down: ['#ff6b6b', '▼ Downgrade'],
   mixed: ['#fcc419', '↕ Trade-off'],
   same: ['#9aa3bd', '= No change'],
+  swap: ['#74c0fc', '⇄ Different weapon type'],
+  blocked: ['#ff8787', '🔒 Off-hand locked'],
 };
+
+// Extra explanation under the verdict: class swap / two-handed eviction / locked off-hand.
+function verdictNote(gc, player) {
+  if (!gc) return '';
+  if (gc.verdict === 'blocked') return `Can't equip: ${gc.blockedBy.name} is two-handed.`;
+  const bits = [];
+  if (gc.classSwap) bits.push(`Switches your attack to ${attackSkillName(player, gc.toClass)}.`);
+  if (gc.evicts) bits.push(`Two-handed: unequips ${gc.evicts.name}.`);
+  return bits.join(' ');
+}
 
 export function itemTooltip(item, player) {
   const rc = RARITY[item.rarity]?.color || '#ffffff';
@@ -727,14 +866,19 @@ export function itemTooltip(item, player) {
     const equipped = player.equipment[item.slot];
     const gc = compareGear(item, player);
     const verdict = gc ? VERDICT_LINE[gc.verdict] : null;
+    const note = verdictNote(gc, player);
+    const tradeoffNote = gc && gc.tradeoff && (gc.verdict === 'up' || gc.verdict === 'down');
     const verdictHtml = verdict
-      ? `<div class="tt-verdict" style="color:${verdict[0]};">${verdict[1]}${gc.tradeoff && gc.verdict !== 'mixed' ? ' <span class="tt-verdict-note">(with trade-offs)</span>' : ''}</div>`
+      ? `<div class="tt-verdict" style="color:${verdict[0]};">${verdict[1]}${tradeoffNote ? ' <span class="tt-verdict-note">(with trade-offs)</span>' : ''}</div>`
+        + (note ? `<div class="tt-verdict-note" style="color:${verdict[0]};">${escapeHtml(note)}</div>` : '')
       : '';
+    // The off-hand a two-handed weapon would take off: its stats are lost too, so list them as losses.
+    const lostOff = gc && gc.evicts ? compareLines({ stats: {} }, gc.evicts) : [];
     if (equipped && equipped.id !== item.id) {
       const cmp = compareLines(item, equipped);
-      parts.push(`<div class="tt-compare">${verdictHtml}${cmp.join('')}</div>`);
+      parts.push(`<div class="tt-compare">${verdictHtml}${cmp.join('')}${lostOff.join('')}</div>`);
     } else if (!equipped) {
-      parts.push(`<div class="tt-compare">${verdictHtml}<div class="tt-compare-empty" style="color:#888;">(Nothing equipped)</div></div>`);
+      parts.push(`<div class="tt-compare">${verdictHtml}<div class="tt-compare-empty" style="color:#888;">(Nothing equipped)</div>${lostOff.join('')}</div>`);
     }
   }
 

@@ -12,6 +12,7 @@
 
 import { computeDamage } from './character.js';
 import { applyResist, applySlow } from './enemies.js';
+import { WEAPON_KIND_INFO, FALLBACK_WEAPON_INFO, weaponClassOf, setAttackSkillResolver } from './items.js';
 
 // ---------------------------------------------------------------------------
 // Tuning constants
@@ -23,6 +24,19 @@ const MAX_COOLDOWN_REDUCTION = 0.4;   // cap on stats.cooldownReduction
 
 const CLEAVE_BASE_CD = 0.45;
 const CLEAVE_MANA = 0;
+
+// Bow Shot (DESIGN §9, §17.12): same cadence as Cleave; a weapon-role arrow (armor applies at impact, point-blank
+// penalty). Rank 3 adds a weak on-hit slow via the projectile's `slow` field -> applySlow (much weaker than Nova's 50%).
+const BOW_BASE_CD = CLEAVE_BASE_CD;
+const BOW_SPEED = 18;
+const BOW_RANGE = 9;
+const BOW_SLOW_PCT = 0.22;
+const BOW_SLOW_DUR = 0.6;
+
+// Arcane Bolt damage comes from spell power (it used to read stats.rangedMin/Max, which also added a little dex;
+// that row now belongs to ranged weapons — §17.9). Same spell-power factors as before.
+const BOLT_SP_MIN = 0.8;
+const BOLT_SP_MAX = 1.2;
 
 const BOLT_BASE_CD = 0.6;
 const BOLT_MANA = 6;
@@ -69,33 +83,29 @@ function perkTotal(def, rank, key) {
 // HUD slot index (0-3) -> category. Slot 1 (index 0) is the weapon-class-dependent attack.
 export const SLOT_CATEGORIES = ['attack', 'spell', 'special', 'movement'];
 
-// Weapon classes that exist right now. Every one of them must have a default attack in CLASS_DEFAULT_ATTACK
-// (validated at startup). Later phases add melee2h / bow / wand / staff along with their default attacks.
-export const WEAPON_CLASSES = ['melee1h'];
+// Weapon classes and their default attacks are derived from items.js WEAPON_KIND_INFO (the single weapon-kind table,
+// DESIGN §17.9) plus its unarmed/unlisted-kind fallback. Right now: melee1h (Cleave) and bow (Bow Shot); later phases
+// add melee2h / wand / staff by adding table entries. Every class must have a default attack skill in SKILL_DEFS
+// (validated at startup).
+const UNARMED_CLASS = FALLBACK_WEAPON_INFO.cls;
+export const WEAPON_CLASSES = [...new Set([UNARMED_CLASS, ...Object.values(WEAPON_KIND_INFO).map((i) => i.cls)])];
+export const CLASS_DEFAULT_ATTACK = { [UNARMED_CLASS]: FALLBACK_WEAPON_INFO.defaultAttack };
+for (const info of Object.values(WEAPON_KIND_INFO)) {
+  if (!(info.cls in CLASS_DEFAULT_ATTACK)) CLASS_DEFAULT_ATTACK[info.cls] = info.defaultAttack;
+}
 
 // Display names for weapon classes (Skills tab labels, "Requires {class}"). Lists every class in DESIGN §17.9 so a
 // class that lands later already reads correctly; only WEAPON_CLASSES decides which ones exist.
 export const WEAPON_CLASS_NAMES = { melee1h: 'Melee', melee2h: 'Two-handed', bow: 'Bow', wand: 'Wand', staff: 'Staff' };
 export function weaponClassName(cls) { return WEAPON_CLASS_NAMES[cls] || cls; }
 
-// Weapon kind -> class. Transitional stand-in for items.js WEAPON_KIND_INFO (DESIGN §17.9): today bows and staves
-// still behave as melee weapons (they Cleave and feed meleeMin/Max), so they map to melee1h until the phase that
-// gives them their own class + default attack. Unarmed / unknown kinds are melee1h too.
-const KIND_CLASS = {
-  sword: 'melee1h', axe: 'melee1h', mace: 'melee1h', dagger: 'melee1h',
-  bow: 'melee1h', staff: 'melee1h',
-};
-const UNARMED_CLASS = 'melee1h';
-
-// The guaranteed-skill rule (DESIGN §9 / §17.10): every weapon class and every slot 2-4 category has an
-// unconditional default, always known at rank >= 1.
-export const CLASS_DEFAULT_ATTACK = { melee1h: 'cleave' };
+// The guaranteed-skill rule (DESIGN §9 / §17.10): every weapon class (CLASS_DEFAULT_ATTACK, above) and every slot 2-4
+// category has an unconditional default, always known at rank >= 1.
 export const CATEGORY_DEFAULT = { spell: 'arcaneBolt', special: 'frostNova', movement: 'shadowDash' };
 
+// Equipped weapon's class via WEAPON_KIND_INFO; unarmed and kinds not in the table (staff, for now) -> melee1h.
 export function weaponClass(player) {
-  const w = player && player.equipment && player.equipment.weapon;
-  if (!w) return UNARMED_CLASS;
-  return KIND_CLASS[w.weaponKind] || UNARMED_CLASS;
+  return weaponClassOf(player && player.equipment && player.equipment.weapon);
 }
 
 function defaultSkillIds() {
@@ -116,10 +126,31 @@ export const SKILL_DEFS = {
     describe(rank, player) {
       const stats = (player && player.stats) || {};
       const mult = rankMult(rank);
-      const lo = Math.max(1, Math.round((stats.meleeMin ?? 1) * mult));
-      const hi = Math.max(lo + 1, Math.round((stats.meleeMax ?? 3) * mult));
       const kb = perkTotal(this, rank, 'knockbackAlways') ? ' Knockback on hit.' : ' Knockback on crit.';
+      // meleeMin is null while a non-melee weapon (bow) is equipped — the numbers would be meaningless.
+      if (stats.meleeMin == null) return `Deals melee weapon damage to 3 tiles in front.${kb}`;
+      const lo = Math.max(1, Math.round(stats.meleeMin * mult));
+      const hi = Math.max(lo + 1, Math.round(stats.meleeMax * mult));
       return `Deals ${lo}-${hi} damage to 3 tiles in front.${kb}`;
+    },
+  },
+  bowShot: {
+    id: 'bowShot', name: 'Bow Shot', icon: '🏹',
+    description: 'Looses an arrow in the direction you face. Armor reduces it; point-blank shots hit weakly.',
+    category: 'attack', classes: ['bow'], aimed: true, range: BOW_RANGE, element: 'physical',
+    baseCooldown: BOW_BASE_CD, manaCost: 0,
+    rankPerks: { 3: { slowPct: BOW_SLOW_PCT, slowDur: BOW_SLOW_DUR, text: `Arrows slow enemies by ${Math.round(BOW_SLOW_PCT * 100)}% for ${BOW_SLOW_DUR}s.` } },
+    cast: castBowShot,
+    describe(rank, player) {
+      const stats = (player && player.stats) || {};
+      const slowPct = perkTotal(this, rank, 'slowPct');
+      const slow = slowPct > 0 ? ` Slows by ${Math.round(slowPct * 100)}% for ${perkTotal(this, rank, 'slowDur')}s.` : '';
+      const pierce = stats.pierce > 0 ? ` Pierces ${stats.pierce} ${stats.pierce > 1 ? 'enemies' : 'enemy'}.` : '';
+      if (stats.rangedMin == null) return `Fires an arrow for bow damage (reduced by armor).${pierce}${slow}`;
+      const mult = rankMult(rank);
+      const lo = Math.max(1, Math.round(stats.rangedMin * mult));
+      const hi = Math.max(lo + 1, Math.round(stats.rangedMax * mult));
+      return `Fires an arrow dealing ${lo}-${hi} damage, reduced by armor; only ${lo} point-blank.${pierce}${slow}`;
     },
   },
   arcaneBolt: {
@@ -133,10 +164,10 @@ export const SKILL_DEFS = {
     },
     cast: castArcaneBolt,
     describe(rank, player) {
-      const stats = (player && player.stats) || {};
+      const { min, max } = boltDamageRange(player);
       const mult = rankMult(rank);
-      const lo = Math.max(1, Math.round((stats.rangedMin ?? 1) * mult));
-      const hi = Math.max(lo + 1, Math.round((stats.rangedMax ?? 3) * mult));
+      const lo = Math.max(1, Math.round(min * mult));
+      const hi = Math.max(lo + 1, Math.round(max * mult));
       const pierce = perkTotal(this, rank, 'pierce');
       const pierceStr = pierce > 0 ? ` Pierces ${pierce} ${pierce > 1 ? 'enemies' : 'enemy'}.` : '';
       return `Fires a bolt dealing ${lo}-${hi} damage.${pierceStr} Costs ${this.manaCost} mana.`;
@@ -197,8 +228,12 @@ export function validateSkillRegistry() {
       errors.push(`weapon class "${cls}" default "${id}" is not an attack skill usable by that class`);
     }
   }
-  for (const kind in KIND_CLASS) {
-    if (!WEAPON_CLASSES.includes(KIND_CLASS[kind])) errors.push(`weapon kind "${kind}" maps to unknown class "${KIND_CLASS[kind]}"`);
+  for (const kind in WEAPON_KIND_INFO) {
+    const info = WEAPON_KIND_INFO[kind];
+    if (!WEAPON_CLASSES.includes(info.cls)) errors.push(`weapon kind "${kind}" maps to unknown class "${info.cls}"`);
+    else if (CLASS_DEFAULT_ATTACK[info.cls] !== info.defaultAttack) {
+      errors.push(`weapon kind "${kind}" default attack "${info.defaultAttack}" disagrees with its class "${info.cls}" ("${CLASS_DEFAULT_ATTACK[info.cls]}")`);
+    }
   }
   if (!WEAPON_CLASSES.includes(UNARMED_CLASS)) errors.push(`unarmed class "${UNARMED_CLASS}" is not a weapon class`);
   for (const cat of SLOT_CATEGORIES) {
@@ -220,6 +255,9 @@ export function validateSkillRegistry() {
     console.error(`[skills] SKILL REGISTRY INVALID — guaranteed-skill rule violated (DESIGN §17.10):\n  ${errors.join('\n  ')}`);
   }
 }
+
+// items.js compareGear's "Switches your attack to {skill}" text (items.js can't import this module: cycle).
+setAttackSkillResolver((player, cls) => attackSkillForClass(player, cls));
 
 // ---------------------------------------------------------------------------
 // Skill state (known ranks + loadout)
@@ -473,11 +511,62 @@ function castCleave(game, player, skill, rank) {
   return true; // consumes cooldown/mana even on a whiff, matching a real "swing"
 }
 
+// Arcane Bolt's damage range (before rank multiplier) from spell power — its own numbers, independent of the
+// weapon-driven rangedMin/Max row.
+export function boltDamageRange(player) {
+  const sp = (player && player.stats && player.stats.spellPower) || 0;
+  const min = Math.max(1, Math.round(sp * BOLT_SP_MIN));
+  return { min, max: Math.max(min + 1, Math.round(sp * BOLT_SP_MAX)) };
+}
+
+// Bow Shot: an arrow along the 4-way facing (DESIGN §17.1), nudged by aim assist (aimed:true). Damage and crit are
+// rolled at release; defense and the point-blank check happen at impact in main.js (projectileHitDamage, §17.12).
+// pointBlankDamage = the bottom of the roll (rangedMin x rank), never more than the rolled damage.
+function castBowShot(game, player, skill, rank) {
+  const s = player.stats;
+  if (s.rangedMin == null) return false; // no ranged weapon (can't normally happen: bowShot is bow-class only)
+  const rng = game.rng;
+  const mult = rankMult(rank);
+  const lo = s.rangedMin * mult, hi = s.rangedMax * mult;
+  const crit = rng.chance(s.critChance);
+  let amount = rng.range(lo, hi) * (1 + rng.range(-0.15, 0.15));
+  if (crit) amount *= s.critMult;
+  amount = Math.max(1, Math.round(amount));
+  const pointBlankDamage = Math.min(amount, Math.max(1, Math.round(lo)));
+
+  const facing = facingOf(player);
+  const ox = player.fx ?? player.x, oy = player.fy ?? player.y;
+  const aim = assistAim(game, player, skill, facing, ox, oy);
+  const slowPct = perkTotal(skill, rank, 'slowPct');
+
+  if (typeof game.spawnProjectile === 'function') {
+    game.spawnProjectile({
+      x: ox, y: oy, ox, oy,
+      dx: aim.x, dy: aim.y,
+      speed: BOW_SPEED,
+      range: skill.range,
+      damage: amount,
+      pointBlankDamage,
+      applyDefense: true,
+      slow: slowPct > 0 ? { pct: slowPct, dur: perkTotal(skill, rank, 'slowDur') } : null,
+      crit,
+      owner: 'player',
+      color: '#e8d6a8',
+      size: 0.2,
+      pierce: s.pierce || 0,
+      kind: 'arrow',
+      element: skill.element,
+    });
+  }
+  return true; // like a swing: a shot into a wall still spends the cooldown
+}
+
 function castArcaneBolt(game, player, skill, rank) {
   const facing = facingOf(player);
   const rng = game.rng;
   const mult = rankMult(rank);
-  const power = rng.range(player.stats.rangedMin, player.stats.rangedMax) * mult;
+  const { min, max } = boltDamageRange(player);
+  const power = rng.range(min, max) * mult;
   const critChance = player.stats.critChance;
   const critMult = player.stats.critMult;
   // Precompute final damage (ignoring target defense — spell damage bypasses armor per contract note);

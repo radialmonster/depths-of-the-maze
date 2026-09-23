@@ -9,7 +9,7 @@ import { ATTRIBUTES, xpForLevel, spendAttribute } from './character.js';
 import { upgradeSkill, skillDescription, activeSkill, skillRank, skillCooldown, effectiveCooldown, MAX_SKILL_RANK,
   assignSkill, knownSkills, attackSkillForClass, skillEligible, weaponClass, weaponClassName, WEAPON_CLASSES,
   SLOT_CATEGORIES } from './skills.js';
-import { equipItem, unequipItem, useItem, dropItem, sellValue, itemTooltip, compareGear, equipUpgrades, SLOTS, INVENTORY_SIZE,
+import { equipItem, unequipItem, useItem, dropItem, sellValue, itemTooltip, compareGear, equipUpgrades, SLOTS, INVENTORY_SIZE, isTwoHanded,
   activePotion, pinnedPotion, potionHotbarKind, togglePotionPin } from './items.js';
 import { buyFromMerchant, sellToMerchant, buybackFromMerchant, nearbyMerchant, shopPrice } from './shop.js';
 import { RARITY, clamp, TILE, ELEMENTS, ELEMENT_ORDER } from './core.js';
@@ -94,12 +94,13 @@ const DERIVED = [
   { k: 'maxHp', label: 'Max HP', icon: '❤️' },
   { k: 'maxMana', label: 'Max Mana', icon: '💧' },
   { k: 'melee', label: 'Melee', icon: '⚔️' },
+  { k: 'ranged', label: 'Ranged', icon: '🏹' }, // bow damage (§17.9); melee/ranged not in use shows a dimmed "—"
   { k: 'spellPower', label: 'Spell Power', icon: '✨' },
   { k: 'defense', label: 'Defense', icon: '🛡️' },
   { k: 'dodgeChance', label: 'Dodge', icon: '🌀' },
   { k: 'critChance', label: 'Crit Chance', icon: '🎯' },
   { k: 'critMult', label: 'Crit Damage', icon: '💥' },
-  { k: 'autoAimAssist', label: 'Aim Assist', icon: '🏹' },
+  { k: 'autoAimAssist', label: 'Aim Assist', icon: '🧭' },
   { k: 'hpRegen', label: 'HP Regen', icon: '🩹' },
   { k: 'manaRegen', label: 'Mana Regen', icon: '🔹' },
   { k: 'moveSpeed', label: 'Move Speed', icon: '👟' },
@@ -125,7 +126,8 @@ function derivedText(k, s) {
   switch (k) {
     case 'maxHp': return String(Math.round(s.maxHp));
     case 'maxMana': return String(Math.round(s.maxMana));
-    case 'melee': return `${Math.round(s.meleeMin)}–${Math.round(s.meleeMax)}`;
+    case 'melee': return s.meleeMin == null ? '—' : `${Math.round(s.meleeMin)}–${Math.round(s.meleeMax)}`;
+    case 'ranged': return s.rangedMin == null ? '—' : `${Math.round(s.rangedMin)}–${Math.round(s.rangedMax)}`;
     case 'spellPower': return String(Math.round(s.spellPower));
     case 'defense': return String(Math.round(s.defense));
     case 'critChance': return fmtPct(s.critChance);
@@ -138,14 +140,17 @@ function derivedText(k, s) {
     default: return '-';
   }
 }
+// null = "not applicable" (the damage row for a role you aren't using) — never compared as a real 0.
 function derivedValue(k, s) {
-  if (k === 'melee') return s.meleeMin + s.meleeMax;
+  if (k === 'melee') return s.meleeMin == null ? null : s.meleeMin + s.meleeMax;
+  if (k === 'ranged') return s.rangedMin == null ? null : s.rangedMin + s.rangedMax;
   if (k === 'moveSpeed') return -s.moveCooldown;
   return s[k] || 0;
 }
 
-// Corner badge on bag/shop cells: ▲ upgrade, ▼ downgrade, ↕ trade-off; hidden for potions / no change.
-const CMP_GLYPH = { up: '▲', down: '▼', mixed: '↕' };
+// Corner badge on bag/shop cells: ▲ upgrade, ▼ downgrade, ↕ trade-off, ⇄ different weapon class (§17.9);
+// hidden for potions / no change / an off-hand locked by a two-handed weapon.
+const CMP_GLYPH = { up: '▲', down: '▼', mixed: '↕', swap: '⇄' };
 function setCmpBadge(el, gc) {
   const v = gc && CMP_GLYPH[gc.verdict] ? gc.verdict : '';
   if (el.dataset.v === v) return;
@@ -161,6 +166,10 @@ function fmtTime(s) {
 }
 
 function fmtPct(x) { return `${Math.round((x || 0) * 100)}%`; }
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
 
 // Damage-bar "trail": a value that follows a falling stat down, but only after holding briefly
 // (so a hit reads clearly before the bar catches up), then drains toward it at `decay` frac/sec.
@@ -1734,6 +1743,7 @@ export class UI {
       const el = rows[k], v = derivedText(k, s);
       if (el.textContent !== v) el.textContent = v;
       el.classList.remove('dm-up', 'dm-down');
+      el.parentElement.classList.toggle('dm-na', derivedValue(k, s || {}) === null);
     }
   }
 
@@ -1944,7 +1954,7 @@ export class UI {
   }
 
   // Slot 1's weapon-class row: every class's remembered attack pick, the equipped class marked, the class the list is
-  // editing highlighted. Hidden while only one weapon class exists (today: melee1h only).
+  // editing highlighted. Hidden while only one weapon class exists (now: melee1h + bow, so it shows).
   _refreshClassChips(card, p, model) {
     const show = WEAPON_CLASSES.length > 1;
     card.classes.style.display = show ? '' : 'none';
@@ -1975,16 +1985,35 @@ export class UI {
       unequipItem(p, slotDef.id);
       this._hideTooltip();
       this._refreshInventoryPanel();
+    } else if (this._offhandLockedBy(slotDef.id, p)) {
+      sfx.denied();
     }
+  }
+
+  // The two-handed weapon locking the off-hand slot (§17.9), or null.
+  _offhandLockedBy(slotId, p) {
+    const w = p && p.equipment && p.equipment.weapon;
+    return slotId === 'offhand' && isTwoHanded(w) ? w : null;
+  }
+
+  // Paperdoll tooltip: the equipped item, or why the off-hand slot is locked. '' = none.
+  _paperdollTooltip(slotId, p, withAction) {
+    const item = p.equipment[slotId];
+    if (item) return itemTooltip(item, p) + (withAction ? '<div class="tt-action">Click to unequip</div>' : '');
+    const lock = this._offhandLockedBy(slotId, p);
+    if (lock) {
+      return `<div class="tt-item"><div class="tt-name" style="font-weight:bold;">🔒 Off-hand locked</div>`
+        + `<div class="tt-verdict-note">${escapeHtml(lock.name)} is two-handed — unequip it to use an off-hand.</div></div>`;
+    }
+    return '';
   }
 
   _hoverPaperdoll(index, e) {
     const p = this.game && this.game.player;
     if (!p) return;
-    const slotDef = SLOTS[index];
-    const item = p.equipment[slotDef.id];
-    if (item) {
-      this._showTooltip(null, itemTooltip(item, p) + '<div class="tt-action">Click to unequip</div>');
+    const html = this._paperdollTooltip(SLOTS[index].id, p, true);
+    if (html) {
+      this._showTooltip(null, html);
       this._positionTooltip(e.clientX, e.clientY);
     }
   }
@@ -2001,10 +2030,11 @@ export class UI {
       this.log(`Salvaged ${item.name} for ${value}g.`, '#f08c00');
     } else if (item.type === 'potion') {
       useItem(this.game, item);
-    } else {
-      equipItem(p, item);
+    } else if (equipItem(p, item, (t, c) => this.log(t, c))) {
       const slot = this.dom.eqSlots.find((s) => s.slotDef.id === item.slot);
       if (slot) flash(slot.el, 'dm-bump');
+    } else {
+      sfx.denied(); // two-handed rules refused it (the reason is in the log)
     }
     this._hideTooltip();
     this._previewItem = null;
@@ -2052,8 +2082,10 @@ export class UI {
       const el = rows[k];
       const now = derivedText(k, p.stats);
       const next = gc ? derivedText(k, gc.after) : now;
-      const dir = next === now ? 0 : Math.sign(derivedValue(k, gc.after) - derivedValue(k, p.stats));
-      const txt = dir ? `${now} → ${next}` : now;
+      const a = derivedValue(k, p.stats), b = gc ? derivedValue(k, gc.after) : a;
+      // A row switching between a number and "—" (melee<->ranged swap) shows the change, uncoloured.
+      const dir = next === now || a === null || b === null ? 0 : Math.sign(b - a);
+      const txt = next !== now && (dir || a === null || b === null) ? `${now} → ${next}` : now;
       if (el.textContent !== txt) el.textContent = txt;
       el.classList.toggle('dm-up', dir > 0);
       el.classList.toggle('dm-down', dir < 0);
@@ -2091,12 +2123,15 @@ export class UI {
 
     for (const s of d.eqSlots) {
       const item = p.equipment[s.slotDef.id];
-      const icon = item ? item.icon : (s.slotDef.icon || '?');
+      // Off-hand slot locked (and shown with a padlock) while a two-handed weapon is held (§17.9).
+      const locked = !item && !!this._offhandLockedBy(s.slotDef.id, p);
+      const icon = item ? item.icon : locked ? '🔒' : (s.slotDef.icon || '?');
       if (s.icon.textContent !== icon) s.icon.textContent = icon;
       const rc = item ? rarityBorderColor(item) : '';
       s.el.style.borderColor = rc;
       s.el.style.setProperty('--item-glow', rc || 'transparent');
       s.el.classList.toggle('dm-filled', !!item);
+      s.el.classList.toggle('dm-locked', locked);
     }
 
     let upgrades = 0;
@@ -2545,9 +2580,9 @@ export class UI {
       this._lastInvCursorKey = cursorKey;
       if (cur.area === 'paperdoll') {
         const slotDef = SLOTS[cur.index];
-        const item = slotDef && p.equipment[slotDef.id];
+        const html = slotDef ? this._paperdollTooltip(slotDef.id, p, false) : '';
         const el = this.dom.eqSlots[cur.index] && this.dom.eqSlots[cur.index].el;
-        if (item && el) this._showTooltip(el, itemTooltip(item, p)); else this._hideTooltip();
+        if (html && el) this._showTooltip(el, html); else this._hideTooltip();
       } else {
         const item = p.inventory[cur.index];
         const el = this.dom.invCells[cur.index] && this.dom.invCells[cur.index].cell;
@@ -3177,6 +3212,11 @@ const CSS_TEXT = `
 .dm-inv-cell.dm-pinned { box-shadow: 0 0 0 2px #fcc419, 0 3px 0 color-mix(in srgb, var(--item-glow) 45%, #c5d6ea); }
 .dm-tooltip .tt-pin { margin-top: 6px; color: #ffd43b; font-size: 11px; font-weight: 800; }
 .dm-tooltip .tt-pin-on { color: #ffe066; }
+.dm-derived-row.dm-na { opacity: 0.45; }
+.dm-eq-slot.dm-locked { cursor: not-allowed; border-style: solid; border-color: #d0d7e2; background: repeating-linear-gradient(135deg, #eef1f6 0 6px, #e3e8f0 6px 12px); }
+.dm-eq-slot.dm-locked .dm-eq-icon { opacity: 0.55; filter: none; }
+.dm-eq-slot.dm-locked:hover { transform: none; }
+.dm-cmp-swap { background: #1c7ed6; }
 .dm-derived-value.dm-up { color: #2f9e44; }
 .dm-derived-value.dm-down { color: #e03131; }
 .dm-inv-upbtn {

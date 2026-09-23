@@ -2,13 +2,16 @@
 // Pure module: no DOM, no three.js. Only touches `game.bus`, `game.effect`, `game.log` (guarded) via gainXP.
 
 import { clamp } from './core.js';
+// Weapon kind -> role/scale (DESIGN §17.9). items.js imports recalcStats back; the cycle is safe because neither
+// module touches the other's bindings at load time, only inside functions.
+import { weaponInfo } from './items.js';
 
 // ---------------------------------------------------------------------------
 // Attribute metadata for the Character (C) panel.
 // ---------------------------------------------------------------------------
 export const ATTRIBUTES = [
   { id: 'str', name: 'Strength', description: 'Increases melee damage and adds a small amount of max HP.' },
-  { id: 'dex', name: 'Dexterity', description: 'Increases crit chance, dodge chance, and move speed slightly. Improves Aim.' },
+  { id: 'dex', name: 'Dexterity', description: 'Increases bow damage, crit chance, dodge chance, and move speed slightly. Improves Aim.' },
   { id: 'int', name: 'Intelligence', description: 'Increases max mana, spell power, and mana regen.' },
   { id: 'vit', name: 'Vitality', description: 'Increases max HP and HP regen.' },
   { id: 'def', name: 'Defense', description: 'Reduces incoming damage (diminishing returns).' },
@@ -27,7 +30,9 @@ const MANA_PER_LEVEL = 2;
 
 const FIST_MIN = 1;
 const FIST_MAX = 3;
-const STR_MELEE_SCALE = 0.8; // str points -> flat melee damage added on top of weapon damageMin/Max
+// Class attribute points -> flat damage added on top of weapon damageMin/Max, for whichever row the weapon's role
+// feeds (melee: str, bow: dex — WEAPON_KIND_INFO.scale). Same 0.8 factor for every role (§17.9).
+const WEAPON_ATTR_SCALE = 0.8;
 
 const DEFENSE_K = 1.0; // mitigate(): raw * 100/(100+defense*k)
 
@@ -75,7 +80,8 @@ export function createPlayer() {
     stats: {
       maxHp: 1, maxMana: 1,
       meleeMin: FIST_MIN, meleeMax: FIST_MAX,
-      rangedMin: 0, rangedMax: 0,
+      rangedMin: null, rangedMax: null,
+      pierce: 0,
       spellPower: 0,
       defense: 0,
       critChance: CRIT_CHANCE_BASE,
@@ -122,7 +128,7 @@ export function recalcStats(player) {
   // Equipment aggregate.
   let armor = 0, damageMin = 0, damageMax = 0, spellPower = 0;
   let maxHpBonus = 0, maxManaBonus = 0, critChanceBonus = 0;
-  let hpRegenBonus = 0, manaRegenBonus = 0, moveSpeedBonus = 0, cooldownReductionBonus = 0;
+  let hpRegenBonus = 0, manaRegenBonus = 0, moveSpeedBonus = 0, cooldownReductionBonus = 0, pierce = 0;
   let hasWeapon = false;
 
   const equipmentSlots = player.equipment || {};
@@ -146,6 +152,7 @@ export function recalcStats(player) {
     if (s.manaRegen) manaRegenBonus += s.manaRegen;
     if (s.moveSpeed) moveSpeedBonus += s.moveSpeed;
     if (s.cooldownReduction) cooldownReductionBonus += s.cooldownReduction; // no gear rolls this yet
+    if (s.pierce) pierce += s.pierce; // bow-only Piercing affix: extra enemies each Bow Shot arrow passes through
   }
 
   // Buffs (temporary stat deltas, keys match player.stats or raw attrs — support both).
@@ -175,13 +182,26 @@ export function recalcStats(player) {
   const maxHp = Math.round(BASE_HP + (lvl - 1) * HP_PER_LEVEL + vit * HP_PER_VIT + str * HP_PER_STR + maxHpBonus + buffMaxHp);
   const maxMana = Math.round(BASE_MANA + (lvl - 1) * MANA_PER_LEVEL + int_ * MANA_PER_INT + maxManaBonus + buffMaxMana);
 
-  const meleeMin = hasWeapon ? Math.max(1, Math.round(damageMin + str * STR_MELEE_SCALE + buffDamageMin)) : FIST_MIN + Math.floor(str * 0.15);
-  const meleeMax = hasWeapon ? Math.max(meleeMin + 1, Math.round(damageMax + str * STR_MELEE_SCALE + buffDamageMax)) : FIST_MAX + Math.floor(str * 0.15);
+  // Damage rows (§17.9): the weapon's damage feeds only the row matching its role, plus that class's attribute
+  // x0.8. The other row is null ("not applicable" — the Character screen shows it as a dimmed "—"). Unarmed (and
+  // any weapon kind not in WEAPON_KIND_INFO, e.g. staff for now) is melee/str. Arcane Bolt no longer reads either
+  // row — its damage comes from spellPower in its own skill definition (skills.js boltDamageRange).
+  const info = weaponInfo(equipmentSlots.weapon);
+  const attrs = { str, dex, int: int_ };
+  const scaleAttr = attrs[info.scale] || 0;
+  let meleeMin = null, meleeMax = null, rangedMin = null, rangedMax = null;
+  if (info.role === 'ranged') {
+    rangedMin = Math.max(1, Math.round(damageMin + scaleAttr * WEAPON_ATTR_SCALE + buffDamageMin));
+    rangedMax = Math.max(rangedMin + 1, Math.round(damageMax + scaleAttr * WEAPON_ATTR_SCALE + buffDamageMax));
+  } else if (hasWeapon) {
+    meleeMin = Math.max(1, Math.round(damageMin + scaleAttr * WEAPON_ATTR_SCALE + buffDamageMin));
+    meleeMax = Math.max(meleeMin + 1, Math.round(damageMax + scaleAttr * WEAPON_ATTR_SCALE + buffDamageMax));
+  } else {
+    meleeMin = FIST_MIN + Math.floor(str * 0.15);
+    meleeMax = FIST_MAX + Math.floor(str * 0.15);
+  }
 
-  // Ranged/spell power: base skill (Arcane Bolt) uses spellPower + dex.
   const totalSpellPower = Math.round(spellPower + int_ * 0.8 + buffSpellPower);
-  const rangedMin = Math.max(1, Math.round(totalSpellPower * 0.8 + dex * 0.2));
-  const rangedMax = Math.max(rangedMin + 1, Math.round(totalSpellPower * 1.2 + dex * 0.3));
 
   const defense = Math.max(0, Math.round(def * DEFENSE_PER_DEF_ATTR + armor + buffDefenseFlat));
 
@@ -203,6 +223,7 @@ export function recalcStats(player) {
     maxHp, maxMana,
     meleeMin, meleeMax,
     rangedMin, rangedMax,
+    pierce,
     spellPower: totalSpellPower,
     defense,
     critChance, critMult,

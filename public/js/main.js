@@ -6,7 +6,7 @@ import { Renderer } from './renderer.js';
 import { createPlayer, recalcStats, gainXP, mitigate, updatePlayer, projectileHitDamage } from './character.js';
 import { createSkillState, normalizeSkillState, useSkill, updateSkills } from './skills.js';
 import { spawnEnemies, updateEnemies, createEnemy, getResist, applySlow } from './enemies.js';
-import { rollLoot, startingGear, addToInventory, useItem, generateItem, activePotion } from './items.js';
+import { rollLoot, startingGear, addToInventory, useItem, generateItem, activePotion, enforceTwoHanded } from './items.js';
 import { Input } from './input.js';
 import { UI, padLabel } from './ui.js';
 import { sfx, wireAudio } from './audio.js';
@@ -100,6 +100,9 @@ const game = {
     // doesn't tag every single target at once.
     let floatText = opts.crit ? `${amount}!` : `${amount}`;
     let floatColor = opts.crit ? '#ffd34f' : '#ffffff';
+    // Point-blank weapon shot (§17.12): smaller grey number + duller hit sound.
+    const floatOpts = opts.pointBlank ? { size: 12 } : undefined;
+    if (opts.pointBlank) floatColor = '#9aa2b1';
     if (Math.abs(resist) >= RESIST_FEEDBACK_THRESHOLD) {
       const now = (typeof performance !== 'undefined' ? performance.now() : Date.now());
       if (now - lastResistFloatAt > RESIST_FLOAT_THROTTLE_MS) {
@@ -108,9 +111,9 @@ const game = {
         else { floatText = `${amount} Weak!`; floatColor = ELEMENTS[opts.element]?.color || '#ff9f43'; }
       }
     }
-    this.floatText(enemy.x, enemy.y, floatText, floatColor);
+    this.floatText(enemy.x, enemy.y, floatText, floatColor, floatOpts);
     this.effect('hit', enemy.x, enemy.y, { color: opts.crit ? '#ffd34f' : '#ffffff', crit: !!opts.crit });
-    sfx.hit(!!opts.crit, opts.element);
+    sfx.hit(!!opts.crit, opts.element, !!opts.pointBlank);
 
     const isBoss = enemy.behavior === 'boss';
     if (opts.crit) { renderer.shake(CRIT_SHAKE); triggerHitStop(CRIT_HITSTOP); }
@@ -188,7 +191,7 @@ const game = {
   },
 
   effect(type, x, y, opts) { renderer.spawnEffect(type, x, y, opts || {}); },
-  floatText(x, y, text, color) { renderer.floatText(x, y, text, color); },
+  floatText(x, y, text, color, opts) { renderer.floatText(x, y, text, color, opts); },
   log(text, color) { ui.log(text, color); },
 
   dropLoot(x, y, list) {
@@ -387,6 +390,8 @@ function continueGame(data) {
     }
     bumpUid(maxId);
 
+    // Saves from before bows were two-handed may hold a bow + off-hand: move the off-hand to the bag (§17.9).
+    const strayOffhand = enforceTwoHanded(p);
     recalcStats(p);
     p.hp = clamp(sp.hp ?? p.stats.maxHp, 0, p.stats.maxHp);
     p.mana = clamp(sp.mana ?? p.stats.maxMana, 0, p.stats.maxMana);
@@ -394,6 +399,7 @@ function continueGame(data) {
 
     game.player = p;
     loadDepth(game.depth);
+    if (strayOffhand) game.dropLoot(p.x, p.y, [strayOffhand]); // bag was full: leave it at the player's feet
     mode = 'playing';
   } catch (e) {
     console.error('[save] failed to restore run, starting a new game instead', e);
@@ -698,8 +704,11 @@ function updateProjectiles(dt) {
         if (e && !pr.hit.has(e.id)) {
           pr.hit.add(e.id);
           // Hit-time resolution (§17.12): point-blank + target defense for applyDefense shots; others unchanged.
-          const { amount, pointBlank } = projectileHitDamage(pr, pr.x, pr.y, e.defense);
-          game.damageEnemy(e, amount, { crit: pr.crit, source: 'ranged', element: pr.element, knockback: null, pointBlank });
+          // Distance is measured to the target's tile, not the projectile's position: with 0.25-tile substeps an
+          // arrow enters a tile 2 away at exactly 1.5 tiles from its origin, which would make 2-tile shots
+          // point-blank. A point-blank hit uses the bottom of the roll, so its release crit doesn't apply either.
+          const { amount, pointBlank } = projectileHitDamage(pr, e.x, e.y, e.defense);
+          game.damageEnemy(e, amount, { crit: pr.crit && !pointBlank, source: 'ranged', element: pr.element, knockback: null, pointBlank });
           if (pr.slow && !e.dead) applySlow(e, pr.slow.pct, pr.slow.dur);
           if (pr.pierce > 0) pr.pierce--;
           else alive = false;

@@ -1712,7 +1712,8 @@ export class Renderer {
   }
 
   // ---------------------------------------------------------------- float text
-  floatText(x, y, text, color) {
+  // opts.size (px) overrides the default size, e.g. the small grey point-blank numbers (§17.12).
+  floatText(x, y, text, color, opts) {
     if (this._floatTexts.length >= this._floatTextCap) {
       const old = this._floatTexts.shift();
       if (old) old.el.remove();
@@ -1721,7 +1722,7 @@ export class Renderer {
     const crit = str.includes('!');
     const el = document.createElement('div');
     el.textContent = str;
-    const size = crit ? 22 : 15;
+    const size = (opts && opts.size) || (crit ? 22 : 15);
     el.style.cssText = `position:absolute;left:0;top:0;transform:translate(-50%,-50%);font-family:Fredoka,Nunito,Arial,sans-serif;font-weight:700;white-space:nowrap;pointer-events:none;color:${color || '#ffffff'};text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000,0 2px 4px rgba(0,0,0,0.7);font-size:${size}px;`;
     this.overlay.appendChild(el);
     this._floatTexts.push({ el, wx: x, wy: y, wz: 0.9, age: 0, duration: crit ? 1.2 : 0.9, rise: crit ? 1.4 : 1.0, crit });
