@@ -28,13 +28,20 @@ level up, spend attribute + skill points (C), manage gear (I). Die → run summa
 | `js/enemies.js` | Enemy agent | Enemy types, spawning, AI (wander/chase/flee/ranged/boss) |
 | `js/items.js` | Loot agent | Item generation, rarities, loot tables, equip/use/drop |
 | `js/input.js` | UI agent | Keyboard + Gamepad abstraction |
-| `js/ui.js` | UI agent | HUD, Character panel (C), Inventory panel (I), messages, death/menu screens. Injects its own CSS. |
+| `js/ui.js` | UI agent | HUD, Character panel (C), Inventory panel (I), Shop panel, boss HP bar, messages, death/menu screens. Injects its own CSS. |
+| `js/audio.js` | Producer | Procedural Web Audio sound effects, mute, `wireAudio(game)` bus wiring (§17.2) |
+| `js/save.js` | Producer | localStorage save/continue (§17.3) |
+| `js/shop.js` | Producer | Merchant placement, stock, pricing, buy/sell transactions (§17.4) |
 
 ## 4. Coordinates & conventions
 - Grid tiles. Tile `(x, y)` ↔ world `(x, 0, y)` in three.js; 1 world unit per tile. Tile centers are at integer coords.
 - `y` grows **down/south** on screen. "Up" key = `y - 1`.
-- Orthogonal movement only (4 directions). Facing is one of `{x:0,y:-1} {x:0,y:1} {x:-1,y:0} {x:1,y:0}`.
-- Logical positions of player/enemies are **integers** (`x`, `y`). Renderer smooths visuals itself (lerps meshes toward logical pos).
+- Keyboard / d-pad move the player tile-by-tile (4 directions). The gamepad left stick moves **freely** (see §17.1).
+  `facing` is always one of `{x:0,y:-1} {x:0,y:1} {x:-1,y:0} {x:1,y:0}` (tile skills use it); `aim` is the exact stick
+  direction (unit vector) or null.
+- Logical positions of enemies are **integers** (`x`, `y`). The player has integer `x`,`y` (its tile, used by AI, FOV,
+  pickups, stairs, melee range) plus float `fx`,`fy` (its free-movement position; `x = round(fx)`). Renderer smooths visuals
+  itself (lerps meshes toward logical pos; the player toward `fx/fy`).
 - Projectiles have **float** positions in tile units.
 - Time: `dt` in seconds. All cooldowns/timers are in seconds and count **down** to 0.
 
@@ -193,12 +200,14 @@ export class Input {
   constructor()                  // attaches listeners
   update()                       // call once per frame BEFORE reading; polls gamepads, computes pressed edges
   moveDir() -> {x,y}|null        // orthogonal only; most recently pressed direction wins; WASD, arrows, D-pad, left stick (deadzone .5)
+  analogMove() -> {x,y,mag}|null // left stick unit direction + push 0..1 for free movement (radial deadzone .22); null in deadzone.
+                                 // `stickOverride = {x,y,mag}` forces it (testing hook)
   pressed(action) -> bool        // true only on the frame the action went down
   held(action) -> bool
   lastDevice: 'keyboard'|'gamepad'
 }
 actions: 'skill1'..'skill4' (1-4 / J K L Space? / gamepad A,X,B,Y → 1,2,3,4 respectively: A=skill1 Cleave, X=skill2 Bolt, Y=skill3 Nova, B=skill4 Dash)
-         'character' (C / gamepad Back/View or RB), 'inventory' (I / gamepad LB), 'pause' (Esc, P / Start),
+         'character' (C / gamepad Back/View or LB), 'inventory' (I / gamepad RB), 'pause' (Esc, P / Start),
          'ui_up','ui_down','ui_left','ui_right' (arrows/WASD/dpad edges), 'confirm' (Enter/E / A), 'cancel' (Esc / B), 'drop' (Q/Delete / X),
          'potion' (H / R? → use first health potion; gamepad LT), 'mana_potion' (M / gamepad RT)
 ```
@@ -251,12 +260,94 @@ light/neutral so the per-instance theme colour tints them; colour maps sRGB, nor
 - Decor: wood-plank door jambs with iron bands, iron-bracket torches with additive layered flame + glow sprite (tinted `theme.torch`),
   soft blob contact shadows under player/enemies. Shared materials are flagged `userData.shared` so `_disposeDecor` skips them.
 
+Character models (`js/models.js`, renderer-owned): procedural hero, every enemy shape (kobold / skeleton archer are variants
+of goblin / skeleton), Slime King, Bone Tyrant and the merchant, plus their idle/walk/attack animations. Static parts sharing a
+material are baked into cached vertex-coloured geometries (shared by all instances, never disposed); materials are always
+per instance (hit flash / freeze tint). The hero's held weapon/off-hand mirror `equipment.weapon.weaponKind` /
+`equipment.offhand.offhandKind` (unarmed falls back to a sword). Elites: gold floor ring + floating gold gem. Red stays
+reserved for attack telegraphs, so no model uses red floor decals. Debug: `__dbg.modelGallery()` / `__dbg.clearGallery()`.
+
 ## 15. Events (bus)
-`enemyKilled {enemy}` · `playerDamaged {amount, source}` · `playerDied` · `levelUp {level}` · `itemPickedUp {item}` ·
-`goldPickedUp {amount}` · `depthChanged {depth}` · `skillUsed {skill}` · `statsChanged`
+`enemyKilled {enemy}` · `playerDamaged {amount, source}` · `playerDodged` · `playerDied` · `levelUp {level}` ·
+`itemPickedUp {item}` · `goldPickedUp {amount}` · `depthChanged {depth}` · `skillUsed {skill}` · `statsChanged` ·
+`potionUsed {kind:'heal'|'mana'}` · `denied` (no mana / no potion / bag full / can't afford) · `bossSlam` ·
+`itemBought {item, price}` · `itemSold {item, price}`
 
 ## 16. Balance targets
 - Depth 1 enemies die in 2–3 Cleaves; player survives ~8–10 hits from depth-appropriate enemies.
 - Level ~1 per floor early. xpForLevel(L) ≈ 50 * L^1.5.
 - Enemy stats scale ~12%/depth; elites (10%) ×2 HP, ×1.3 dmg, better loot. Boss every 5 depths.
 - Per level: +5 attr points? No — +3 attribute points, +1 skill point.
+- Gear: base stats and value grow **every item level** (linear formulas in items.js). Attribute stats (str/dex/int/vit/def)
+  keep one decimal so each level reads as an upgrade. Randomness (rarity, affixes, ±1 item level on drops) is welcome, but
+  depth N+1 gear must be better *on average* than depth N.
+- Potions deliberately stay in three tiers — Minor / Normal / Greater (depth 1-3 / 4-7 / 8+) with clearly different amounts.
+  Do not convert them to a per-level curve.
+
+## 17. Game design decisions (living notes)
+Decisions made with the user while building. Keep this section current — when a design call is made, record it here.
+
+### 17.1 Movement & controls
+- Gamepad left stick = free analog movement (radial deadzone 0.22, speed ∝ stick push, top speed = 1 / moveCooldown
+  tiles/s). Box collision (half-size 0.3) slides along walls; a corner assist eases the player into doorways/corridors.
+- Pushing within ~40° toward an adjacent enemy holds position and swings Cleave; a clearly sideways push walks around it.
+- Arcane Bolt fires along the exact stick angle (`player.aim`); Cleave/Dash use the nearest 4-way `facing`.
+- Keys: 1-4 skills · H / LT health potion · M / RT mana potion · C / LB character · I, Tab / RB bag · E, Enter, Space / A
+  confirm & **Trade** (near a merchant A trades instead of Cleaving) · U mute · Esc, P / Start pause.
+  In the shop, Tab / I or LB / RB switch Buy / Sell.
+
+### 17.2 Audio (audio.js)
+- All sound is procedural Web Audio — no audio files. `sfx` singleton; `wireAudio(game)` maps bus events to sounds.
+- Browsers only start audio after a key/mouse gesture; gamepad buttons don't count. The AudioContext is created at page
+  load, so wherever the browser already allows sound (installed app, site allowed in browser settings, high media
+  engagement) it runs with no click at all. Otherwise it unlocks on the first key/click. While locked: the title card
+  shows a controller note (only if a gamepad is present) and the HUD shows "🔇 Click or press any key to turn on sound".
+  Mute (U) persists in localStorage `dotm.muted`.
+- Per-sound throttles and a voice cap keep multi-hits (Frost Nova on a crowd, 16-shot sprays) from stacking into one loud blast.
+
+### 17.3 Save / continue (save.js)
+- localStorage `dotm.save.v1` (versioned). Saves on entering every depth and on `pagehide` / tab hidden while playing.
+- Persists the player (level, xp, points, gold, attributes, equipment, inventory, skill ranks, hp/mana) and run stats —
+  never positions or timers. Continue regenerates a fresh layout for the saved depth. Death deletes the save.
+- Title screen: with a save → "Continue — Depth N · Level L" (default) and "New Game"; random keys don't start anything.
+
+### 17.4 Merchant & economy (shop.js)
+- A merchant stands on **every** depth, in a room kept clear of enemies (fallback: start room). No log line announces it.
+- Stock is fresh each depth and never carries over: health + mana potions (unlimited), 4 magic-or-better items and one
+  **Featured** premium item (rare; epic chance rises with depth), all at exact item level depth + 1.
+- Enemies don't respawn, so gold can't be ground on a level. Intended tension: if you can't afford the Featured item,
+  skip shopping and save for the next depth's merchant.
+- Pricing: buy = value × 1.3, sell = value × 0.35. Featured markup rises with item level so it costs ~2.5-3.5 depths of
+  typical income at every depth; regular gear ~1-1.5 depths; potions cheap. Estimated income ≈ 35g (d1), 120g (d5), 260g (d10).
+
+### 17.4b Look & atmosphere
+- The background/fog behind the map is each depth theme's sky colour blended (in sRGB) toward a deep dusk tone
+  (`themeSky` in renderer.js), and it gets darker the deeper you go: slate blue at depth 1, charcoal around 15,
+  near-black from ~22. Explored-but-not-visible tiles fade toward that colour too.
+
+### 17.5 Combat feel
+- Every hit: white flash, visual recoil + squash away from the attacker. Knockback is an eased shove.
+- Hit-stop freezes the whole sim briefly (crit 45ms, kill 60ms, boss hit 50ms, boss kill 150ms); input still registers.
+- Camera shake: crit, boss hit, light on kills (shakes take the max, never stack). Crits: bigger popping numbers + sparks.
+- Player hit: red screen-edge pulse scaled by damage fraction.
+
+### 17.6 Elements & resistances
+- Damage has an **element**: physical, arcane, frost, fire, poison, lightning (fire/poison/lightning reserved for future
+  skills and gear). Skills are tagged with an element (Cleave physical, Arcane Bolt arcane, Frost Nova frost) — resistances
+  never refer to specific skills.
+- Status effects are separate keys: freeze, slow (future: burn, poison).
+- Enemy types may define `resist` per element/effect: positive = resist, negative = weakness. Always clamped to
+  −75%..+80% — **nothing is ever fully immune**, and there are no blanket hard rules (e.g. no global "bosses can't be frozen").
+- Hits that are notably resisted / super-effective are tagged on the damage number; bosses list weaknesses/resists on their HP bar.
+
+### 17.7 Bosses
+- Boss every 5th depth (Slime King 5, 15…; Bone Tyrant 10, 20…). Top-of-screen HP bar with a phase notch; intro banner + roar.
+- Phase 2 at 50% HP: faster cadence (~25%) and an extra attack. Every attack is telegraphed on the ground (~0.7-1.0s)
+  and dodgeable; hit checks use the player's free-movement position. All telegraphs use one readable red
+  (`TELEGRAPH_COLOR`), never the boss's own colour, and lanes stop at walls.
+- Slime King: Hop Slam (leaps onto a marked circle), Glob Spray (8-projectile ring, 16 in phase 2), Split into 3-4
+  slimes on entering phase 2 plus occasional smaller splits after. Resist `{ physical: 0.25, frost: -0.3, freeze: 0.3 }`.
+- Bone Tyrant: Bone Spears (3 fanned lanes, 5 in phase 2), Bone Charge (up to 5 tiles; then Dazed, +25% damage taken
+  for 1s), Spiral + skeletons in phase 2. Resist `{ arcane: 0.3, physical: -0.25, fire: -0.2, freeze: 0.6, slow: 0.5 }`.
+- Boss HP bar lists weaknesses/resists in element colours, e.g. "Weak: Frost · Resists: Physical".
+- Guaranteed loot: at least one rare-or-better item (epic ~25-35%, legendary ~5-10%, rising with depth) plus a health potion.

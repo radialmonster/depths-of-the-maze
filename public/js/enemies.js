@@ -105,6 +105,9 @@ export const ENEMY_TYPES = {
     behavior: 'boss', windup: 0.6, meleeRange: 1.6, slamRadius: 2.2, summon: 'slime',
     ranged: { minDist: 0, maxDist: 8, speed: 6, range: 9, color: '#4fd67a', size: 0.25, kind: 'enemyBolt' },
     visual: { shape: 'boss', color: '#3fae62', scale: 2.3 },
+    // Squishy against blunt/physical hits, but ice bites deep into an ooze — and it still
+    // freezes solid (if only a little less obligingly than a regular slime).
+    resist: { physical: 0.25, frost: -0.3, freeze: 0.3 },
   },
   bone_tyrant: {
     id: 'bone_tyrant', name: 'Bone Tyrant', minDepth: 10, maxDepth: 60, boss: true,
@@ -113,6 +116,9 @@ export const ENEMY_TYPES = {
     behavior: 'boss', windup: 0.6, meleeRange: 1.6, slamRadius: 2.2, summon: 'skeleton',
     ranged: { minDist: 0, maxDist: 9, speed: 7, range: 10, color: '#cfcfc0', size: 0.25, kind: 'enemyBolt' },
     visual: { shape: 'boss', color: '#cfcfc0', scale: 2.4 },
+    // Arcane bolts pass clean through a ribcage, but crushing blows shatter bone — and dry
+    // bone catches fire far more readily than it freezes.
+    resist: { arcane: 0.3, physical: -0.25, fire: -0.2, freeze: 0.6, slow: 0.5 },
   },
 };
 
@@ -123,6 +129,29 @@ function depthMult(depth) {
 function pickBossId(depth) {
   const idx = Math.max(1, Math.round(depth / 5));
   return (idx % 2 === 1) ? 'slime_king' : 'bone_tyrant';
+}
+
+// ---------------------------------------------------------------------------
+// Resistances — ENEMY_TYPES[id].resist maps an element (core.js ELEMENTS: physical, arcane,
+// frost, fire, poison, lightning) or a status effect ('freeze', 'slow', ...) to a -0.75..0.8
+// modifier. Positive = resists (less damage / shorter effect), negative = vulnerable (more
+// damage / longer effect). Clamped so nothing is ever fully immune. Enemies with no `resist`
+// table (i.e. everything but the two bosses today) are simply neutral to everything.
+// ---------------------------------------------------------------------------
+const RESIST_MIN = -0.75;
+const RESIST_MAX = 0.8;
+
+export function getResist(enemy, key) {
+  if (!key) return 0;
+  const type = ENEMY_TYPES[enemy?.type];
+  const raw = type?.resist?.[key] ?? 0;
+  return clamp(raw, RESIST_MIN, RESIST_MAX);
+}
+
+// Scales a status-effect duration (freeze/slow/...) by the enemy's resist to that key.
+// Never returns a negative duration; a negative resist (vulnerability) lengthens it instead.
+export function applyResist(enemy, key, value) {
+  return Math.max(0, value * (1 - getResist(enemy, key)));
 }
 
 // ---------------------------------------------------------------------------
@@ -177,9 +206,16 @@ export function createEnemy(typeId, x, y, depth, rng, opts = {}) {
     slow: 0,
     frozen: 0,
     hitFlash: 0,
+    _kbTime: 0, // cosmetic: renderer.js eases the tile-knockback slide over this window
     dead: false,
     deathTimer: 0,
     elite,
+
+    // --- boss-only bookkeeping (harmless on regular enemies) ---
+    _hopTime: 0, _hopFrom: null, _hopDur: 0, // cosmetic: renderer.js arcs a boss leap over this window
+    _dazedTime: 0, _vulnMult: 1,             // Bone Tyrant post-charge "Dazed" vulnerability window
+    _phase: 1, _noticed: false,
+    _activeAttack: null, _atkSub: null, _atkTimer: 0, _lastAttack: null, _gapTimer: 0,
 
     // --- internal AI bookkeeping (extra fields beyond §10; harmless, ignored by other modules) ---
     _wanderTimer: rng.range(0.2, 1.2),
@@ -190,7 +226,6 @@ export function createEnemy(typeId, x, y, depth, rng, opts = {}) {
     _windup: 0,
     _cast: 0,
     _blinkCd: 0,
-    _summoned: false,
     _thinkAccum: rng.range(0, 0.3),
   };
 }
@@ -439,34 +474,10 @@ function fireProjectile(game, e, type, p) {
   });
 }
 
-function fireVolley(game, e, type, p, spreadCount = 3, spreadAngle = 0.28) {
-  if (!game.hasLineOfSight(e.x, e.y, p.x, p.y)) return;
-  const r = type.ranged || {};
-  const base = Math.atan2(p.y - e.y, p.x - e.x);
-  const mid = (spreadCount - 1) / 2;
-  for (let i = 0; i < spreadCount; i++) {
-    const a = base + (i - mid) * spreadAngle;
-    game.spawnProjectile({
-      x: e.x, y: e.y,
-      dx: Math.cos(a), dy: Math.sin(a),
-      speed: r.speed ?? 7,
-      range: r.range ?? 10,
-      traveled: 0,
-      damage: e.attack,
-      crit: false,
-      owner: 'enemy',
-      color: r.color ?? '#ff8844',
-      size: r.size ?? 0.22,
-      pierce: 0,
-      kind: r.kind ?? 'enemyBolt',
-      hit: new Set(),
-    });
-  }
-}
-
-function summonMinions(game, e, type) {
+function summonMinions(game, e, type, opts = {}) {
   const minionId = type.summon ?? 'slime';
-  const n = 2 + (game.rng.chance(0.5) ? 1 : 0);
+  const [nMin, nMax] = opts.count || [2, 3];
+  const n = game.rng.int(nMin, nMax);
   for (let i = 0; i < n; i++) {
     for (let tries = 0; tries < 8; tries++) {
       const ang = game.rng.range(0, Math.PI * 2);
@@ -679,48 +690,338 @@ function updateReturn(game, e, type, dt) {
   moveAlongPathToward(game, e, type, e.home.x, e.home.y, dt, false);
 }
 
+// ---------------------------------------------------------------------------
+// Boss AI — unique telegraphed attack patterns per boss, driven by a shared
+// notice/phase/gap/attack state machine. All hit checks against the player use the
+// float position (p.fx/p.fy, falling back to p.x/p.y) so dodging with the stick is fair.
+// ---------------------------------------------------------------------------
+const BOSS_ATTACK_GAP = [0.8, 1.5];       // idle/walk gap between attacks, for readability
+const BOSS_PHASE2_HP_FRAC = 0.5;
+const BOSS_PHASE2_CADENCE_MULT = 0.75;    // ~25% shorter gap between attacks in phase 2
+const TELEGRAPH_COLOR = '#ff3b3b';        // every danger zone uses one readable red, whatever the boss/floor colour
+const BOSS_FLAVOR = {
+  slime_king: 'The ooze rises, crowned and hungry.',
+  bone_tyrant: 'Bones rattle. The Tyrant awakens.',
+};
+
+function playerPos(p) {
+  return { x: p.fx ?? p.x, y: p.fy ?? p.y };
+}
+
+// Perpendicular distance of (px,py) from the ray starting at (ox,oy) along unit dir (ux,uy),
+// plus how far along the ray the closest point sits (negative/over-length means "off the end").
+function lineHit(px, py, ox, oy, ux, uy) {
+  const relx = px - ox, rely = py - oy;
+  const proj = relx * ux + rely * uy;
+  const perp = Math.abs(relx * uy - rely * ux);
+  return { proj, perp };
+}
+
+// --- Slime King -------------------------------------------------------------------
+const SK_HOP_TELEGRAPH = 0.85;
+const SK_HOP_RADIUS = 1.8;
+const SK_HOP_LEAP_TIME = 0.35;
+const SK_HOP_DAMAGE_MULT = 1.5;
+const SK_GLOB_TELEGRAPH = 0.35;
+const SK_GLOB_COUNT = 8;
+const SK_GLOB_COUNT_P2 = 16;
+const SK_GLOB_SPEED = 3.4;
+const SK_GLOB_RANGE = 8;
+const SK_GLOB_DAMAGE_MULT = 0.6;
+const SK_SPLIT_COUNT = [3, 4];
+
+function skHopBegin(game, e) {
+  const p = game.player;
+  const { x: px, y: py } = playerPos(p);
+  let tx = Math.round(px), ty = Math.round(py);
+  if (!game.isWalkable(tx, ty)) { tx = e.x; ty = e.y; }
+  e._hopTargetX = tx;
+  e._hopTargetY = ty;
+  game.effect('telegraphCircle', px, py, { radius: SK_HOP_RADIUS, duration: SK_HOP_TELEGRAPH, color: TELEGRAPH_COLOR });
+  e._atkSub = 'telegraph';
+  e._atkTimer = SK_HOP_TELEGRAPH;
+}
+function skHopTick(game, e, type, dt) {
+  const p = game.player;
+  if (e._atkSub === 'telegraph') {
+    e._atkTimer -= dt;
+    if (e._atkTimer <= 0) {
+      e._hopFrom = { x: e.x, y: e.y };
+      e.x = e._hopTargetX;
+      e.y = e._hopTargetY;
+      e._hopDur = SK_HOP_LEAP_TIME;
+      e._hopTime = SK_HOP_LEAP_TIME; // renderer.js arcs the visual leap over this window
+      e._atkSub = 'airborne';
+      e._atkTimer = SK_HOP_LEAP_TIME;
+    }
+    return false;
+  }
+  // airborne
+  e._atkTimer -= dt;
+  if (e._atkTimer > 0) return false;
+  if (p && !p.dead) {
+    const { x: px, y: py } = playerPos(p);
+    if (dist(e.x, e.y, px, py) <= SK_HOP_RADIUS + 0.35) {
+      game.damagePlayer(Math.round(e.attack * SK_HOP_DAMAGE_MULT), e);
+    }
+  }
+  game.effect('nova', e.x, e.y, { radius: SK_HOP_RADIUS, color: '#3fae62' });
+  game.bus?.emit('bossSlam');
+  return true;
+}
+
+function skGlobBegin(game, e) {
+  game.effect('hit', e.x, e.y, { telegraph: true, color: '#4fd67a' });
+  e._atkTimer = SK_GLOB_TELEGRAPH;
+}
+function skGlobTick(game, e, type, dt) {
+  e._atkTimer -= dt;
+  if (e._atkTimer > 0) return false;
+  const count = e._phase >= 2 ? SK_GLOB_COUNT_P2 : SK_GLOB_COUNT;
+  e._globToggle = !e._globToggle;
+  const baseOffset = e._globToggle ? Math.PI / count : 0; // alternate the ring each cast
+  for (let i = 0; i < count; i++) {
+    const a = baseOffset + (i / count) * Math.PI * 2;
+    game.spawnProjectile({
+      x: e.x, y: e.y, dx: Math.cos(a), dy: Math.sin(a),
+      speed: SK_GLOB_SPEED, range: SK_GLOB_RANGE, traveled: 0,
+      damage: Math.max(1, Math.round(e.attack * SK_GLOB_DAMAGE_MULT)), crit: false, owner: 'enemy',
+      color: '#7be89a', size: 0.22, pierce: 0, kind: 'enemyBolt', hit: new Set(),
+    });
+  }
+  return true;
+}
+
+// Split fires once immediately on the phase-2 transition (see bossEnterPhase2), but is also a
+// low-weight rotation option afterward so phase 2 genuinely gains an extra attack, not just a
+// one-off — an occasional smaller top-up of reinforcements.
+const SK_SPLIT_TOPUP_COUNT = [2, 3];
+function skSplitBegin(game, e, type) { summonMinions(game, e, type, { count: SK_SPLIT_TOPUP_COUNT }); }
+function skSplitTick() { return true; }
+
+const SLIME_KING_ATTACKS = [
+  { id: 'hopSlam', weight: 3, minPhase: 1, begin: skHopBegin, tick: skHopTick },
+  { id: 'globSpray', weight: 2, minPhase: 1, begin: skGlobBegin, tick: skGlobTick },
+  { id: 'split', weight: 1, minPhase: 2, begin: skSplitBegin, tick: skSplitTick },
+];
+
+// --- Bone Tyrant --------------------------------------------------------------------
+const BT_SPEAR_TELEGRAPH = 0.8;
+const BT_SPEAR_LEN = 7;
+const BT_SPEAR_WIDTH = 1;
+const BT_SPEAR_ANGLES = [-25, 0, 25].map((d) => d * Math.PI / 180);
+const BT_SPEAR_ANGLES_P2 = [-50, -25, 0, 25, 50].map((d) => d * Math.PI / 180);
+const BT_SPEAR_DAMAGE_MULT = 1.0;
+const BT_CHARGE_TELEGRAPH = 0.75;
+const BT_CHARGE_TILES = 5;
+const BT_CHARGE_STEP_TIME = 0.06;
+const BT_CHARGE_DAMAGE_MULT = 1.3;
+const BT_CHARGE_DAZE = 1.0;
+const BT_CHARGE_VULN_MULT = 1.25;
+const BT_SPIRAL_DURATION = 2.0;
+const BT_SPIRAL_ARMS = 2;
+const BT_SPIRAL_RATE = 9; // projectiles/sec, split across arms
+const BT_SPIRAL_SPEED = 5.5;
+const BT_SPIRAL_RANGE = 9;
+const BT_SPIRAL_DAMAGE_MULT = 0.55;
+const BT_SPIRAL_TURNS = 2.5;
+const BT_SPIRAL_SUMMON_COUNT = [2, 3];
+
+// How far a straight lane from (ox,oy) along unit (ux,uy) runs before hitting a wall, capped at max.
+// Spears/charge lanes stop at walls, both visually and for damage.
+function laneLength(game, ox, oy, ux, uy, max) {
+  const step = 0.25;
+  for (let d = step; d <= max; d += step) {
+    if (!game.isWalkable(Math.round(ox + ux * d), Math.round(oy + uy * d))) return Math.max(0.5, d - 0.5);
+  }
+  return max;
+}
+
+function btSpearsBegin(game, e) {
+  const { x: px, y: py } = playerPos(game.player);
+  const base = Math.atan2(py - e.y, px - e.x);
+  const angles = e._phase >= 2 ? BT_SPEAR_ANGLES_P2 : BT_SPEAR_ANGLES;
+  e._spearLines = angles.map((off) => {
+    const a = base + off;
+    const ux = Math.cos(a), uy = Math.sin(a);
+    return { ux, uy, len: laneLength(game, e.x, e.y, ux, uy, BT_SPEAR_LEN) };
+  });
+  for (const line of e._spearLines) {
+    game.effect('telegraphLine', e.x, e.y, { dx: line.ux, dy: line.uy, length: line.len, width: BT_SPEAR_WIDTH, duration: BT_SPEAR_TELEGRAPH, color: TELEGRAPH_COLOR });
+  }
+  e._atkTimer = BT_SPEAR_TELEGRAPH;
+}
+function btSpearsTick(game, e, type, dt) {
+  e._atkTimer -= dt;
+  if (e._atkTimer > 0) return false;
+  const p = game.player;
+  if (p && !p.dead) {
+    const { x: px, y: py } = playerPos(p);
+    for (const line of e._spearLines || []) {
+      const { proj, perp } = lineHit(px, py, e.x, e.y, line.ux, line.uy);
+      if (proj < -0.4 || proj > line.len + 0.2) continue;
+      if (perp <= BT_SPEAR_WIDTH / 2 + 0.3) {
+        game.damagePlayer(Math.round(e.attack * BT_SPEAR_DAMAGE_MULT), e);
+        break;
+      }
+    }
+  }
+  e._spearLines = null;
+  game.bus?.emit('bossSlam');
+  return true;
+}
+
+function btChargeBegin(game, e) {
+  const { x: px, y: py } = playerPos(game.player);
+  const dx = px - e.x, dy = py - e.y;
+  const len = Math.hypot(dx, dy) || 1;
+  e._chargeDir = { x: dx / len, y: dy / len };
+  const lane = laneLength(game, e.x, e.y, e._chargeDir.x, e._chargeDir.y, BT_CHARGE_TILES);
+  game.effect('telegraphLine', e.x, e.y, { dx: e._chargeDir.x, dy: e._chargeDir.y, length: lane, width: 1, duration: BT_CHARGE_TELEGRAPH, color: TELEGRAPH_COLOR });
+  e._atkSub = 'telegraph';
+  e._atkTimer = BT_CHARGE_TELEGRAPH;
+  e._chargeSteps = BT_CHARGE_TILES;
+  e._chargeStepTimer = 0;
+  e._chargeHit = false;
+}
+function btFinishCharge(game, e) {
+  e._dazedTime = BT_CHARGE_DAZE;
+  e._vulnMult = BT_CHARGE_VULN_MULT;
+  game.floatText(e.x, e.y - 0.5, 'Dazed', '#ffdd66');
+  game.bus?.emit('bossSlam');
+  return true;
+}
+function btChargeTick(game, e, type, dt) {
+  const p = game.player;
+  if (e._atkSub === 'telegraph') {
+    e._atkTimer -= dt;
+    if (e._atkTimer <= 0) e._atkSub = 'charging';
+    return false;
+  }
+  e._chargeStepTimer -= dt;
+  if (e._chargeStepTimer > 0) return false;
+  if (e._chargeSteps <= 0) return btFinishCharge(game, e);
+  const nx = Math.round(e.x + e._chargeDir.x), ny = Math.round(e.y + e._chargeDir.y);
+  const blocker = game.enemyAt(nx, ny);
+  if (!game.isWalkable(nx, ny) || (blocker && blocker !== e)) return btFinishCharge(game, e);
+  e.x = nx; e.y = ny;
+  e._chargeSteps--;
+  e._chargeStepTimer = BT_CHARGE_STEP_TIME;
+  if (!e._chargeHit && p && !p.dead) {
+    const { x: px, y: py } = playerPos(p);
+    if (dist(e.x, e.y, px, py) <= 0.9) {
+      game.damagePlayer(Math.round(e.attack * BT_CHARGE_DAMAGE_MULT), e);
+      e._chargeHit = true;
+    }
+  }
+  if (e._chargeSteps <= 0) return btFinishCharge(game, e);
+  return false;
+}
+
+function btSpiralBegin(game, e, type) {
+  e._spiralT = 0;
+  e._spiralFireAccum = 0;
+  e._spiralAngle0 = Math.random() * Math.PI * 2;
+  summonMinions(game, e, type, { count: BT_SPIRAL_SUMMON_COUNT });
+}
+function btSpiralTick(game, e, type, dt) {
+  e._spiralT += dt;
+  e._spiralFireAccum += dt;
+  const interval = 1 / BT_SPIRAL_RATE;
+  while (e._spiralFireAccum >= interval && e._spiralT <= BT_SPIRAL_DURATION) {
+    e._spiralFireAccum -= interval;
+    const frac = e._spiralT / BT_SPIRAL_DURATION;
+    const ang = e._spiralAngle0 + frac * Math.PI * 2 * BT_SPIRAL_TURNS;
+    for (let arm = 0; arm < BT_SPIRAL_ARMS; arm++) {
+      const a = ang + arm * (Math.PI * 2 / BT_SPIRAL_ARMS);
+      game.spawnProjectile({
+        x: e.x, y: e.y, dx: Math.cos(a), dy: Math.sin(a),
+        speed: BT_SPIRAL_SPEED, range: BT_SPIRAL_RANGE, traveled: 0,
+        damage: Math.max(1, Math.round(e.attack * BT_SPIRAL_DAMAGE_MULT)), crit: false, owner: 'enemy',
+        color: '#cfcfc0', size: 0.2, pierce: 0, kind: 'enemyBolt', hit: new Set(),
+      });
+    }
+  }
+  return e._spiralT >= BT_SPIRAL_DURATION;
+}
+
+const BONE_TYRANT_ATTACKS = [
+  { id: 'boneSpears', weight: 3, minPhase: 1, begin: btSpearsBegin, tick: btSpearsTick },
+  { id: 'boneCharge', weight: 2, minPhase: 1, begin: btChargeBegin, tick: btChargeTick },
+  { id: 'spiral', weight: 2, minPhase: 2, begin: btSpiralBegin, tick: btSpiralTick },
+];
+
+const BOSS_ATTACKS = { slime_king: SLIME_KING_ATTACKS, bone_tyrant: BONE_TYRANT_ATTACKS };
+
+function bossEnterPhase2(game, e, type) {
+  e._phase = 2;
+  game.effect('nova', e.x, e.y, { radius: 2.5, color: '#ff5555' });
+  game.floatText(e.x, e.y - 0.5, 'Enraged!', '#ff5555');
+  game.bus?.emit('bossPhase2', { enemy: e });
+  game.shake?.(0.3);
+  if (type.id === 'slime_king') summonMinions(game, e, type, { count: SK_SPLIT_COUNT });
+}
+
+function bossMoveOrIdle(game, e, type, dt) {
+  const p = game.player;
+  facePlayer(e, p);
+  if (dist(e.x, e.y, p.x, p.y) > 2.2) moveAlongPathToward(game, e, type, p.x, p.y, dt, true);
+}
+
+function pickBossAttack(game, e, table) {
+  const phase = e._phase || 1;
+  const inPhase = table.filter((a) => a.minPhase <= phase);
+  const notRepeat = inPhase.filter((a) => a.id !== e._lastAttack);
+  const pool = notRepeat.length ? notRepeat : inPhase;
+  return game.rng.weighted(pool.length ? pool : table, (a) => a.weight);
+}
+
 function updateBoss(game, e, type, dt) {
   const p = game.player;
   if (!p || p.dead) return;
 
-  if (e.attackTimer > 0) e.attackTimer = Math.max(0, e.attackTimer - dt);
-
-  if (e._windup > 0) {
-    e._windup -= dt;
-    if (e._windup <= 0) {
-      const d = dist(e.x, e.y, p.x, p.y);
-      if (d <= (type.slamRadius ?? 1.8)) {
-        game.damagePlayer(Math.round(e.attack * 1.6), e);
-      }
-      game.effect?.('nova', e.x, e.y, { radius: type.slamRadius ?? 1.8 });
-      e.attackTimer = e.attackCooldown;
+  // Intro: fires once, the first time the boss notices (or is debug-provoked toward) the player.
+  if (!e._noticed) {
+    const d = dist(e.x, e.y, p.x, p.y);
+    if (e.provoked || (d <= e.aggroRange && game.hasLineOfSight(e.x, e.y, p.x, p.y))) {
+      e._noticed = true;
+      game.bus?.emit('bossIntro', { enemy: e });
+      game.banner?.(e.name, BOSS_FLAVOR[type.id] || 'A powerful foe blocks your path.');
+      game.shake?.(0.35);
+    } else {
+      return; // dormant until it notices the player
     }
-    return; // frozen in place mid wind-up (telegraph gives player a chance to dash away)
   }
+
+  if (e._phase === 1 && e.hp <= e.maxHp * BOSS_PHASE2_HP_FRAC) bossEnterPhase2(game, e, type);
 
   facePlayer(e, p);
 
-  if (!e._summoned && e.hp <= e.maxHp * 0.5) {
-    e._summoned = true;
-    summonMinions(game, e, type);
-  }
+  const table = BOSS_ATTACKS[type.id];
+  if (!table) return; // no pattern table defined for this boss id — sit still rather than throw
 
-  const d = dist(e.x, e.y, p.x, p.y);
-  if (d <= (type.meleeRange ?? 1.5)) {
-    if (e.attackTimer <= 0) {
-      e._windup = type.windup ?? 0.6;
-      game.effect?.('hit', e.x, e.y, { telegraph: true, color: '#ff3b3b' });
+  if (e._activeAttack) {
+    const atk = table.find((a) => a.id === e._activeAttack);
+    const done = atk ? atk.tick(game, e, type, dt) : true;
+    if (done) {
+      e._lastAttack = e._activeAttack;
+      e._activeAttack = null;
+      const gap = game.rng.range(BOSS_ATTACK_GAP[0], BOSS_ATTACK_GAP[1]);
+      e._gapTimer = e._phase >= 2 ? gap * BOSS_PHASE2_CADENCE_MULT : gap;
     }
     return;
   }
 
-  if (e.attackTimer <= 0 && game.hasLineOfSight(e.x, e.y, p.x, p.y)) {
-    fireVolley(game, e, type, p);
-    e.attackTimer = e.attackCooldown;
+  if (e._gapTimer > 0) {
+    e._gapTimer -= dt;
+    bossMoveOrIdle(game, e, type, dt);
     return;
   }
 
-  moveAlongPathToward(game, e, type, p.x, p.y, dt, true);
+  const chosen = pickBossAttack(game, e, table);
+  e._activeAttack = chosen.id;
+  e._atkSub = null;
+  chosen.begin(game, e, type);
 }
 
 // ---------------------------------------------------------------------------
@@ -740,6 +1041,12 @@ export function updateEnemies(game, dt) {
     // Cosmetic/status timers always tick.
     if (e.hitFlash > 0) e.hitFlash = Math.max(0, e.hitFlash - dt);
     if (e.slow > 0) e.slow = Math.max(0, e.slow - dt);
+    if (e._kbTime > 0) e._kbTime = Math.max(0, e._kbTime - dt);
+    if (e._hopTime > 0) e._hopTime = Math.max(0, e._hopTime - dt); // renderer.js arcs the leap over this
+    if (e._dazedTime > 0) {
+      e._dazedTime = Math.max(0, e._dazedTime - dt);
+      if (e._dazedTime <= 0) e._vulnMult = 1;
+    }
 
     if (e.frozen > 0) {
       e.frozen = Math.max(0, e.frozen - dt);

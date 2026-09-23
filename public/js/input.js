@@ -22,6 +22,7 @@ const ACTION_KEYS = {
   drop: ['KeyQ', 'Delete'],
   potion: ['KeyH'],
   mana_potion: ['KeyM'],
+  mute: ['KeyU'], // 'M' is already bound to mana_potion, so mute uses U instead
 };
 
 // Gamepad action -> array of standard-mapping button indices.
@@ -30,8 +31,8 @@ const ACTION_BUTTONS = {
   skill2: [2],  // X
   skill3: [3],  // Y
   skill4: [1],  // B
-  character: [8, 5], // Back/View or RB
-  inventory: [4],    // LB
+  character: [8, 4], // Back/View or LB
+  inventory: [5],    // RB
   pause: [9],        // Start
   confirm: [0],      // A
   cancel: [1],       // B
@@ -58,6 +59,7 @@ const PREVENT_DEFAULT_CODES = new Set([
 ]);
 
 const GAMEPAD_DEADZONE = 0.5;
+const STICK_DEADZONE = 0.22; // radial deadzone for analog (free) movement
 const UI_REPEAT_DELAY = 0.35; // seconds before first auto-repeat
 const UI_REPEAT_INTERVAL = 0.12; // seconds between subsequent auto-repeats
 
@@ -164,6 +166,7 @@ export class Input {
     const pads = (typeof navigator !== 'undefined' && navigator.getGamepads) ? navigator.getGamepads() : [];
     let pad = null;
     for (let i = 0; i < pads.length; i++) { if (pads[i]) { pad = pads[i]; break; } }
+    this._stick = null;
 
     this._padButtonsPrev = this._padButtonsNow;
     this._padButtonsNow = {};
@@ -193,6 +196,13 @@ export class Input {
       // Left stick: dominant axis wins, deadzone 0.5.
       const ax = pad.axes[0] || 0;
       const ay = pad.axes[1] || 0;
+      // Free-movement vector: radial deadzone, magnitude rescaled to 0..1.
+      const len = Math.hypot(ax, ay);
+      if (len > STICK_DEADZONE) {
+        const mag = Math.min(1, (len - STICK_DEADZONE) / (1 - STICK_DEADZONE));
+        this._stick = { x: ax / len, y: ay / len, mag };
+        padActive = true;
+      }
       if (Math.abs(ax) > Math.abs(ay)) {
         if (Math.abs(ax) > GAMEPAD_DEADZONE) { padDir[ax < 0 ? 'left' : 'right'] = true; padActive = true; }
       } else {
@@ -248,6 +258,14 @@ export class Input {
     const dir = this._moveStack[this._moveStack.length - 1];
     const v = DIRS[dir];
     return v ? { x: v.x, y: v.y } : null;
+  }
+
+  // -------------------------------------------------------------------
+  // analogMove() -> {x,y,mag}|null   Left-stick direction (unit vector) and
+  // push strength 0..1, for free (non-tile) movement. Null inside the deadzone.
+  // -------------------------------------------------------------------
+  analogMove() {
+    return this.stickOverride || this._stick || null; // stickOverride: debug/testing hook
   }
 
   // -------------------------------------------------------------------

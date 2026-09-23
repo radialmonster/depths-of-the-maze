@@ -3,6 +3,7 @@
 // floatText, log, isFree, isWalkable, rng, bus, player).
 
 import { computeDamage } from './character.js';
+import { applyResist } from './enemies.js';
 
 // ---------------------------------------------------------------------------
 // Tuning constants
@@ -81,6 +82,7 @@ export function useSkill(game, index) {
   if (skill.manaCost > 0 && player.mana < skill.manaCost) {
     if (player._noManaFlashTimer <= 0) {
       if (typeof game.floatText === 'function') game.floatText(player.x, player.y, 'No mana', '#6af');
+      try { game.bus && game.bus.emit('denied'); } catch (e) { /* ignore */ }
       player._noManaFlashTimer = NO_MANA_FLASH_THROTTLE;
     }
     return false;
@@ -204,7 +206,7 @@ function castCleave(game, player, skill) {
     const power = rng.range(player.stats.meleeMin, player.stats.meleeMax) * mult;
     const { amount, crit } = computeDamage(power, enemy.defense, rng, critChance, critMult);
     const doKnockback = skill.rank >= 3 || crit;
-    const opts = { crit, source: 'melee' };
+    const opts = { crit, source: 'melee', element: 'physical' };
     if (doKnockback) opts.knockback = { x: facing.x, y: facing.y };
     if (typeof game.damageEnemy === 'function') game.damageEnemy(enemy, amount, opts);
   }
@@ -228,11 +230,13 @@ function castArcaneBolt(game, player, skill) {
   amount = Math.max(1, Math.round(amount));
 
   const pierce = skill.rank >= 5 ? 2 : skill.rank >= 3 ? 1 : 0;
+  // Analog stick play aims freely (player.aim) from the free-movement position (fx/fy).
+  const aim = player.aim || facing;
 
   if (typeof game.spawnProjectile === 'function') {
     game.spawnProjectile({
-      x: player.x, y: player.y,
-      dx: facing.x, dy: facing.y,
+      x: player.fx ?? player.x, y: player.fy ?? player.y,
+      dx: aim.x, dy: aim.y,
       speed: BOLT_SPEED,
       range: BOLT_RANGE,
       damage: amount,
@@ -243,6 +247,7 @@ function castArcaneBolt(game, player, skill) {
       size: 0.22,
       pierce,
       kind: 'bolt',
+      element: 'arcane',
     });
   }
   return true;
@@ -261,9 +266,12 @@ function castFrostNova(game, player, skill) {
   for (const enemy of enemies) {
     const power = player.stats.spellPower * mult;
     const { amount, crit } = computeDamage(power, enemy.defense, rng, critChance, critMult);
-    if (typeof game.damageEnemy === 'function') game.damageEnemy(enemy, amount, { crit, source: 'spell' });
-    enemy.frozen = frozen;
-    enemy.slow = NOVA_SLOW;
+    if (typeof game.damageEnemy === 'function') game.damageEnemy(enemy, amount, { crit, source: 'spell', element: 'frost' });
+    // Status-effect durations scale by the target's resist to that effect (enemies.js
+    // ENEMY_TYPES.resist) — e.g. Bone Tyrant shrugs off most of the freeze/slow, Slime King
+    // barely resists either. Regular enemies have no resist table, so this is a no-op for them.
+    enemy.frozen = applyResist(enemy, 'freeze', frozen);
+    enemy.slow = applyResist(enemy, 'slow', NOVA_SLOW);
   }
 
   if (typeof game.effect === 'function') game.effect('nova', player.x, player.y, { radius });

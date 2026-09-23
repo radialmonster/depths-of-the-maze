@@ -19,6 +19,20 @@ export const RARITY = Object.freeze({
 });
 export const RARITY_ORDER = ['common', 'magic', 'rare', 'epic', 'legendary'];
 
+// Damage elements. Only 'physical' (Cleave), 'arcane' (Arcane Bolt) and 'frost' (Frost Nova)
+// are dealt by anything today — fire/poison/lightning are reserved for future skills/gear, but
+// the resist system and UI labels already support them (ENEMY_TYPES.resist, enemies.js
+// getResist/applyResist).
+export const ELEMENTS = Object.freeze({
+  physical:  { id: 'physical',  name: 'Physical',  color: '#c8c8c8' },
+  arcane:    { id: 'arcane',    name: 'Arcane',    color: '#a86bff' },
+  frost:     { id: 'frost',     name: 'Frost',     color: '#66ccff' },
+  fire:      { id: 'fire',      name: 'Fire',      color: '#ff7043' },
+  poison:    { id: 'poison',    name: 'Poison',    color: '#66bb6a' },
+  lightning: { id: 'lightning', name: 'Lightning', color: '#ffd43b' },
+});
+export const ELEMENT_ORDER = ['physical', 'arcane', 'frost', 'fire', 'poison', 'lightning'];
+
 function mulberry32(a) {
   return function () {
     a |= 0; a = (a + 0x6D2B79F5) | 0;
@@ -73,6 +87,9 @@ export class EventBus {
 
 let _uid = 1;
 export const uid = () => _uid++;
+// Bumps the id counter past `min` so items/enemies/projectiles created after loading a save
+// never collide with ids already saved on the player's equipment/inventory.
+export const bumpUid = (min) => { if (min >= _uid) _uid = min + 1; };
 
 export const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 export const lerp = (a, b, t) => a + (b - a) * t;

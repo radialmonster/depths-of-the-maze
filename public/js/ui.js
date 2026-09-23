@@ -8,12 +8,39 @@
 import { ATTRIBUTES, xpForLevel, spendAttribute } from './character.js';
 import { upgradeSkill, skillDescription } from './skills.js';
 import { equipItem, unequipItem, useItem, dropItem, sellValue, itemTooltip, SLOTS, INVENTORY_SIZE } from './items.js';
-import { RARITY, clamp, TILE } from './core.js';
+import { buyFromMerchant, sellToMerchant, nearbyMerchant, shopPrice } from './shop.js';
+import { RARITY, clamp, TILE, ELEMENTS, ELEMENT_ORDER } from './core.js';
+import { ENEMY_TYPES } from './enemies.js';
+import { sfx } from './audio.js';
 
 const SKILL_KEY_LABEL = ['1', '2', '3', '4'];
 const SKILL_PAD_LABEL = ['A', 'X', 'Y', 'B'];
 const PAD_COLOR = { A: '#3ecf5a', B: '#e05a4e', X: '#3e8cf0', Y: '#e0c23e' };
 const INV_COLS = 8;
+
+const HIT_VIGNETTE_DURATION = 0.35;   // seconds the on-hit red pulse takes to fade out
+const HIT_VIGNETTE_MAX_OPACITY = 0.85; // opacity at frac = 1 (a hit for the player's full HP)
+const RESIST_TAG_THRESHOLD = 0.2;      // |resist| at/above this shows up on the boss bar
+
+// "Weak: Frost, Fire · Resists: Physical" — built once per boss from ENEMY_TYPES[id].resist,
+// each element name tinted with its ELEMENTS color so the tag doubles as a quick-read legend.
+function describeResistHTML(typeId) {
+  const resist = ENEMY_TYPES[typeId]?.resist;
+  if (!resist) return '';
+  const weak = [], strong = [];
+  for (const key of ELEMENT_ORDER) {
+    const v = resist[key];
+    if (v == null) continue;
+    const el = ELEMENTS[key];
+    const span = `<span style="color:${el.color}">${el.name}</span>`;
+    if (v >= RESIST_TAG_THRESHOLD) strong.push(span);
+    else if (v <= -RESIST_TAG_THRESHOLD) weak.push(span);
+  }
+  const parts = [];
+  if (weak.length) parts.push(`Weak: ${weak.join(', ')}`);
+  if (strong.length) parts.push(`Resists: ${strong.join(', ')}`);
+  return parts.join(' &middot; ');
+}
 
 // Potion flask drawn as SVG (emoji potions render in platform colors — 🧪 is green on Windows).
 const POTION_LIQUID = { heal: '#f03e3e', mana: '#1c7ed6' };
@@ -56,8 +83,9 @@ const CONTROLS = [
   ['Skills', ['1', '2', '3', '4'], ['A', 'X', 'Y', 'B']],
   ['Health potion', ['H'], ['LT']],
   ['Mana potion', ['M'], ['RT']],
-  ['Character', ['C'], ['RB']],
-  ['Inventory', ['I'], ['LB']],
+  ['Trade', ['E'], ['A']],
+  ['Character', ['C'], ['LB']],
+  ['Inventory', ['I'], ['RB']],
   ['Pause', ['Esc'], ['Start']],
   ['Drop item', ['Q'], ['X']],
 ];
@@ -148,6 +176,13 @@ export class UI {
     this._invCursor = { area: 'grid', index: 0 };
     this._lastInvCursorKey = null;
 
+    this._shopOpen = false;
+    this._shopMerchant = null;
+    this._shopTab = 'buy';
+    this._shopCursor = 0;
+    this._lastShopCursorKey = null;
+    this._shopList = [];
+
     this._logLines = []; // {text, color, t, count}
     this._banner = null; // {title, subtitle, t}
 
@@ -158,9 +193,21 @@ export class UI {
     this._hpTrail = 1;
     this._hpTrailHold = 0;
 
+    this._bossId = null;       // id of the boss the top HUD bar is currently tracking, or null
+    this._bossBarShown = false;
+    this._bossHpTrail = 1;
+    this._bossHpTrailHold = 0;
+    this._prevBossHpPct = null;
+
+    this._hitFlashTimer = 0; // counts down HIT_VIGNETTE_DURATION after a pulseHit() call
+    this._hitFlashPeak = 0;  // damage-fraction (0..1) driving this pulse's peak opacity
+
     this._startActive = false;
-    this._startCallback = null;
+    this._startOnNew = null;
+    this._startOnContinue = null;
     this._startFired = false;
+    this._startSave = null;   // {depth, level} when a save exists, else null
+    this._startCursor = 0;    // 0 = Continue, 1 = New Game (only relevant with a save)
 
     this._pauseActive = false;
     this._pauseCallback = null;
@@ -200,6 +247,7 @@ export class UI {
     this.dom.scrim = scrim;
     this._buildCharacterPanel(root);
     this._buildInventoryPanel(root);
+    this._buildShopPanel(root);
     this._buildTooltip(root);
     this._buildOverlays(root);
     window.addEventListener('resize', () => { if (this._characterOpen || this._inventoryOpen) this._syncPanelSize(); });
@@ -232,7 +280,7 @@ export class UI {
     const canvas = mk('canvas', 'dm-minimap', mmCard);
     canvas.width = 220; canvas.height = 220;
     const mmLegend = mk('div', 'dm-mm-legend', mmCard);
-    for (const [cls, label] of [['you', 'You'], ['foe', 'Foe'], ['exit', 'Stairs']]) {
+    for (const [cls, label] of [['you', 'You'], ['foe', 'Foe'], ['exit', 'Stairs'], ['merchant', 'Merchant']]) {
       const l = mk('span', 'dm-mm-key', mmLegend);
       mk('i', `dm-mm-dot dm-mm-${cls}`, l);
       l.appendChild(document.createTextNode(label));
@@ -251,14 +299,33 @@ export class UI {
     btnC.addEventListener('click', () => this.toggleCharacter());
     btnI.addEventListener('click', () => this.toggleInventory());
 
+    // --- boss HP bar (top center, clear of the plate and minimap) ---
+    const bossBar = mk('div', 'dm-bossbar', hud);
+    const bossName = mk('div', 'dm-bossbar-name', bossBar, '');
+    const bossTrack = mk('div', 'dm-bossbar-track', bossBar);
+    const bossTrail = mk('div', 'dm-bossbar-trail', bossTrack);
+    const bossFill = mk('div', 'dm-bossbar-fill', bossTrack);
+    mk('div', 'dm-bossbar-notch', bossTrack);
+    const bossResist = mk('div', 'dm-bossbar-resist', bossBar, '');
+    const bossPhase = mk('div', 'dm-bossbar-phase', bossBar, '');
+
     // --- vignette ---
     const vignette = mk('div', 'dm-vignette', hud);
+    // Separate element for the brief on-hit pulse (see pulseHit()) so its opacity is driven
+    // directly frame-by-frame without fighting the low-HP element's CSS class/transition.
+    const hitVignette = mk('div', 'dm-vignette dm-hit-vignette', hud);
 
     // --- banner ---
     const banner = mk('div', 'dm-banner', hud);
     mk('div', 'dm-banner-rule', banner);
     const bannerTitle = mk('div', 'dm-banner-title', banner);
     const bannerSub = mk('div', 'dm-banner-sub', banner);
+
+    // --- merchant trade prompt ---
+    const tradePrompt = mk('div', 'dm-trade-prompt', hud, 'Trade — E');
+
+    // --- "sound is locked" hint (browsers need a click/key before audio can start) ---
+    const soundHint = mk('div', 'dm-sound-hint', hud, '🔇 Click or press any key to turn on sound');
 
     // --- combat log ---
     const log = mk('div', 'dm-log', hud);
@@ -326,7 +393,8 @@ export class UI {
     Object.assign(this.dom, {
       hud, lvl, lvlNum, depthText, goldChip, goldText, killsText, pointsPill,
       canvas, ctx: canvas.getContext('2d'), btnC, btnCKey, plusC, btnI, btnIKey, bagCount,
-      vignette, banner, bannerTitle, bannerSub,
+      bossBar, bossName, bossTrack, bossTrail, bossFill, bossResist, bossPhase,
+      vignette, hitVignette, banner, bannerTitle, bannerSub, tradePrompt, soundHint,
       log, logLines,
       hp, mana,
       skillSlots, potHeal, potMana,
@@ -486,6 +554,52 @@ export class UI {
     });
   }
 
+  // Standalone modal (not a Character/Inventory tab): its own header with Buy/Sell tabs,
+  // reusing the same panel shell classes and inventory-grid cell styling so it feels native.
+  _buildShopPanel(root) {
+    const panel = mk('div', 'dm-panel dm-shop', root);
+    const header = mk('div', 'dm-panel-header', panel);
+
+    const tabs = mk('div', 'dm-tabs', header);
+    const tabBuy = mk('button', 'dm-tab dm-tab-active', tabs);
+    mk('span', '', tabBuy, '🛒 Buy');
+    const tabSell = mk('button', 'dm-tab', tabs);
+    mk('span', '', tabSell, '💰 Sell');
+    tabBuy.addEventListener('click', () => this._setShopTab('buy'));
+    tabSell.addEventListener('click', () => this._setShopTab('sell'));
+
+    const extra = mk('div', 'dm-panel-extra', header);
+    mk('div', 'dm-shop-title', extra, '🧙 Merchant');
+    const goldText = mk('div', 'dm-inv-gold', extra, '🪙 0');
+    const closeBtn = mk('button', 'dm-panel-close', header, '✕');
+    closeBtn.title = 'Close (Esc)';
+    closeBtn.addEventListener('click', () => this.closeAll());
+
+    const body = mk('div', 'dm-panel-body dm-shop-body', panel);
+    const grid = mk('div', 'dm-inv-grid dm-shop-grid', body);
+    const cellEls = [];
+    for (let i = 0; i < INVENTORY_SIZE; i++) {
+      const cell = mk('div', 'dm-inv-cell dm-shop-cell', grid);
+      cell.dataset.index = String(i);
+      const badge = mk('div', 'dm-shop-badge', cell, '★ Featured');
+      const icon = mk('div', 'dm-inv-icon', cell, '');
+      const stack = mk('div', 'dm-inv-stack', cell, '');
+      const price = mk('div', 'dm-shop-price', cell, '');
+      cell.addEventListener('click', () => this._clickShopCell(i));
+      cell.addEventListener('mouseenter', (e) => this._hoverShopCell(i, e));
+      cell.addEventListener('mousemove', (e) => this._positionTooltip(e.clientX, e.clientY));
+      cell.addEventListener('mouseleave', () => this._hideTooltip());
+      cellEls.push({ cell, icon, stack, price, badge });
+    }
+
+    const foot = mk('div', 'dm-panel-foot', panel);
+
+    Object.assign(this.dom, {
+      shopPanel: panel, shopTabBuy: tabBuy, shopTabSell: tabSell,
+      shopGoldText: goldText, shopCells: cellEls, shopFoot: foot,
+    });
+  }
+
   _buildTooltip(root) {
     this.dom.tooltip = mk('div', 'dm-tooltip', root);
   }
@@ -499,12 +613,19 @@ export class UI {
     mk('span', 'dm-title-small', title, 'Depths of the');
     mk('span', 'dm-title-big', title, 'MAZE');
     mk('div', 'dm-tagline', startCard, 'Descend. Fight. Loot. Try not to die.');
-    const startBtn = mk('button', 'dm-btn dm-btn-primary', startCard, 'Enter the Maze');
-    mk('div', 'dm-press-any', startCard, 'or press any key / button');
+    const startBtnRow = mk('div', 'dm-start-btn-row', startCard);
+    const continueBtn = mk('button', 'dm-btn dm-btn-primary dm-start-hide', startBtnRow, 'Continue');
+    const startBtn = mk('button', 'dm-btn dm-btn-primary', startBtnRow, 'Enter the Maze');
+    const pressAny = mk('div', 'dm-press-any', startCard, 'or press any key / button');
+    const startHint = mk('div', 'dm-hint dm-start-hide', startCard, '');
+    // Browsers only allow audio after a click/key press, and gamepad buttons don't count.
+    const startSound = mk('div', 'dm-start-sound', startCard, '🎮 Playing with a controller? Click anywhere once to turn on sound.');
     buildControlsTable(startCard);
     mk('div', 'dm-hint', startCard, 'Walk into enemies to attack · Find the glowing stairs to descend · Every 5th depth hides a boss');
-    start.addEventListener('click', () => this._fireStart());
-    startBtn.addEventListener('click', (e) => { e.stopPropagation(); this._fireStart(); });
+    // Backdrop click only starts a fresh run when there's nothing to accidentally overwrite.
+    start.addEventListener('click', () => { if (!this._startSave) this._fireStart('new'); });
+    continueBtn.addEventListener('click', (e) => { e.stopPropagation(); this._fireStart('continue'); });
+    startBtn.addEventListener('click', (e) => { e.stopPropagation(); this._fireStart('new'); });
 
     // Pause screen.
     const pause = mk('div', 'dm-overlay dm-pause', root);
@@ -512,7 +633,8 @@ export class UI {
     mk('div', 'dm-title dm-title-sm', pauseCard, 'Paused');
     const pauseStats = mk('div', 'dm-pause-stats', pauseCard, '');
     const resumeBtn = mk('button', 'dm-btn dm-btn-primary', pauseCard, 'Resume');
-    mk('div', 'dm-hint', pauseCard, 'Esc / P / Start to resume');
+    mk('div', 'dm-hint', pauseCard, 'Esc / P / Start to resume · U to mute sound');
+    mk('div', 'dm-hint', pauseCard, 'Progress saves automatically at each new depth');
     buildControlsTable(pauseCard);
     resumeBtn.addEventListener('click', () => { if (this._pauseCallback) this._pauseCallback(); });
 
@@ -540,6 +662,11 @@ export class UI {
     retryBtn.addEventListener('click', () => this._fireDeath());
 
     this.dom.start = start;
+    this.dom.continueBtn = continueBtn;
+    this.dom.startBtn = startBtn;
+    this.dom.pressAny = pressAny;
+    this.dom.startHint = startHint;
+    this.dom.startSound = startSound;
     this.dom.pause = pause;
     this.dom.pauseStats = pauseStats;
     this.dom.death = death;
@@ -551,21 +678,37 @@ export class UI {
   // Public API — panel toggling
   // =====================================================================
   toggleCharacter() {
-    if (this._characterOpen) { this._characterOpen = false; }
-    else { this._inventoryOpen = false; this._characterOpen = true; this._charCursor = 0; this._lastCharCursor = -1; }
+    if (this._characterOpen) { this._characterOpen = false; sfx.uiClick(); }
+    else { this._inventoryOpen = false; this._characterOpen = true; this._charCursor = 0; this._lastCharCursor = -1; sfx.uiOpen(); }
     if (this._characterOpen) this._syncPanelSize();
     this._applyPanelVisibility();
   }
 
   toggleInventory() {
-    if (this._inventoryOpen) { this._inventoryOpen = false; }
+    if (this._inventoryOpen) { this._inventoryOpen = false; sfx.uiClick(); }
     else {
       this._characterOpen = false; this._inventoryOpen = true; this._invCursor = { area: 'grid', index: 0 };
       // Gamepad users get the cursor tooltip immediately; keyboard/mouse users only once they move the cursor.
       this._lastInvCursorKey = this.input && this.input.lastDevice === 'gamepad' ? null : 'grid:0';
+      sfx.uiOpen();
     }
     if (this._inventoryOpen) this._syncPanelSize();
     this._applyPanelVisibility();
+  }
+
+  openShop(merchant) {
+    if (!merchant) return;
+    this._characterOpen = false;
+    this._inventoryOpen = false;
+    this._shopOpen = true;
+    this._shopMerchant = merchant;
+    this._shopTab = 'buy';
+    this._shopCursor = 0;
+    // Gamepad users get the cursor tooltip immediately; keyboard/mouse users only once they move the cursor.
+    this._lastShopCursorKey = this._initialShopCursorKey();
+    sfx.uiOpen();
+    this._applyPanelVisibility();
+    this._refreshShopPanel();
   }
 
   _cycleTab(dir) {
@@ -591,17 +734,21 @@ export class UI {
   closeAll() {
     this._characterOpen = false;
     this._inventoryOpen = false;
+    if (this._shopOpen) sfx.uiClick();
+    this._shopOpen = false;
+    this._shopMerchant = null;
     this._applyPanelVisibility();
     this._hideTooltip();
   }
 
   isModalOpen() {
-    return this._characterOpen || this._inventoryOpen;
+    return this._characterOpen || this._inventoryOpen || this._shopOpen;
   }
 
   _applyPanelVisibility() {
     this.dom.charPanel.classList.toggle('dm-open', this._characterOpen);
     this.dom.invPanel.classList.toggle('dm-open', this._inventoryOpen);
+    this.dom.shopPanel.classList.toggle('dm-open', this._shopOpen);
     this.dom.scrim.classList.toggle('dm-open', this.isModalOpen());
     this._hideTooltip();
   }
@@ -626,6 +773,13 @@ export class UI {
   banner(title, subtitle) {
     this._banner = { title: title || '', subtitle: subtitle || '', t: now() };
     flash(this.dom.banner, 'dm-banner-in');
+  }
+
+  // Brief red vignette pulse when the player takes a hit, scaled by how much of their max HP
+  // the hit cost (0..1). Independent of the slow low-HP pulse driven by _updateHud().
+  pulseHit(frac) {
+    this._hitFlashPeak = Math.max(this._hitFlashPeak, clamp(frac, 0, 1));
+    this._hitFlashTimer = HIT_VIGNETTE_DURATION;
   }
 
   // =====================================================================
@@ -653,6 +807,7 @@ export class UI {
     this._pauseCallback = onResume;
     this._pauseActive = true;
     this._hideTooltip();
+    sfx.uiOpen();
     const g = this.game, p = g && g.player;
     this.dom.pauseStats.textContent = p
       ? `Depth ${g.depth} · Level ${p.level} · ${(g.stats && g.stats.kills) || 0} kills · ${fmtTime(g.stats && g.stats.timePlayed)}`
@@ -663,24 +818,51 @@ export class UI {
   hidePause() {
     this._pauseActive = false;
     this.dom.pause.classList.remove('dm-open');
+    sfx.uiClick();
   }
 
-  showStart(onStart) {
-    this._startCallback = onStart;
+  // showStart({ onNew, onContinue, save }) — save is {depth, level} when a save exists (shows
+  // a Continue/New Game chooser), or falsy to keep the single "Enter the Maze" behavior.
+  showStart({ onNew, onContinue, save } = {}) {
+    this._startOnNew = onNew;
+    this._startOnContinue = onContinue;
+    this._startSave = save || null;
     this._startFired = false;
     this._startActive = true;
+    this._startCursor = 0; // default focus: Continue, when present
     this.dom.start.classList.add('dm-open');
     this.dom.hud.classList.add('dm-hidden');
+    this._renderStartButtons();
   }
 
-  _fireStart() {
+  _renderStartButtons() {
+    const d = this.dom;
+    const save = this._startSave;
+    d.continueBtn.classList.toggle('dm-start-hide', !save);
+    if (save) d.continueBtn.textContent = `Continue — Depth ${save.depth} · Level ${save.level}`;
+    d.startBtn.textContent = save ? 'New Game' : 'Enter the Maze';
+    d.startBtn.className = `dm-btn ${save ? 'dm-btn-secondary' : 'dm-btn-primary'}`;
+    d.pressAny.classList.toggle('dm-start-hide', !!save);
+    d.startHint.classList.toggle('dm-start-hide', !save);
+    if (save) d.startHint.textContent = 'New Game replaces your saved run';
+    this._syncStartFocus();
+  }
+
+  _syncStartFocus() {
+    const d = this.dom;
+    d.continueBtn.classList.toggle('dm-focused', !!this._startSave && this._startCursor === 0);
+    d.startBtn.classList.toggle('dm-focused', !!this._startSave && this._startCursor === 1);
+  }
+
+  _fireStart(which) {
     if (this._startFired) return;
     this._startFired = true;
     this._startActive = false;
     this.dom.start.classList.remove('dm-open');
     this.dom.hud.classList.remove('dm-hidden');
-    const cb = this._startCallback;
-    this._startCallback = null;
+    const cb = which === 'continue' ? this._startOnContinue : this._startOnNew;
+    this._startOnNew = null;
+    this._startOnContinue = null;
     if (cb) cb();
   }
 
@@ -690,6 +872,9 @@ export class UI {
     this._deathActive = false;
     this.dom.death.classList.remove('dm-open');
     this._hpTrail = 1;
+    this._bossId = null;
+    this._bossBarShown = false;
+    this.dom.bossBar.classList.remove('dm-show');
     const cb = this._deathCallback;
     this._deathCallback = null;
     if (cb) cb();
@@ -704,21 +889,97 @@ export class UI {
     this._tickBanner();
     this._tickLog();
 
+    if (this._startActive) {
+      // Only nag controller players, and only while the browser is still holding audio back.
+      const pads = (navigator.getGamepads && [...navigator.getGamepads()].some(Boolean)) || this.input?.lastDevice === 'gamepad';
+      const show = sfx.needsGesture() && pads;
+      if (this._cache.startSoundShow !== show) {
+        this.dom.startSound.classList.toggle('dm-show', show);
+        this._cache.startSoundShow = show;
+      }
+    }
     if (this._startActive || this._deathActive) return; // HUD not relevant on these screens
 
     if (!game || !game.player) return;
 
     this._updateDeviceHints();
     this._updateHud(game, dt);
+    this._updateBossBar(game, dt);
+    this._updateTradePrompt(game);
+    const needSound = sfx.needsGesture();
+    if (this._cache.soundHintShow !== needSound) {
+      this.dom.soundHint.classList.toggle('dm-show', needSound);
+      this._cache.soundHintShow = needSound;
+    }
     if (this._characterOpen) this._refreshCharacterPanel();
     if (this._inventoryOpen) this._refreshInventoryPanel();
+    if (this._shopOpen) this._refreshShopPanel();
+  }
+
+  // Small floating HUD prompt shown while standing near a merchant and no panel is open.
+  _updateTradePrompt(game) {
+    const near = !this.isModalOpen() && !!nearbyMerchant(game);
+    if (this._cache.tradePromptShow !== near) {
+      this.dom.tradePrompt.classList.toggle('dm-show', near);
+      this._cache.tradePromptShow = near;
+    }
+    if (near) {
+      const gamepad = !!(this.input && this.input.lastDevice === 'gamepad');
+      const text = gamepad ? 'Trade — A' : 'Trade — E';
+      if (this._cache.tradePromptText !== text) {
+        this.dom.tradePrompt.textContent = text;
+        this._cache.tradePromptText = text;
+      }
+    }
+  }
+
+  // Top-of-screen boss HP bar: shown once a boss has noticed the player (enemies.js sets
+  // `_noticed`), hidden (with a fade) once it dies or a new depth/run replaces game.enemies.
+  _updateBossBar(game, dt) {
+    const d = this.dom;
+    const boss = (game.enemies || []).find((e) => e.behavior === 'boss' && !e.dead && e._noticed);
+    if (!boss) {
+      if (this._bossBarShown) { this._bossBarShown = false; d.bossBar.classList.remove('dm-show'); }
+      this._bossId = null;
+      return;
+    }
+    if (this._bossId !== boss.id) {
+      this._bossId = boss.id;
+      const startPct = clamp(boss.hp / Math.max(1, boss.maxHp), 0, 1);
+      this._bossHpTrail = startPct;
+      this._prevBossHpPct = startPct;
+      this._bossHpTrailHold = 0;
+      d.bossName.textContent = boss.name;
+      d.bossResist.innerHTML = describeResistHTML(boss.type);
+      flash(d.bossBar, 'dm-bossbar-in');
+    }
+    if (!this._bossBarShown) { this._bossBarShown = true; d.bossBar.classList.add('dm-show'); }
+
+    const hpPct = clamp(boss.hp / Math.max(1, boss.maxHp), 0, 1);
+    d.bossFill.style.width = `${hpPct * 100}%`;
+    if (this._prevBossHpPct != null && hpPct < this._prevBossHpPct) this._bossHpTrailHold = 0.45;
+    this._prevBossHpPct = hpPct;
+    if (this._bossHpTrail < hpPct) this._bossHpTrail = hpPct;
+    else if (this._bossHpTrail > hpPct) {
+      if (this._bossHpTrailHold > 0) this._bossHpTrailHold -= dt;
+      else this._bossHpTrail = Math.max(hpPct, this._bossHpTrail - dt * 0.5);
+    }
+    d.bossTrail.style.width = `${this._bossHpTrail * 100}%`;
+    d.bossPhase.textContent = (boss._phase || 1) >= 2 ? 'PHASE 2' : '';
   }
 
   _tickOverlayInput() {
     const input = this.input;
     if (!input) return;
     if (this._startActive && !this._startFired) {
-      if (input.anyPressed()) this._fireStart();
+      if (this._startSave) {
+        // Two-button chooser: no "any key" start (that could fire either action by accident).
+        if (input.pressed('ui_up') || input.pressed('ui_left')) { this._startCursor = 0; this._syncStartFocus(); }
+        if (input.pressed('ui_down') || input.pressed('ui_right')) { this._startCursor = 1; this._syncStartFocus(); }
+        if (input.pressed('confirm')) this._fireStart(this._startCursor === 0 ? 'continue' : 'new');
+      } else if (input.anyPressed()) {
+        this._fireStart('new');
+      }
     }
     if (this._pauseActive) {
       if (input.pressed('pause') || input.pressed('confirm')) {
@@ -794,13 +1055,13 @@ export class UI {
     if (this._cache.gamepad === gamepad) return;
     this._cache.gamepad = gamepad;
     const d = this.dom;
-    d.btnCKey.textContent = gamepad ? 'RB' : 'C';
-    d.btnIKey.textContent = gamepad ? 'LB' : 'I';
+    d.btnCKey.textContent = gamepad ? 'LB' : 'C';
+    d.btnIKey.textContent = gamepad ? 'RB' : 'I';
     d.potHeal.key.textContent = gamepad ? 'LT' : 'H';
     d.potMana.key.textContent = gamepad ? 'RT' : 'M';
     for (const shell of [d.charShell, d.invShell]) {
-      shell.tabKeys[0].textContent = gamepad ? 'RB' : 'C';
-      shell.tabKeys[1].textContent = gamepad ? 'LB' : 'I';
+      shell.tabKeys[0].textContent = gamepad ? 'LB' : 'C';
+      shell.tabKeys[1].textContent = gamepad ? 'RB' : 'I';
     }
     for (let i = 0; i < 4; i++) {
       const k = d.charSkillRows[i].key;
@@ -809,8 +1070,8 @@ export class UI {
     }
     const hint = (pairs) => pairs.map(([k, a]) => `<span class="dm-foot-item"><span class="dm-kbd">${k}</span>${a}</span>`).join('');
     d.charShell.foot.innerHTML = gamepad
-      ? hint([['D-pad', 'Navigate'], ['A', 'Spend point'], ['LB / RB', 'Switch tab'], ['B', 'Close']])
-      : hint([['Click +', 'Spend point'], ['↑↓', 'Navigate'], ['Enter', 'Spend'], ['I', 'Inventory'], ['Esc', 'Close']]);
+      ? hint([['D-pad ↑↓', 'Navigate'], ['D-pad ←→', 'Attributes / Skills'], ['A', 'Spend point'], ['LB / RB', 'Switch tab'], ['B', 'Close']])
+      : hint([['Click +', 'Spend point'], ['↑↓', 'Navigate'], ['←→', 'Attributes / Skills'], ['Enter', 'Spend'], ['I', 'Inventory'], ['Esc', 'Close']]);
     d.invShell.foot.innerHTML = gamepad
       ? hint([['D-pad', 'Navigate'], ['A', 'Equip / Use'], ['X', 'Drop'], ['LB / RB', 'Switch tab'], ['B', 'Close']])
       : hint([['Click', 'Equip / Use'], ['Right-click', 'Drop'], ['Shift+Click', 'Salvage for gold'], ['Esc', 'Close']]);
@@ -859,6 +1120,14 @@ export class UI {
       d.hp.bar.classList.toggle('dm-critical', lowHp);
     }
 
+    // Brief red pulse on the separate hit-vignette element, triggered by pulseHit().
+    if (this._hitFlashTimer > 0) {
+      this._hitFlashTimer = Math.max(0, this._hitFlashTimer - dt);
+      const t = this._hitFlashTimer / HIT_VIGNETTE_DURATION; // 1 -> 0
+      d.hitVignette.style.opacity = String(this._hitFlashPeak * HIT_VIGNETTE_MAX_OPACITY * t * t);
+      if (this._hitFlashTimer <= 0) this._hitFlashPeak = 0;
+    }
+
     // XP: dock bar + level ring on the player plate.
     const need = xpForLevel(p.level);
     const xpPct = clamp(p.xp / Math.max(1, need), 0, 1);
@@ -890,7 +1159,7 @@ export class UI {
     // Unspent points.
     const totalPts = (p.attrPoints || 0) + (p.skillPoints || 0);
     const gamepad = !!(this.input && this.input.lastDevice === 'gamepad');
-    const ptsStr = totalPts > 0 ? `✦ ${totalPts} point${totalPts === 1 ? '' : 's'} to spend · ${gamepad ? 'RB' : 'C'}` : '';
+    const ptsStr = totalPts > 0 ? `✦ ${totalPts} point${totalPts === 1 ? '' : 's'} to spend · ${gamepad ? 'LB' : 'C'}` : '';
     if (c.ptsStr !== ptsStr) {
       d.pointsPill.textContent = ptsStr;
       d.pointsPill.classList.toggle('dm-show', totalPts > 0);
@@ -1038,6 +1307,23 @@ export class UI {
       }
     }
 
+    // Merchant (once its tile has been explored).
+    for (const n of (game.npcs || [])) {
+      if (!n || n.type !== 'merchant') continue;
+      const nIdx = map.idx ? map.idx(n.x, n.y) : n.y * map.width + n.x;
+      if (!map.explored[nIdx]) continue;
+      const nx = offX + n.x * scale + cell / 2, ny = offY + n.y * scale + cell / 2;
+      const nr = Math.max(2.2, cell * 0.75);
+      ctx.fillStyle = '#5c3c00';
+      ctx.beginPath(); ctx.arc(nx, ny, nr + 1, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#ffd43b';
+      ctx.beginPath(); ctx.arc(nx, ny, nr, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#5c3c00';
+      ctx.font = `${Math.max(6, cell * 1.1)}px sans-serif`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('$', nx, ny + 0.5);
+    }
+
     // Enemies (visible & living only).
     for (const e of (game.enemies || [])) {
       if (!e || e.dead) continue;
@@ -1054,8 +1340,8 @@ export class UI {
     // Player, with a small facing wedge.
     const p = game.player;
     if (p) {
-      const px = offX + p.x * scale + cell / 2, py = offY + p.y * scale + cell / 2, pr = Math.max(2.5, cell * 0.8);
-      const f = p.facing || { x: 0, y: 1 };
+      const px = offX + (p.fx ?? p.x) * scale + cell / 2, py = offY + (p.fy ?? p.y) * scale + cell / 2, pr = Math.max(2.5, cell * 0.8);
+      const f = p.aim || p.facing || { x: 0, y: 1 };
       ctx.fillStyle = 'rgba(28,126,214,0.35)';
       ctx.beginPath();
       ctx.moveTo(px, py);
@@ -1307,6 +1593,184 @@ export class UI {
   }
 
   // =====================================================================
+  // Shop panel
+  // =====================================================================
+  _setShopTab(tab) {
+    if (this._shopTab === tab) return;
+    this._shopTab = tab;
+    this._shopCursor = 0;
+    this._lastShopCursorKey = this._initialShopCursorKey();
+    this.dom.shopTabBuy.classList.toggle('dm-tab-active', tab === 'buy');
+    this.dom.shopTabSell.classList.toggle('dm-tab-active', tab === 'sell');
+    this._hideTooltip();
+    sfx.uiClick();
+    this._refreshShopPanel();
+  }
+
+  _shopBuyList() {
+    const m = this._shopMerchant;
+    if (!m || !m.stock) return [];
+    const list = [];
+    if (m.stock.featured) list.push({ kind: 'featured', index: 0, item: m.stock.featured });
+    if (m.stock.heal) list.push({ kind: 'heal', index: 0, item: m.stock.heal });
+    if (m.stock.mana) list.push({ kind: 'mana', index: 0, item: m.stock.mana });
+    m.stock.gear.forEach((item, i) => list.push({ kind: 'gear', index: i, item }));
+    return list;
+  }
+
+  _shopSellList() {
+    const p = this.game && this.game.player;
+    if (!p) return [];
+    const list = [];
+    (p.inventory || []).forEach((item, i) => { if (item) list.push({ kind: 'sell', index: i, item }); });
+    return list;
+  }
+
+  _shopEntryPrice(entry) {
+    return this._shopTab === 'buy' ? shopPrice(entry.kind, entry.item) : sellValue(entry.item);
+  }
+
+  _clickShopCell(i) {
+    const entry = this._shopList[i];
+    if (!entry) return;
+    if (this._shopTab === 'buy') this._buyShopEntry(entry);
+    else this._sellShopEntry(entry);
+  }
+
+  _buyShopEntry(entry) {
+    const res = buyFromMerchant(this.game, this._shopMerchant, entry.kind, entry.index);
+    if (res.ok) {
+      this.log(`Bought ${res.item.name} for ${res.price}g.`, '#2f9e44');
+      this.game.bus.emit('itemBought', { item: res.item, price: res.price });
+    } else {
+      const p = this.game.player;
+      const msg = res.reason === 'full' ? 'Your bag is full' : res.reason === 'gold' ? 'Not enough gold' : 'Sold out';
+      this.game.floatText(p.x, p.y, msg, '#ff9955');
+      this.game.bus.emit('denied');
+    }
+    this._hideTooltip();
+    this._refreshShopPanel();
+  }
+
+  _sellShopEntry(entry) {
+    const res = sellToMerchant(this.game, entry.index);
+    if (res.ok) {
+      this.log(`Sold ${res.item.name} for ${res.price}g.`, '#2f9e44');
+      this.game.bus.emit('itemSold', { item: res.item, price: res.price });
+    }
+    this._hideTooltip();
+    this._refreshShopPanel();
+  }
+
+  _hoverShopCell(i, e) {
+    const entry = this._shopList[i];
+    if (!entry) return;
+    const p = this.game && this.game.player;
+    const label = this._shopTab === 'buy' ? `Buy for ${this._shopEntryPrice(entry)}g` : `Sell for ${this._shopEntryPrice(entry)}g`;
+    this._showTooltip(null, itemTooltip(entry.item, p) + `<div class="tt-action">${label}</div>`);
+    this._positionTooltip(e.clientX, e.clientY);
+  }
+
+  _refreshShopPanel() {
+    const p = this.game && this.game.player;
+    const m = this._shopMerchant;
+    if (!p || !m) return;
+    const d = this.dom;
+    const goldStr = `🪙 ${(p.gold || 0).toLocaleString()}`;
+    if (d.shopGoldText.textContent !== goldStr) d.shopGoldText.textContent = goldStr;
+
+    const list = this._shopTab === 'buy' ? this._shopBuyList() : this._shopSellList();
+    this._shopList = list;
+    const gold = p.gold || 0;
+
+    for (let i = 0; i < d.shopCells.length; i++) {
+      const cellDom = d.shopCells[i];
+      const entry = list[i];
+      if (!entry) {
+        cellDom.cell.style.display = 'none';
+        continue;
+      }
+      cellDom.cell.style.display = '';
+      const item = entry.item;
+      const potionKind = potionKindOf(item);
+      if (potionKind) cellDom.icon.innerHTML = potionIconSvg(potionKind);
+      else cellDom.icon.textContent = item.icon || '?';
+      const rc = rarityBorderColor(item);
+      cellDom.cell.style.borderColor = rc;
+      cellDom.cell.style.setProperty('--item-glow', rc);
+      cellDom.cell.classList.add('dm-filled');
+      cellDom.cell.classList.toggle('dm-shop-featured', entry.kind === 'featured');
+      const stack = (this._shopTab === 'sell' && item.stack && item.stack > 1) ? String(item.stack) : '';
+      cellDom.stack.textContent = stack;
+      const price = this._shopEntryPrice(entry);
+      cellDom.price.textContent = `${price}g`;
+      const noAfford = this._shopTab === 'buy' && gold < price;
+      cellDom.cell.classList.toggle('dm-shop-noafford', noAfford);
+    }
+    this._applyShopFocus();
+    this._updateShopFoot();
+  }
+
+  _updateShopFoot() {
+    const gamepad = !!(this.input && this.input.lastDevice === 'gamepad');
+    const hint = (pairs) => pairs.map(([k, a]) => `<span class="dm-foot-item"><span class="dm-kbd">${k}</span>${a}</span>`).join('');
+    const text = gamepad
+      ? hint([['D-pad', 'Navigate'], ['A', this._shopTab === 'buy' ? 'Buy' : 'Sell'], ['LB / RB', 'Switch tab'], ['B', 'Close']])
+      : hint([['Click', this._shopTab === 'buy' ? 'Buy' : 'Sell'], ['Arrows', 'Navigate'], ['Enter', this._shopTab === 'buy' ? 'Buy' : 'Sell'], ['Tab', 'Switch tab'], ['Esc', 'Close']]);
+    if (this.dom.shopFoot.innerHTML !== text) this.dom.shopFoot.innerHTML = text;
+  }
+
+  // Cursor key that counts as "tooltip already shown" for a freshly opened shop / tab: null for gamepad
+  // (show it right away), the first cell for keyboard/mouse (wait until the cursor actually moves).
+  _initialShopCursorKey() {
+    return this.input && this.input.lastDevice === 'gamepad' ? null : `${this._shopTab}:0`;
+  }
+
+  _applyShopFocus() {
+    for (const c of this.dom.shopCells) c.cell.classList.remove('dm-focused');
+    const c = this.dom.shopCells[this._shopCursor];
+    if (c && c.cell.style.display !== 'none') c.cell.classList.add('dm-focused');
+  }
+
+  _handleShopInput(input) {
+    // LB/RB (tab_prev/tab_next) and the keyboard Inventory key (I / Tab) both cycle Buy/Sell —
+    // the shop has no separate panel to switch to, so that hotkey is repurposed here.
+    if (input.pressed('tab_prev') || input.pressed('tab_next') || input.pressed('inventory')) {
+      this._setShopTab(this._shopTab === 'buy' ? 'sell' : 'buy');
+      return;
+    }
+
+    const list = this._shopList;
+    if (!list.length) return;
+    const cols = INV_COLS;
+    const rows = Math.max(1, Math.ceil(list.length / cols));
+    let row = Math.floor(this._shopCursor / cols), col = this._shopCursor % cols;
+    if (input.pressed('ui_left')) col = Math.max(0, col - 1);
+    if (input.pressed('ui_right')) col = Math.min(cols - 1, col + 1);
+    if (input.pressed('ui_up')) row = Math.max(0, row - 1);
+    if (input.pressed('ui_down')) row = Math.min(rows - 1, row + 1);
+    this._shopCursor = clamp(row * cols + col, 0, list.length - 1);
+    this._applyShopFocus();
+
+    const cursorKey = `${this._shopTab}:${this._shopCursor}`;
+    if (cursorKey !== this._lastShopCursorKey) {
+      this._lastShopCursorKey = cursorKey;
+      const entry = list[this._shopCursor];
+      const cellDom = this.dom.shopCells[this._shopCursor];
+      if (entry && cellDom) {
+        const p = this.game.player;
+        const label = this._shopTab === 'buy' ? `Buy for ${this._shopEntryPrice(entry)}g` : `Sell for ${this._shopEntryPrice(entry)}g`;
+        this._showTooltip(cellDom.cell, itemTooltip(entry.item, p) + `<div class="tt-action">${label}</div>`);
+      } else this._hideTooltip();
+    }
+
+    if (input.pressed('confirm')) {
+      this._clickShopCell(this._shopCursor);
+      this._lastShopCursorKey = null;
+    }
+  }
+
+  // =====================================================================
   // Tooltip
   // =====================================================================
   _showTooltip(el, html, placement) {
@@ -1352,6 +1816,11 @@ export class UI {
     this.input = input;
 
     if (input.pressed('cancel')) { this.closeAll(); return; }
+
+    // The shop is a standalone modal: while it's open, LB/RB/I/Tab switch its own Buy/Sell
+    // tabs instead of opening Character/Inventory on top of it.
+    if (this._shopOpen) { this._handleShopInput(input); return; }
+
     // Controller bumpers cycle tabs (checked first: they also map to character/inventory).
     if (input.pressed('tab_prev') || input.pressed('tab_next')) { this._cycleTab(input.pressed('tab_next') ? 1 : -1); return; }
     if (input.pressed('character')) { if (this._characterOpen) this.closeAll(); else this.toggleCharacter(); return; }
@@ -1364,8 +1833,20 @@ export class UI {
   _handleCharacterInput(input) {
     const list = this._charFocusList();
     if (!list.length) return;
-    if (input.pressed('ui_up')) { this._charCursor = (this._charCursor - 1 + list.length) % list.length; this._applyCharacterFocus(); }
-    if (input.pressed('ui_down')) { this._charCursor = (this._charCursor + 1) % list.length; this._applyCharacterFocus(); }
+    // Two columns: attributes (left) and skills (right). Up/down move within the current column
+    // (wrapping), left/right jump across to the same row of the other column.
+    const cur = list[this._charCursor] || list[0];
+    const column = (kind) => list.map((e, i) => (e.kind === kind ? i : -1)).filter((i) => i >= 0);
+    const col = column(cur.kind);
+    const row = Math.max(0, col.indexOf(this._charCursor));
+    let next = this._charCursor;
+    if (input.pressed('ui_up')) next = col[(row - 1 + col.length) % col.length];
+    if (input.pressed('ui_down')) next = col[(row + 1) % col.length];
+    if (input.pressed('ui_left') || input.pressed('ui_right')) {
+      const other = column(cur.kind === 'attr' ? 'skill' : 'attr');
+      if (other.length) next = other[Math.min(row, other.length - 1)];
+    }
+    if (next !== this._charCursor) { this._charCursor = next; this._applyCharacterFocus(); }
     const focused = list[this._charCursor];
     if (focused && this._lastCharCursor !== this._charCursor) {
       this._lastCharCursor = this._charCursor;
@@ -1531,7 +2012,7 @@ const CSS_TEXT = `
 }
 .dm-mm-key { display: inline-flex; align-items: center; gap: 4px; }
 .dm-mm-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; box-shadow: 0 0 0 1.5px #fff, 0 0 0 2.5px rgba(35,40,56,0.15); }
-.dm-mm-you { background: #1c7ed6; } .dm-mm-foe { background: #e03131; } .dm-mm-exit { background: #f76707; }
+.dm-mm-you { background: #1c7ed6; } .dm-mm-foe { background: #e03131; } .dm-mm-exit { background: #f76707; } .dm-mm-merchant { background: #ffd43b; }
 .dm-mini-buttons { display: flex; flex-direction: column; gap: 6px; pointer-events: auto; }
 .dm-menubtn {
   position: relative; display: flex; align-items: center; gap: 6px; padding: 5px 8px;
@@ -1559,6 +2040,47 @@ const CSS_TEXT = `
 .dm-menubtn-plus.dm-show { display: flex; }
 @keyframes dm-pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.18); } }
 
+/* ---------- boss HP bar (top center) ---------- */
+.dm-bossbar {
+  position: absolute; top: var(--dm-gutter); left: 50%;
+  width: clamp(260px, 42vmin, 640px);
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  opacity: 0; pointer-events: none; visibility: hidden;
+  transform: translate(-50%, -16px) scale(0.94);
+  transition: opacity 0.35s ease, transform 0.35s cubic-bezier(.2,1.4,.4,1), visibility 0s linear 0.35s;
+}
+.dm-bossbar.dm-show {
+  opacity: 1; visibility: visible; transform: translate(-50%, 0) scale(1);
+  transition: opacity 0.35s ease, transform 0.35s cubic-bezier(.2,1.4,.4,1);
+}
+.dm-bossbar-in { animation: dm-bossbar-pop 0.5s cubic-bezier(.2,1.4,.4,1); }
+@keyframes dm-bossbar-pop {
+  0% { transform: translate(-50%, -20px) scale(0.85); }
+  55% { transform: translate(-50%, 4px) scale(1.04); }
+  100% { transform: translate(-50%, 0) scale(1); }
+}
+.dm-bossbar-name {
+  font-family: 'Fredoka', sans-serif; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+  font-size: clamp(13px, 2vmin, 19px); color: #ffe8a3;
+  text-shadow: 0 2px 0 rgba(0,0,0,0.55), 0 0 10px rgba(0,0,0,0.45);
+}
+.dm-bossbar-track {
+  position: relative; width: 100%; height: clamp(14px, 2.2vmin, 20px); border-radius: 8px;
+  background: var(--dm-ink); overflow: hidden;
+  box-shadow: inset 0 2px 4px rgba(0,0,0,0.4), 0 0 0 2px rgba(255,232,163,0.55), 0 4px 14px rgba(0,0,0,0.35);
+}
+.dm-bossbar-trail { position: absolute; inset: 0; width: 0%; background: #ffe066; }
+.dm-bossbar-fill { position: absolute; inset: 0; width: 0%; background: linear-gradient(180deg, #ff6b6b, #c92a2a); transition: width 0.15s ease-out; }
+.dm-bossbar-notch { position: absolute; top: -2px; bottom: -2px; left: 50%; width: 2px; background: rgba(255,255,255,0.8); box-shadow: 0 0 4px rgba(0,0,0,0.5); }
+.dm-bossbar-resist {
+  min-height: 1.1em; font-size: clamp(9px, 1.2vmin, 11px); font-weight: 800;
+  color: #e8e8f0; text-shadow: 0 1px 0 rgba(0,0,0,0.6); letter-spacing: 0.02em;
+}
+.dm-bossbar-phase {
+  height: 1.2em; font-size: clamp(9px, 1.3vmin, 11px); font-weight: 900; letter-spacing: 0.12em;
+  color: #ff8787; text-shadow: 0 1px 0 rgba(0,0,0,0.55);
+}
+
 /* ---------- vignette ---------- */
 .dm-vignette {
   position: absolute; inset: 0; pointer-events: none; opacity: 0;
@@ -1567,6 +2089,8 @@ const CSS_TEXT = `
 }
 .dm-vignette.dm-active { opacity: 1; animation: dm-vignette-pulse 1.2s ease-in-out infinite; }
 @keyframes dm-vignette-pulse { 0%,100% { opacity: 0.35; } 50% { opacity: 0.8; } }
+/* Opacity is driven frame-by-frame from JS (pulseHit()/_updateHud), not CSS transitions/classes. */
+.dm-hit-vignette { opacity: 0; box-shadow: inset 0 0 18vmin 5vmin rgba(255,25,25,0.9); transition: none; }
 
 /* ---------- banner ---------- */
 .dm-banner {
@@ -1588,6 +2112,34 @@ const CSS_TEXT = `
   font-size: clamp(12px, 1.8vmin, 17px); font-weight: 800; box-shadow: 0 4px 14px rgba(35,40,56,0.25);
 }
 .dm-banner-nosub .dm-banner-sub { display: none; }
+
+/* ---------- merchant trade prompt ---------- */
+.dm-trade-prompt {
+  position: absolute; left: 50%; bottom: 128px; transform: translate(-50%, 6px);
+  font-family: 'Fredoka', sans-serif; font-weight: 700; font-size: clamp(13px, 1.9vmin, 17px);
+  color: #ffe8a3; background: rgba(28,32,48,0.88); border: 2px solid #ffd43b; border-radius: 999px;
+  padding: 7px 18px; box-shadow: 0 4px 0 rgba(20,24,40,0.35);
+  opacity: 0; pointer-events: none; visibility: hidden;
+  transition: opacity 0.15s, transform 0.15s, visibility 0s linear 0.15s;
+}
+.dm-trade-prompt.dm-show { opacity: 1; visibility: visible; transform: translate(-50%, 0); transition: opacity 0.15s, transform 0.15s; }
+
+/* ---------- title screen: controller sound note ---------- */
+.dm-start-sound {
+  display: none; margin: 10px auto 0; padding: 6px 14px; width: fit-content; border-radius: 999px;
+  font-family: 'Fredoka', sans-serif; font-weight: 600; font-size: 14px;
+  color: #7a4b00; background: #fff4d6; border: 1.5px solid #ffd43b;
+}
+.dm-start-sound.dm-show { display: block; }
+
+/* ---------- sound locked hint ---------- */
+.dm-sound-hint {
+  position: absolute; left: 20px; top: 104px;
+  font-family: 'Fredoka', sans-serif; font-weight: 600; font-size: clamp(12px, 1.6vmin, 15px);
+  color: #fff; background: rgba(28,32,48,0.78); border-radius: 999px; padding: 6px 14px;
+  opacity: 0; visibility: hidden; pointer-events: none; transition: opacity 0.3s, visibility 0s linear 0.3s;
+}
+.dm-sound-hint.dm-show { opacity: 1; visibility: visible; transition: opacity 0.3s; }
 
 /* ---------- log ---------- */
 .dm-log {
@@ -1896,6 +2448,29 @@ const CSS_TEXT = `
 }
 .dm-inv-stack:empty { display: none; }
 
+/* ---------- shop ---------- */
+.dm-shop-title { font-family: 'Fredoka', sans-serif; font-weight: 700; font-size: clamp(15px, 2vmin, 19px); color: var(--dm-ink); }
+.dm-shop-body { flex-wrap: nowrap; }
+.dm-shop-grid { flex: 1 1 auto; }
+.dm-shop-cell { padding-bottom: 14px; }
+.dm-shop-price {
+  position: absolute; left: 0; right: 0; bottom: 2px; text-align: center;
+  font-size: 10px; font-weight: 900; color: #5c3c00; background: #ffe066; border-radius: 0 0 10px 10px;
+  padding: 1px 0;
+}
+.dm-shop-cell.dm-shop-noafford .dm-shop-price { color: #fff; background: #e03131; }
+.dm-shop-cell.dm-shop-noafford { opacity: 0.55; }
+.dm-shop-cell .dm-inv-stack { bottom: 16px; }
+.dm-shop-badge {
+  display: none; position: absolute; top: -9px; left: 50%; transform: translateX(-50%); z-index: 1;
+  font-size: 8.5px; font-weight: 900; color: #5c3c00; background: linear-gradient(180deg, #ffe066, #fcc419);
+  border-radius: 999px; padding: 1px 7px; white-space: nowrap; box-shadow: 0 2px 0 rgba(0,0,0,0.15);
+}
+.dm-shop-cell.dm-shop-featured {
+  border-width: 3px; box-shadow: 0 0 0 2px #ffd43b, 0 0 14px 2px rgba(255,212,59,0.55);
+}
+.dm-shop-cell.dm-shop-featured .dm-shop-badge { display: block; }
+
 /* ---------- tooltip (dark, so items.js' dark-tuned rarity/delta colors read well) ---------- */
 .dm-tooltip {
   position: fixed; z-index: 90; max-width: 290px; pointer-events: none;
@@ -1991,9 +2566,19 @@ const CSS_TEXT = `
 }
 .dm-btn:hover { transform: translateY(-2px); filter: brightness(1.05); box-shadow: 0 7px 0 #2f9e44, 0 14px 26px rgba(64,192,87,0.4); }
 .dm-btn:active { transform: translateY(3px); box-shadow: 0 2px 0 #2f9e44, 0 4px 10px rgba(64,192,87,0.3); }
+.dm-btn-secondary {
+  background: linear-gradient(180deg, #dee2e6, #ced4da); color: var(--dm-ink); text-shadow: none;
+  box-shadow: 0 5px 0 #adb5bd, 0 10px 22px rgba(33,37,41,0.15);
+}
+.dm-btn-secondary:hover { box-shadow: 0 7px 0 #adb5bd, 0 14px 26px rgba(33,37,41,0.18); }
+.dm-btn-secondary:active { box-shadow: 0 2px 0 #adb5bd, 0 4px 10px rgba(33,37,41,0.15); }
 .dm-death .dm-btn { background: linear-gradient(180deg, #ff8787, #fa5252); box-shadow: 0 5px 0 #c92a2a, 0 10px 22px rgba(250,82,82,0.35); }
 .dm-death .dm-btn:hover { box-shadow: 0 7px 0 #c92a2a, 0 14px 26px rgba(250,82,82,0.4); }
 .dm-death .dm-btn:active { box-shadow: 0 2px 0 #c92a2a; }
+.dm-start-btn-row { display: flex; flex-direction: column; align-items: center; gap: 10px; margin-top: 6px; }
+.dm-start-btn-row .dm-btn { margin-top: 0; }
+.dm-start-hide { display: none !important; }
+.dm-start-btn-row .dm-btn.dm-focused { outline: 3px solid var(--dm-blue-deep); outline-offset: 4px; }
 
 /* ---------- small screens ---------- */
 @media (max-width: 900px) {
@@ -2009,6 +2594,7 @@ const CSS_TEXT = `
   .dm-mm-legend { display: none; }
   .dm-menubtn-label { display: none; }
   .dm-dock { max-width: calc(100vw - 16px); }
+  .dm-bossbar { width: clamp(200px, 58vw, 380px); }
   .dm-bars { width: 110px; }
   .dm-tab { padding: 8px 10px; }
   .dm-tab .dm-kbd { display: none; }

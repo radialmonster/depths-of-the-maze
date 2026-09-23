@@ -2,9 +2,24 @@
 import * as THREE from 'three';
 import { TILE, RARITY } from './core.js';
 import { getTextures } from './textures.js';
+import { Models, SWING_DURATION } from './models.js';
 
 // Entities read small from the angled top-down camera, so scale them up uniformly.
 const ENTITY_SCALE = 1.3;
+
+// --- Combat "game feel" tunables ---------------------------------------------------
+const HIT_FLASH_WINDOW = 0.12;    // seconds over which the white hit-flash intensity ramps in
+const HIT_RECOIL_DURATION = 0.12; // seconds for the knockback-independent hit recoil to spring back
+const HIT_RECOIL_DIST = 0.2;      // tiles the mesh is shoved away from the attacker on a hit
+const HIT_SQUASH_DURATION = 0.12; // seconds for the squash-and-stretch pop to settle
+const HIT_SQUASH_AMOUNT = 0.22;   // fractional scale pop on hit
+const CRIT_FLOAT_POP_DURATION = 0.15; // seconds the crit float-text stays enlarged
+const CRIT_FLOAT_POP_AMOUNT = 0.35;   // extra scale on crit float-text at spawn
+const HIT_BURST_COUNT = 10, HIT_BURST_SPEED = 2.5, HIT_BURST_SIZE = 0.09;
+const CRIT_BURST_COUNT = 18, CRIT_BURST_SPEED = 3.6, CRIT_BURST_SIZE = 0.12;
+const CRIT_FLASH_DURATION = 0.22; // extra bright pop sprite on a crit hit
+const DEATH_POP_FRAC = 0.14;      // fraction of the death timer spent on the initial "pop"
+const DEATH_POP_AMOUNT = 0.28;    // how much the mesh pops up before it implodes
 
 // Bright, cheerful per-depth palettes. `sky` is the background/fog colour that
 // unexplored space fades into, so the dungeon reads as a sunny floating maze.
@@ -15,6 +30,23 @@ const DEPTH_THEMES = [
   { name: 'frost',  floor: 0xd4f1ff, wall: 0x7cc6ff, sky: 0xeaf8ff, accent: 0x2f7bff, torch: 0xbfe9ff },
   { name: 'autumn', floor: 0xffc978, wall: 0xe9806a, sky: 0xffe9c7, accent: 0x9b3dff, torch: 0xffc070 },
 ];
+
+// The themes' pastel skies were too bright behind the map, so the background/fog colour is each
+// theme's sky blended toward a deep dusk tone — and it sinks further toward dusk the deeper you go.
+// Blend: 0 = the original pastel, 1 = pure dusk.
+const SKY_DUSK = 0x161c28;
+const SKY_DARKEN_START = 0.62;     // blend at depth 1
+const SKY_DARKEN_PER_DEPTH = 0.015; // extra blend per depth
+const SKY_DARKEN_MAX = 0.94;       // reached around depth 22
+function themeSky(theme, depth = 1) {
+  const t = Math.min(SKY_DARKEN_MAX, SKY_DARKEN_START + SKY_DARKEN_PER_DEPTH * Math.max(0, depth - 1));
+  // Blend in sRGB (screen) space: THREE.Color.lerp works in linear space, which keeps the result far brighter.
+  const mix = (shift) => {
+    const a = (theme.sky >> shift) & 255, b = (SKY_DUSK >> shift) & 255;
+    return Math.round(a + (b - a) * t);
+  };
+  return new THREE.Color((mix(16) << 16) | (mix(8) << 8) | mix(0));
+}
 
 const FLOOR_STATE = { HIDDEN: 0, DIM: 1, LIT: 2 };
 
@@ -132,7 +164,7 @@ export class Renderer {
   constructor(container) {
     this.container = container;
     this.scene = new THREE.Scene();
-    this.scene.background = new THREE.Color(DEPTH_THEMES[0].sky);
+    this.scene.background = themeSky(DEPTH_THEMES[0]);
 
     const w = container.clientWidth || window.innerWidth;
     const h = container.clientHeight || window.innerHeight;
@@ -190,11 +222,12 @@ export class Renderer {
     this.torchLight.position.set(0, 2.2, 0);
     this.scene.add(this.torchLight);
 
-    this.scene.fog = new THREE.Fog(DEPTH_THEMES[0].sky, 22, 48);
+    this.scene.fog = new THREE.Fog(themeSky(DEPTH_THEMES[0]), 22, 48);
 
     this._time = 0;
 
     this._buildSharedAssets();
+    this.models = new Models(this);
     this._recomputeCameraDistance();
 
     this.map = null;
@@ -214,6 +247,7 @@ export class Renderer {
     this.playerEntry = null;
     this.enemyEntries = new Map();
     this.itemEntries = new Map();
+    this.npcEntries = new Map();
     this.projectileEntries = new Map();
     this.effects = [];
   }
@@ -246,6 +280,19 @@ export class Renderer {
     this._geo.lootRing = new THREE.RingGeometry(0.4, 0.5, 40, 1);
     this._geo.lootRing.rotateX(-Math.PI / 2);
     this._geo.bowArc = new THREE.TorusGeometry(0.5, 0.12, 6, 18, Math.PI);
+    // Boss attack telegraphs: flat unit-radius decals, scaled per-instance. Materials are
+    // cloned per effect (opacity/color animate independently) but geometry is always shared.
+    this._geo.telegraphDisc = new THREE.CircleGeometry(1, 32);
+    this._geo.telegraphDisc.rotateX(-Math.PI / 2);
+    this._geo.telegraphRing = new THREE.RingGeometry(0.92, 1.0, 32);
+    this._geo.telegraphRing.rotateX(-Math.PI / 2);
+    this._telegraphFillMatTpl = new THREE.MeshBasicMaterial({
+      color: 0xff3b3b, transparent: true, opacity: 0.3, depthWrite: false, side: THREE.DoubleSide,
+      polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+    });
+    this._telegraphRingMatTpl = new THREE.MeshBasicMaterial({
+      color: 0xff3b3b, transparent: true, opacity: 0.85, depthWrite: false, side: THREE.DoubleSide,
+    });
 
     // Procedural textures (generated once; see textures.js).
     const tx = getTextures(this.renderer.capabilities.getMaxAnisotropy());
@@ -308,6 +355,7 @@ export class Renderer {
     }, extra || {}));
     m.userData.baseEmissive = m.emissive.clone();
     m.userData.baseEmissiveIntensity = m.emissiveIntensity;
+    m.userData.baseOpacity = m.opacity;
     if (materialsList) materialsList.push(m);
     return m;
   }
@@ -341,8 +389,8 @@ export class Renderer {
     this.depth = depth || 1;
     const theme = DEPTH_THEMES[(this.depth - 1) % DEPTH_THEMES.length];
     this._theme = theme;
-    this.scene.fog.color.setHex(theme.sky);
-    this.scene.background.setHex(theme.sky);
+    this.scene.fog.color.copy(themeSky(theme, this.depth));
+    this.scene.background.copy(themeSky(theme, this.depth));
     this.torchLight.color.setHex(theme.torch);
     this._glowMat.color.setHex(theme.torch);
 
@@ -441,7 +489,7 @@ export class Renderer {
     this._wallMesh = wallMesh;
     this._floorColor = new THREE.Color(theme.floor);
     this._wallColor = new THREE.Color(theme.wall);
-    this._skyColor = new THREE.Color(theme.sky);
+    this._skyColor = themeSky(theme, this.depth);
 
     for (const f of this._floorTiles) {
       if (f.t === TILE.DOOR) this._buildDoorDecor(map, f.x, f.y);
@@ -460,6 +508,10 @@ export class Renderer {
   }
 
   _disposeLevel() {
+    // Any in-flight effect (in particular boss attack telegraphs) is tied to world-space
+    // coordinates on the old map — drop them rather than let them linger into the new depth.
+    for (let i = this.effects.length - 1; i >= 0; i--) this._disposeEffect(this.effects[i]);
+    this.effects.length = 0;
     if (this._floorMesh) { this._levelGroup.remove(this._floorMesh); this._floorMesh.geometry.dispose(); this._floorMesh.dispose(); this._floorMesh = null; }
     if (this._wallMesh) { this._levelGroup.remove(this._wallMesh); this._wallMesh.geometry.dispose(); this._wallMesh.dispose(); this._wallMesh = null; }
     for (const d of this._doorDecor) { this._levelGroup.remove(d); this._disposeDecor(d); }
@@ -677,6 +729,7 @@ export class Renderer {
     this._updateTorches(dt);
     this._updatePlayer(game, dt);
     this._syncEnemies(game, dt);
+    this._syncNpcs(game, dt);
     this._syncItems(game, dt);
     this._syncProjectiles(game, dt);
     this._updateEffects(dt);
@@ -777,7 +830,7 @@ export class Renderer {
   }
 
   _setEntryOpacity(entry, val) {
-    for (const m of entry.materials) m.opacity = val;
+    for (const m of entry.materials) m.opacity = val * (m.userData.baseOpacity ?? 1);
   }
 
   _removeEntry(entry) {
@@ -790,62 +843,11 @@ export class Renderer {
   }
 
   // ---------------------------------------------------------------- player
+  // Model + walk/swing animation live in models.js. Entry contract: { root, materials, sword, cape, anim }.
   _buildPlayerMesh() {
-    const root = new THREE.Group();
-    const materials = [];
-
-    const armorMat = this._newMat(0x3d8bff, {}, materials);
-    const trimMat = this._newMat(0xd8b34a, { metalness: 0.6, roughness: 0.35 }, materials);
-    const skinMat = this._newMat(0xd8a874, { metalness: 0, roughness: 0.8 }, materials);
-    const helmMat = this._newMat(0xc7ccd6, { metalness: 0.7, roughness: 0.3 }, materials);
-    const capeMat = this._newMat(0x9a2b2b, { side: THREE.DoubleSide, roughness: 0.8 }, materials);
-    const bladeMat = this._newMat(0xdfe6ee, { metalness: 0.8, roughness: 0.2 }, materials);
-    const hiltMat = this._newMat(0x5a3a20, { roughness: 0.7 }, materials);
-    const visorMat = this._newMat(0x2b2d42, { metalness: 0.4, roughness: 0.4 }, materials);
-
-    const legs = new THREE.Mesh(this._geo.box, armorMat);
-    legs.scale.set(0.34, 0.32, 0.3); legs.position.y = 0.18; root.add(legs);
-
-    const torso = new THREE.Mesh(this._geo.box, armorMat);
-    torso.scale.set(0.42, 0.42, 0.28); torso.position.y = 0.52; root.add(torso);
-
-    const belt = new THREE.Mesh(this._geo.box, trimMat);
-    belt.scale.set(0.44, 0.07, 0.3); belt.position.y = 0.34; root.add(belt);
-
-    const shoulderL = new THREE.Mesh(this._geo.sphereLow, trimMat);
-    shoulderL.scale.setScalar(0.16); shoulderL.position.set(-0.24, 0.72, 0); root.add(shoulderL);
-    const shoulderR = shoulderL.clone(); shoulderR.position.x = 0.24; root.add(shoulderR);
-
-    const head = new THREE.Mesh(this._geo.sphereLow, skinMat);
-    head.scale.setScalar(0.19); head.position.y = 0.92; root.add(head);
-
-    const helm = new THREE.Mesh(this._geo.sphereLow, helmMat);
-    helm.scale.set(0.21, 0.16, 0.21); helm.position.y = 0.99; root.add(helm);
-
-    const visor = new THREE.Mesh(this._geo.box, visorMat);
-    visor.scale.set(0.16, 0.05, 0.04); visor.position.set(0, 0.97, 0.19); root.add(visor);
-
-    const plume = new THREE.Mesh(this._geo.cone, trimMat);
-    plume.scale.set(0.06, 0.22, 0.06); plume.position.set(0, 1.18, -0.03); root.add(plume);
-
-    const cape = new THREE.Mesh(this._geo.plane, capeMat);
-    cape.scale.set(0.4, 0.5, 1); cape.position.set(0, 0.5, -0.18); cape.rotation.x = 0.2; root.add(cape);
-
-    const armL = new THREE.Mesh(this._geo.box, armorMat);
-    armL.scale.set(0.1, 0.32, 0.1); armL.position.set(-0.28, 0.5, 0.02); root.add(armL);
-
-    const swordPivot = new THREE.Group();
-    swordPivot.position.set(0.3, 0.55, 0.05);
-    const blade = new THREE.Mesh(this._geo.box, bladeMat);
-    blade.scale.set(0.05, 0.5, 0.05); blade.position.y = 0.32;
-    const hilt = new THREE.Mesh(this._geo.box, hiltMat);
-    hilt.scale.set(0.07, 0.12, 0.07); hilt.position.y = 0.02;
-    swordPivot.add(blade, hilt);
-    root.add(swordPivot);
-
-    root.add(this._makeBlobShadow(0.8));
-    root.scale.setScalar(ENTITY_SCALE);
-    return { root, materials, sword: swordPivot, cape };
+    const entry = this.models.buildPlayer();
+    entry.root.scale.setScalar(ENTITY_SCALE);
+    return entry;
   }
 
   _updatePlayer(game, dt) {
@@ -854,29 +856,28 @@ export class Renderer {
     if (!this.playerEntry) {
       this.playerEntry = this._buildPlayerMesh();
       this.scene.add(this.playerEntry.root);
-      this.playerEntry.vx = p.x; this.playerEntry.vy = p.y;
+      this.playerEntry.vx = p.fx ?? p.x; this.playerEntry.vy = p.fy ?? p.y;
       this.playerEntry.angle = facingAngle(p.facing?.x || 0, p.facing?.y || 1);
     }
     const entry = this.playerEntry;
+    // Held weapon / off-hand mirror the equipped items (rebuilt only when they change).
+    this.models.syncPlayerEquipment(entry, p);
     const prevX = entry.vx, prevY = entry.vy;
-    this._lerpEntry(entry, p.x, p.y, dt);
+    // fx/fy is the free-movement (analog) position; x/y is the tile it rounds to.
+    this._lerpEntry(entry, p.fx ?? p.x, p.fy ?? p.y, dt);
     const moving = Math.hypot(entry.vx - prevX, entry.vy - prevY) > 0.001;
-    const targetAngle = facingAngle(p.facing?.x || 0, p.facing?.y || 1);
+    const look = p.aim || p.facing;
+    const targetAngle = facingAngle(look?.x || 0, look?.y || 1);
     this._rotateEntryTowards(entry, targetAngle, dt);
 
-    entry.bobPhase = (entry.bobPhase || 0) + dt * (moving ? 9 : 2.2);
-    const bob = moving ? Math.sin(entry.bobPhase) * 0.045 : Math.sin(entry.bobPhase) * 0.015;
-    entry.root.position.y = bob;
-
-    if (entry.sword) entry.sword.rotation.x = moving ? Math.sin(entry.bobPhase * 2) * 0.15 : 0;
-    if (entry.cape) entry.cape.rotation.x = 0.2 + (moving ? Math.sin(entry.bobPhase) * 0.08 : 0);
+    this.models.animatePlayer(entry, dt, moving, this._time);
 
     this._applyHitFlash(entry, p.hitFlash || 0);
     this._applyInvuln(entry, p.invuln || 0);
   }
 
   _applyHitFlash(entry, hitFlash) {
-    const t = Math.min(1, hitFlash / 0.12);
+    const t = Math.min(1, hitFlash / HIT_FLASH_WINDOW);
     for (const m of entry.materials) {
       if (t > 0) {
         m.emissive.copy(m.userData.baseEmissive).lerp(TMP_COLOR2.setHex(0xffffff), t * 0.85);
@@ -898,33 +899,22 @@ export class Renderer {
   }
 
   // ---------------------------------------------------------------- enemy shapes
+  // Every shape (and both bosses) is built in models.js; `anim` holds its animation handles plus
+  // `kind`, `topY` (head height in model units, used for the health bar) and `shadow` (blob size).
   _buildEnemyVisual(enemy) {
     const shape = (enemy.visual && enemy.visual.shape) || 'blob';
-    const colorHex = (enemy.visual && enemy.visual.color) || '#aa4444';
     const scale = ((enemy.visual && enemy.visual.scale) || 1) * ENTITY_SCALE;
     const materials = [];
     const extraMats = [];
     const root = new THREE.Group();
-    const color = new THREE.Color(colorHex);
-    let anim = {};
-
-    switch (shape) {
-      case 'slime': anim = this._partsSlime(root, color, materials); break;
-      case 'skeleton': anim = this._partsSkeleton(root, color, materials); break;
-      case 'bat': anim = this._partsBat(root, color, materials); break;
-      case 'goblin': anim = this._partsGoblin(root, color, materials); break;
-      case 'spider': anim = this._partsSpider(root, color, materials); break;
-      case 'mage': anim = this._partsMage(root, color, materials); break;
-      case 'ogre': anim = this._partsOgre(root, color, materials); break;
-      case 'boss': anim = this._partsBoss(root, color, materials, extraMats); break;
-      default: anim = this._partsBlob(root, color, materials); break;
-    }
-
-    if (shape !== 'bat') root.add(this._makeBlobShadow(shape === 'boss' ? 1.5 : shape === 'ogre' ? 1.1 : 0.8));
+    const anim = this.models.buildEnemy(enemy, root, materials, extraMats);
+    if (anim.shadow) root.add(this._makeBlobShadow(anim.shadow));
     root.scale.setScalar(scale);
 
     if (enemy.elite) {
+      // Elites: a slowly turning gold ring on the floor plus a floating gold gem over the head.
       const auraMat = new THREE.MeshBasicMaterial({ color: 0xffd34f, transparent: true, opacity: 0.7, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false });
+      auraMat.userData.baseOpacity = 0.7;
       const ring = new THREE.Mesh(this._geo.ring, auraMat);
       ring.rotation.x = -Math.PI / 2;
       ring.scale.set(0.65, 0.65, 1);
@@ -932,198 +922,20 @@ export class Renderer {
       root.add(ring);
       anim.aura = ring;
       extraMats.push(auraMat);
+      this.models.addEliteMarker(root, anim, materials);
     }
 
-    return { root, materials, extraMats, shape, anim, elite: !!enemy.elite, baseScale: scale };
-  }
-
-  _partsSlime(root, color, materials) {
-    const mat = this._newMat(color, { roughness: 0.3, metalness: 0.05, opacity: 0.88 }, materials);
-    const body = new THREE.Mesh(this._geo.sphereLow, mat);
-    body.scale.set(0.42, 0.3, 0.42);
-    body.position.y = 0.16;
-    root.add(body);
-    const eyeMat = this._newMat(0x111111, { roughness: 0.9 }, materials);
-    const eyeL = new THREE.Mesh(this._geo.sphereLow, eyeMat); eyeL.scale.setScalar(0.05); eyeL.position.set(-0.12, 0.28, 0.32); root.add(eyeL);
-    const eyeR = eyeL.clone(); eyeR.position.x = 0.12; root.add(eyeR);
-    return { body };
-  }
-
-  _partsSkeleton(root, color, materials) {
-    const boneMat = this._newMat(color, { roughness: 0.7 }, materials);
-    const torso = new THREE.Mesh(this._geo.box, boneMat); torso.scale.set(0.26, 0.4, 0.16); torso.position.y = 0.42; root.add(torso);
-    const head = new THREE.Mesh(this._geo.sphereLow, boneMat); head.scale.setScalar(0.15); head.position.y = 0.72; root.add(head);
-    const armL = new THREE.Mesh(this._geo.box, boneMat); armL.scale.set(0.07, 0.32, 0.07); armL.position.set(-0.18, 0.42, 0); root.add(armL);
-    const armR = armL.clone(); armR.position.x = 0.18; root.add(armR);
-    const legL = new THREE.Mesh(this._geo.box, boneMat); legL.scale.set(0.08, 0.34, 0.08); legL.position.set(-0.08, 0.15, 0); root.add(legL);
-    const legR = legL.clone(); legR.position.x = 0.08; root.add(legR);
-    const weaponMat = this._newMat(0x888888, { metalness: 0.6, roughness: 0.35 }, materials);
-    const weapon = new THREE.Mesh(this._geo.box, weaponMat); weapon.scale.set(0.05, 0.42, 0.05); weapon.position.set(0.24, 0.5, 0.05); root.add(weapon);
-    return { armL, armR, legL, legR };
-  }
-
-  _partsBat(root, color, materials) {
-    const mat = this._newMat(color, { roughness: 0.5 }, materials);
-    const body = new THREE.Mesh(this._geo.sphereLow, mat); body.scale.set(0.16, 0.14, 0.2); body.position.y = 0.55; root.add(body);
-    const wingMat = this._newMat(color.clone().multiplyScalar(0.85), { side: THREE.DoubleSide, roughness: 0.6 }, materials);
-    const wingL = new THREE.Mesh(this._geo.plane, wingMat); wingL.scale.set(0.4, 0.22, 1); wingL.position.set(-0.2, 0.55, 0); wingL.rotation.y = Math.PI / 2;
-    const wingR = wingL.clone(); wingR.position.x = 0.2;
-    root.add(wingL, wingR);
-    return { wingL, wingR, body };
-  }
-
-  _partsGoblin(root, color, materials) {
-    const mat = this._newMat(color, { roughness: 0.65 }, materials);
-    const torso = new THREE.Mesh(this._geo.box, mat); torso.scale.set(0.3, 0.34, 0.22); torso.position.y = 0.34; root.add(torso);
-    const head = new THREE.Mesh(this._geo.sphereLow, mat); head.scale.setScalar(0.16); head.position.y = 0.6; root.add(head);
-    const earL = new THREE.Mesh(this._geo.cone, mat); earL.scale.set(0.05, 0.12, 0.05); earL.position.set(-0.14, 0.63, 0); earL.rotation.z = 0.6; root.add(earL);
-    const earR = earL.clone(); earR.position.x = 0.14; earR.rotation.z = -0.6; root.add(earR);
-    const weaponMat = this._newMat(0x7a5a3a, { roughness: 0.8 }, materials);
-    const weapon = new THREE.Mesh(this._geo.box, weaponMat); weapon.scale.set(0.06, 0.34, 0.06); weapon.position.set(0.2, 0.4, 0.1); weapon.rotation.z = 0.4; root.add(weapon);
-    const armL = new THREE.Mesh(this._geo.box, mat); armL.scale.set(0.08, 0.24, 0.08); armL.position.set(-0.16, 0.34, 0); root.add(armL);
-    return { armL, weapon };
-  }
-
-  _partsSpider(root, color, materials) {
-    const mat = this._newMat(color, { roughness: 0.55 }, materials);
-    const body = new THREE.Mesh(this._geo.sphereLow, mat); body.scale.set(0.28, 0.2, 0.34); body.position.y = 0.22; root.add(body);
-    const abdomen = new THREE.Mesh(this._geo.sphereLow, mat); abdomen.scale.set(0.22, 0.18, 0.24); abdomen.position.set(0, 0.24, -0.26); root.add(abdomen);
-    const legs = [];
-    for (let i = 0; i < 8; i++) {
-      const side = i < 4 ? -1 : 1;
-      const idx = i % 4;
-      const leg = new THREE.Mesh(this._geo.box, mat);
-      leg.scale.set(0.4, 0.045, 0.045);
-      leg.position.set(side * 0.28, 0.2, -0.18 + idx * 0.13);
-      leg.rotation.y = side * 0.5 + (idx - 1.5) * 0.15;
-      root.add(leg);
-      legs.push({ mesh: leg, phase: i * 0.7, baseY: leg.position.y });
-    }
-    const eyeMat = this._newMat(0xff2222, { emissive: 0x660000, emissiveIntensity: 0.8 }, materials);
-    for (const dx of [-0.06, 0.06]) {
-      const eye = new THREE.Mesh(this._geo.sphereLow, eyeMat); eye.scale.setScalar(0.035); eye.position.set(dx, 0.3, 0.36); root.add(eye);
-    }
-    return { legs };
-  }
-
-  _partsMage(root, color, materials) {
-    const robeMat = this._newMat(color, { roughness: 0.75 }, materials);
-    const robe = new THREE.Mesh(this._geo.cone, robeMat); robe.scale.set(0.34, 0.55, 0.34); robe.position.y = 0.3; root.add(robe);
-    const headMat = this._newMat(0xd8b98a, { roughness: 0.8 }, materials);
-    const head = new THREE.Mesh(this._geo.sphereLow, headMat); head.scale.setScalar(0.14); head.position.y = 0.68; root.add(head);
-    const hood = new THREE.Mesh(this._geo.sphereLow, robeMat); hood.scale.set(0.17, 0.14, 0.17); hood.position.y = 0.74; root.add(hood);
-    const staffMat = this._newMat(0x5a4530, { roughness: 0.7 }, materials);
-    const staff = new THREE.Mesh(this._geo.cylinder, staffMat); staff.scale.set(0.03, 0.6, 0.03); staff.position.set(0.22, 0.4, 0); root.add(staff);
-    const orbMat = this._newMat(0x66aaff, { emissive: 0x3388ff, emissiveIntensity: 1.2 }, materials);
-    const orb = new THREE.Mesh(this._geo.sphereLow, orbMat); orb.scale.setScalar(0.08); orb.position.set(0.22, 0.72, 0); root.add(orb);
-    return { orb, staff };
-  }
-
-  _partsOgre(root, color, materials) {
-    const mat = this._newMat(color, { roughness: 0.7 }, materials);
-    const torso = new THREE.Mesh(this._geo.box, mat); torso.scale.set(0.6, 0.56, 0.4); torso.position.y = 0.5; root.add(torso);
-    const head = new THREE.Mesh(this._geo.sphereLow, mat); head.scale.setScalar(0.22); head.position.y = 0.94; root.add(head);
-    const armL = new THREE.Mesh(this._geo.box, mat); armL.scale.set(0.16, 0.44, 0.16); armL.position.set(-0.4, 0.5, 0); root.add(armL);
-    const armR = armL.clone(); armR.position.x = 0.4; root.add(armR);
-    const clubMat = this._newMat(0x6b5738, { roughness: 0.85 }, materials);
-    const club = new THREE.Mesh(this._geo.cylinder, clubMat); club.scale.set(0.12, 0.5, 0.12); club.position.set(0.5, 0.32, 0.1); club.rotation.z = 0.3; root.add(club);
-    return { armL, armR };
-  }
-
-  _partsBoss(root, color, materials, extraMats) {
-    const mat = this._newMat(color, { roughness: 0.6, metalness: 0.2 }, materials);
-    const torso = new THREE.Mesh(this._geo.box, mat); torso.scale.set(0.8, 0.8, 0.56); torso.position.y = 0.7; root.add(torso);
-    const head = new THREE.Mesh(this._geo.sphereLow, mat); head.scale.setScalar(0.3); head.position.y = 1.35; root.add(head);
-    const hornMat = this._newMat(0xffffff, { roughness: 0.3, metalness: 0.4 }, materials);
-    for (const s of [-1, 1]) {
-      const horn = new THREE.Mesh(this._geo.cone, hornMat); horn.scale.set(0.06, 0.22, 0.06); horn.position.set(s * 0.14, 1.55, 0); horn.rotation.z = s * 0.3; root.add(horn);
-    }
-    const eyeMat = this._newMat(0xff3300, { emissive: 0xff3300, emissiveIntensity: 1.5 }, materials);
-    for (const s of [-1, 1]) {
-      const eye = new THREE.Mesh(this._geo.sphereLow, eyeMat); eye.scale.setScalar(0.045); eye.position.set(s * 0.1, 1.38, 0.28); root.add(eye);
-    }
-    const armL = new THREE.Mesh(this._geo.box, mat); armL.scale.set(0.22, 0.6, 0.22); armL.position.set(-0.55, 0.7, 0); root.add(armL);
-    const armR = armL.clone(); armR.position.x = 0.55; root.add(armR);
-    const auraMat = new THREE.MeshBasicMaterial({ color: color.getHex(), transparent: true, opacity: 0.35, blending: THREE.AdditiveBlending, side: THREE.DoubleSide, depthWrite: false });
-    const aura = new THREE.Mesh(this._geo.ring, auraMat);
-    aura.rotation.x = -Math.PI / 2; aura.scale.set(0.95, 0.95, 1); aura.position.y = 0.04;
-    root.add(aura);
-    extraMats.push(auraMat);
-    return { armL, armR, aura, eyeMat };
-  }
-
-  _partsBlob(root, color, materials) {
-    const mat = this._newMat(color, { roughness: 0.6 }, materials);
-    const body = new THREE.Mesh(this._geo.sphereLow, mat); body.scale.set(0.3, 0.3, 0.3); body.position.y = 0.3; root.add(body);
-    return {};
+    return { root, materials, extraMats, shape, anim, elite: !!enemy.elite, baseScale: scale, topY: anim.topY || 0.9 };
   }
 
   _animateEnemyEntry(entry, enemy, dt, moving) {
-    entry.bobPhase = (entry.bobPhase !== undefined ? entry.bobPhase : Math.random() * 10) + dt * (moving ? 8 : 2.5);
-    const t = this._time;
-    switch (entry.shape) {
-      case 'slime': {
-        const squish = 1 + Math.sin(entry.bobPhase * 1.6) * 0.18;
-        if (entry.anim.body) entry.anim.body.scale.set(0.42 * (2 - squish), 0.3 * squish, 0.42 * (2 - squish));
-        break;
-      }
-      case 'bat': {
-        const flap = Math.sin(t * 14 + entry.bobPhase);
-        if (entry.anim.wingL) entry.anim.wingL.rotation.z = flap * 0.9;
-        if (entry.anim.wingR) entry.anim.wingR.rotation.z = -flap * 0.9;
-        entry.root.position.y = 0.3 + Math.sin(t * 3 + entry.bobPhase) * 0.08;
-        break;
-      }
-      case 'spider': {
-        for (const leg of entry.anim.legs || []) {
-          leg.mesh.position.y = leg.baseY + Math.sin(t * 10 + leg.phase) * (moving ? 0.04 : 0.015);
-        }
-        break;
-      }
-      case 'skeleton': {
-        const swing = moving ? Math.sin(entry.bobPhase * 1.8) * 0.5 : 0;
-        if (entry.anim.armL) entry.anim.armL.rotation.x = swing;
-        if (entry.anim.armR) entry.anim.armR.rotation.x = -swing;
-        if (entry.anim.legL) entry.anim.legL.rotation.x = -swing;
-        if (entry.anim.legR) entry.anim.legR.rotation.x = swing;
-        entry.root.position.y = moving ? Math.abs(Math.sin(entry.bobPhase)) * 0.04 : 0;
-        break;
-      }
-      case 'goblin': {
-        const swing = moving ? Math.sin(entry.bobPhase * 2) * 0.4 : 0;
-        if (entry.anim.armL) entry.anim.armL.rotation.x = swing;
-        entry.root.position.y = moving ? Math.abs(Math.sin(entry.bobPhase)) * 0.05 : 0;
-        break;
-      }
-      case 'mage': {
-        if (entry.anim.orb) entry.anim.orb.material.emissiveIntensity = 1.0 + 0.5 * Math.sin(t * 4);
-        entry.root.position.y = Math.sin(entry.bobPhase * 0.8) * 0.03;
-        break;
-      }
-      case 'ogre': {
-        const swing = moving ? Math.sin(entry.bobPhase * 1.4) * 0.35 : Math.sin(t * 1.5) * 0.05;
-        if (entry.anim.armL) entry.anim.armL.rotation.x = swing;
-        if (entry.anim.armR) entry.anim.armR.rotation.x = -swing;
-        entry.root.position.y = moving ? Math.abs(Math.sin(entry.bobPhase * 0.7)) * 0.05 : 0;
-        break;
-      }
-      case 'boss': {
-        const swing = moving ? Math.sin(entry.bobPhase * 1.1) * 0.3 : Math.sin(t * 1.2) * 0.06;
-        if (entry.anim.armL) entry.anim.armL.rotation.x = swing;
-        if (entry.anim.armR) entry.anim.armR.rotation.x = -swing;
-        if (entry.anim.eyeMat) entry.anim.eyeMat.emissiveIntensity = 1.2 + 0.6 * Math.sin(t * 5);
-        entry.root.position.y = moving ? Math.abs(Math.sin(entry.bobPhase * 0.6)) * 0.06 : 0;
-        break;
-      }
-      default:
-        entry.root.position.y = Math.sin(entry.bobPhase * 0.8) * 0.02;
-    }
-    if (entry.anim.aura) entry.anim.aura.rotation.z += dt * (entry.shape === 'boss' ? 0.5 : 0.9);
+    this.models.animateEnemy(entry, enemy, dt, moving, this._time);
+    if (entry.anim.aura) entry.anim.aura.rotation.z += dt * 0.9;
   }
 
   _applyStatusEffects(entry, enemy) {
-    const frozen = enemy.frozen > 0, slow = !frozen && enemy.slow > 0;
-    const flashAmt = Math.min(1, (enemy.hitFlash || 0) / 0.12);
+    const frozen = enemy.frozen > 0 && !enemy._gallery, slow = !frozen && enemy.slow > 0;
+    const flashAmt = Math.min(1, (enemy.hitFlash || 0) / HIT_FLASH_WINDOW);
     for (const m of entry.materials) {
       const base = m.userData.baseEmissive;
       let col = base;
@@ -1136,13 +948,55 @@ export class Renderer {
     }
   }
 
+  // Kicks off a brief recoil (mesh shoved away from the attacker, spring back) plus a
+  // squash-and-stretch pop. Purely a visual offset on top of whatever _lerpEntry/knockback did —
+  // never touches game state.
+  _triggerHitReaction(entry, enemy) {
+    const pe = this.playerEntry;
+    const fromX = pe ? pe.vx : enemy.x, fromY = pe ? pe.vy : enemy.y;
+    let dx = entry.vx - fromX, dy = entry.vy - fromY;
+    const d = Math.hypot(dx, dy);
+    if (d < 1e-3) { dx = enemy.facing?.x || 0; dy = enemy.facing?.y || 1; }
+    else { dx /= d; dy /= d; }
+    entry.hitRecoilDir = { x: dx, y: dy };
+    entry.hitRecoilTime = HIT_RECOIL_DURATION;
+    entry.hitSquashTime = HIT_SQUASH_DURATION;
+  }
+
+  _applyHitReaction(entry, dt) {
+    if (entry.hitRecoilTime > 0) {
+      entry.hitRecoilTime = Math.max(0, entry.hitRecoilTime - dt);
+      const t = entry.hitRecoilTime / HIT_RECOIL_DURATION; // 1 -> 0
+      const mag = HIT_RECOIL_DIST * t * t; // fast start, eases back to 0
+      entry.root.position.x += entry.hitRecoilDir.x * mag;
+      entry.root.position.z += entry.hitRecoilDir.y * mag;
+    }
+    let scaleY = 1, scaleXZ = 1;
+    if (entry.hitSquashTime > 0) {
+      entry.hitSquashTime = Math.max(0, entry.hitSquashTime - dt);
+      const t = entry.hitSquashTime / HIT_SQUASH_DURATION; // 1 -> 0
+      const amt = HIT_SQUASH_AMOUNT * t * t;
+      scaleY = 1 - amt * 0.6;
+      scaleXZ = 1 + amt * 0.6;
+    }
+    const base = entry.baseScale || 1;
+    entry.root.scale.set(base * scaleXZ, base * scaleY, base * scaleXZ);
+  }
+
   _animateEnemyDeath(entry, enemy) {
     if (entry.deathStart === undefined) entry.deathStart = Math.max(enemy.deathTimer || 0.4, 0.0001);
     const t = 1 - THREE.MathUtils.clamp((enemy.deathTimer || 0) / entry.deathStart, 0, 1);
-    entry.root.scale.setScalar(Math.max(0.001, (1 - t)) * (entry.baseScale || 1));
+    // A quick pop right at the moment of death, then a shrinking implosion — reads as a "pop"
+    // instead of a plain fade/shrink.
+    const shrink = Math.max(0, 1 - t);
+    const pop = t < DEATH_POP_FRAC ? DEATH_POP_AMOUNT * (1 - t / DEATH_POP_FRAC) : 0;
+    entry.root.scale.setScalar(Math.max(0.001, shrink + pop) * (entry.baseScale || 1));
     entry.root.position.y = -t * 0.6;
-    for (const m of entry.materials) m.opacity = Math.max(0, 1 - t);
-    for (const m of entry.extraMats) m.opacity = Math.max(0, (m.userData?.baseOpacity ?? m.opacity) * (1 - t));
+    for (const m of entry.materials) m.opacity = Math.max(0, (m.userData.baseOpacity ?? 1) * (1 - t));
+    for (const m of entry.extraMats) {
+      if (m.userData.baseOpacity === undefined) m.userData.baseOpacity = m.opacity;
+      m.opacity = Math.max(0, m.userData.baseOpacity * (1 - t));
+    }
     if (entry.hpBarGroup) entry.hpBarGroup.visible = false;
   }
 
@@ -1168,9 +1022,10 @@ export class Renderer {
     entry.hpBarFg.position.x = -0.3 * (1 - frac);
     entry.hpBarFg.material.color.setRGB(1 - frac, frac, 0.08);
     const scaleUp = entry.elite ? 1.25 : (entry.shape === 'boss' ? 1.5 : 1);
-    const heightAdd = (entry.elite ? 0.3 : 0) + (entry.shape === 'boss' ? 0.55 : 0);
+    // Sit just above the model's head (and the elite gem), following hovering/hopping bodies.
+    const top = (entry.topY || 0.9) + (entry.elite ? 0.42 : 0.16);
     entry.hpBarGroup.scale.setScalar(scaleUp);
-    entry.hpBarGroup.position.set(entry.vx, 1.05 * (entry.baseScale || 1) + heightAdd, entry.vy);
+    entry.hpBarGroup.position.set(entry.vx, top * (entry.baseScale || 1) + 0.08 + Math.max(0, entry.root.position.y), entry.vy);
     entry.hpBarGroup.quaternion.copy(this.camera.quaternion);
     if (entry.elite) entry.hpBarBg.material.color.setHex(0x554010);
   }
@@ -1193,7 +1048,9 @@ export class Renderer {
       }
       const visible = this._tileVisible(map, enemy.x, enemy.y) || this._tileVisible(map, entry.vx, entry.vy);
       entry.root.visible = visible;
-      if (entry.hpBarGroup) entry.hpBarGroup.visible = visible && !enemy.dead && enemy.hp < enemy.maxHp;
+      // Bosses show their HP in the top-of-screen HUD bar instead — the overhead bar would
+      // just duplicate it.
+      if (entry.hpBarGroup) entry.hpBarGroup.visible = visible && !enemy.dead && enemy.hp < enemy.maxHp && entry.shape !== 'boss';
       if (!visible) continue;
 
       if (enemy.dead) {
@@ -1201,17 +1058,96 @@ export class Renderer {
         continue;
       }
 
+      // A fresh hit (hitFlash just reset) kicks off a recoil + squash pop, independent of any
+      // tile knockback — this fires on every hit, including ones that don't move the enemy.
+      const flash = enemy.hitFlash || 0;
+      if (flash > (entry._prevHitFlash || 0) + 1e-6) this._triggerHitReaction(entry, enemy);
+      entry._prevHitFlash = flash;
+
+      // A fresh tile-knockback (enemy._kbTime just (re)set by game.damageEnemy) is animated as a
+      // fast-start/ease-out shove instead of the generic constant-speed lerp.
+      const kbTime = enemy._kbTime || 0;
+      if (kbTime > (entry._prevKbTime || 0) + 1e-6) {
+        entry._kbFromX = entry.vx; entry._kbFromY = entry.vy;
+        entry._kbToX = enemy.x; entry._kbToY = enemy.y;
+        entry._kbDuration = kbTime;
+      }
+      entry._prevKbTime = kbTime;
+
+      // Slime King's Hop Slam: a fresh boss leap (enemy._hopTime just (re)set by enemies.js)
+      // is animated as an arc from the takeoff tile to the landing tile, overriding both the
+      // knockback ease and the generic lerp for its duration.
+      const hopTime = enemy._hopTime || 0;
+      if (hopTime > (entry._prevHopTime || 0) + 1e-6) {
+        const from = enemy._hopFrom || { x: entry.vx, y: entry.vy };
+        entry._hopFromX = from.x; entry._hopFromY = from.y;
+        entry._hopToX = enemy.x; entry._hopToY = enemy.y;
+        entry._hopDuration = enemy._hopDur || hopTime;
+      }
+      entry._prevHopTime = hopTime;
+
       const prevX = entry.vx, prevY = entry.vy;
-      this._lerpEntry(entry, enemy.x, enemy.y, dt, 16);
+      if (hopTime > 0 && entry._hopDuration) {
+        const t = THREE.MathUtils.clamp(1 - hopTime / entry._hopDuration, 0, 1);
+        entry.vx = THREE.MathUtils.lerp(entry._hopFromX, entry._hopToX, t);
+        entry.vy = THREE.MathUtils.lerp(entry._hopFromY, entry._hopToY, t);
+        entry.root.position.x = entry.vx;
+        entry.root.position.z = entry.vy;
+        entry._hopArcY = Math.sin(Math.PI * t) * 0.9;
+      } else if (kbTime > 0 && entry._kbDuration) {
+        const t = THREE.MathUtils.clamp(1 - kbTime / entry._kbDuration, 0, 1);
+        const eased = 1 - Math.pow(1 - t, 3); // ease-out cubic: fast start, settles at the end
+        entry.vx = THREE.MathUtils.lerp(entry._kbFromX, entry._kbToX, eased);
+        entry.vy = THREE.MathUtils.lerp(entry._kbFromY, entry._kbToY, eased);
+        entry.root.position.x = entry.vx;
+        entry.root.position.z = entry.vy;
+        entry._hopArcY = 0;
+      } else {
+        entry._hopArcY = 0;
+        this._lerpEntry(entry, enemy.x, enemy.y, dt, 16);
+      }
       const moved = Math.hypot(entry.vx - prevX, entry.vy - prevY) > 0.001;
       const targetAngle = facingAngle(enemy.facing?.x || 0, enemy.facing?.y || 1);
       this._rotateEntryTowards(entry, targetAngle, dt);
       this._applyStatusEffects(entry, enemy);
       this._animateEnemyEntry(entry, enemy, dt, moved);
+      this._applyHitReaction(entry, dt);
       this._updateHealthBar(entry, enemy);
     }
     for (const [id, entry] of this.enemyEntries) {
       if (!seen.has(id)) { this._removeEntry(entry); this.enemyEntries.delete(id); }
+    }
+  }
+
+  // ---------------------------------------------------------------- npcs (merchant)
+  // A travelling merchant (models.js): feathered hat, overstuffed backpack, swinging lantern, wares on
+  // a rug, and a bobbing/spinning coin above so the tile reads as "shop" from the top-down camera.
+  _buildNpcVisual(npc) {
+    const entry = this.models.buildMerchant();
+    entry.root.scale.setScalar(ENTITY_SCALE);
+    return entry;
+  }
+
+  _syncNpcs(game, dt) {
+    const list = game.npcs || [];
+    const seen = new Set();
+    const map = game.map;
+    for (const npc of list) {
+      seen.add(npc.id);
+      let entry = this.npcEntries.get(npc.id);
+      if (!entry) {
+        entry = this._buildNpcVisual(npc);
+        this.scene.add(entry.root);
+        this.npcEntries.set(npc.id, entry);
+      }
+      entry.root.position.set(npc.x, 0, npc.y);
+      const visible = this._tileVisible(map, npc.x, npc.y);
+      entry.root.visible = visible;
+      if (!visible) continue;
+      this.models.animateMerchant(entry, npc, game.player, dt);
+    }
+    for (const [id, entry] of this.npcEntries) {
+      if (!seen.has(id)) { this._removeEntry(entry); this.npcEntries.delete(id); }
     }
   }
 
@@ -1512,17 +1448,106 @@ export class Renderer {
 
   spawnEffect(type, x, y, opts = {}) {
     switch (type) {
-      case 'slash': this._fxSlash(x, y, opts); break;
+      case 'slash':
+        this._fxSlash(x, y, opts);
+        if (this.playerEntry) this.playerEntry.swingT = SWING_DURATION; // hero swings the held weapon
+        break;
       case 'nova': this._fxNova(x, y, opts); break;
       case 'dash': this._fxDash(x, y, opts); break;
-      case 'hit': this._fxBurst(x, y, { color: opts.color || '#ffdd88', count: 10, speed: 2.5, size: 0.09, duration: 0.35, gravity: 0 }); break;
+      case 'hit': {
+        const crit = !!opts.crit;
+        this._fxBurst(x, y, {
+          color: opts.color || '#ffdd88',
+          count: crit ? CRIT_BURST_COUNT : HIT_BURST_COUNT,
+          speed: crit ? CRIT_BURST_SPEED : HIT_BURST_SPEED,
+          size: crit ? CRIT_BURST_SIZE : HIT_BURST_SIZE,
+          duration: 0.35, gravity: 0,
+        });
+        if (crit) this._fxCritFlash(x, y);
+        break;
+      }
       case 'death': this._fxBurst(x, y, { color: opts.color || '#ff5555', count: 18, speed: 3.2, size: 0.12, duration: 0.6, gravity: 3 }); break;
       case 'levelup': this._fxLevelup(x, y, opts); break;
       case 'heal': this._fxBurst(x, y, { color: opts.color || '#55ff88', count: 14, speed: 1.0, size: 0.09, duration: 0.9, gravity: -1.0 }); break;
       case 'pickup': this._fxBurst(x, y, { color: opts.color || '#ffffff', count: 6, speed: 1.0, size: 0.06, duration: 0.35, gravity: -0.5 }); break;
       case 'exit': this._fxNova(x, y, { radius: opts.radius || 3, color: this._theme ? this._theme.accent : 0x8fe0ff }); this.shake(0.15); break;
+      case 'telegraphCircle': this._fxTelegraphCircle(x, y, opts); break;
+      case 'telegraphLine': this._fxTelegraphLine(x, y, opts); break;
       default: break;
     }
+  }
+
+  // A red ground disc + outline ring that fills in over `duration`, then a quick bright
+  // flash right as the attack detonates. Boss AoE telegraphs (e.g. Slime King's Hop Slam).
+  _fxTelegraphCircle(x, y, opts = {}) {
+    const radius = opts.radius || 1.5;
+    const duration = opts.duration || 0.8;
+    const color = new THREE.Color(opts.color !== undefined ? opts.color : 0xff3b3b);
+    const fillMat = this._telegraphFillMatTpl.clone();
+    fillMat.color.copy(color);
+    const fill = new THREE.Mesh(this._geo.telegraphDisc, fillMat);
+    fill.position.set(x, 0.02, y);
+    fill.scale.setScalar(0.001);
+    const ringMat = this._telegraphRingMatTpl.clone();
+    ringMat.color.copy(color);
+    const ring = new THREE.Mesh(this._geo.telegraphRing, ringMat);
+    ring.position.set(x, 0.021, y);
+    ring.scale.setScalar(radius);
+    this.scene.add(fill, ring);
+    this.effects.push({
+      obj: fill, extra: ring, mats: [fillMat, ringMat], age: 0, duration, update: (t) => {
+        if (t < 0.88) {
+          const grow = t / 0.88;
+          fill.scale.setScalar(Math.max(0.001, radius * grow));
+          fillMat.opacity = 0.24 + 0.2 * grow;
+          ringMat.opacity = 0.5 + 0.35 * grow;
+        } else {
+          const ft = (t - 0.88) / 0.12;
+          fill.scale.setScalar(radius * (1 + ft * 0.25));
+          fillMat.opacity = Math.max(0, 0.7 * (1 - ft));
+          fillMat.color.lerp(TMP_COLOR2.setHex(0xffffff), ft * 0.6);
+          ringMat.opacity = Math.max(0, 0.9 * (1 - ft));
+        }
+      },
+    });
+  }
+
+  // Same idea as the circle telegraph, but a growing line from (x,y) out along (dx,dy) for
+  // `length` tiles. Boss line/lane telegraphs (Bone Tyrant's spears and charge lane).
+  _fxTelegraphLine(x, y, opts = {}) {
+    const dx = opts.dx ?? 0, dy = opts.dy ?? 1;
+    const dlen = Math.hypot(dx, dy) || 1;
+    const ux = dx / dlen, uy = dy / dlen;
+    const length = opts.length || 5;
+    const width = opts.width || 1;
+    const duration = opts.duration || 0.8;
+    const color = new THREE.Color(opts.color !== undefined ? opts.color : 0xff3b3b);
+    const angle = Math.atan2(ux, uy); // matches facingAngle()'s convention used elsewhere
+    const fillMat = this._telegraphFillMatTpl.clone();
+    fillMat.color.copy(color);
+    const mesh = new THREE.Mesh(this._geo.box, fillMat);
+    mesh.rotation.y = angle;
+    mesh.position.set(x, 0.02, y);
+    mesh.scale.set(width, 0.03, 0.001);
+    this.scene.add(mesh);
+    this.effects.push({
+      obj: mesh, mats: [fillMat], age: 0, duration, update: (t) => {
+        let curLen, opac;
+        if (t < 0.85) {
+          const grow = t / 0.85;
+          curLen = Math.max(0.001, length * grow);
+          opac = 0.32 + 0.22 * grow;
+        } else {
+          const ft = (t - 0.85) / 0.15;
+          curLen = length * (1 + ft * 0.08);
+          opac = Math.max(0, 0.75 * (1 - ft));
+          fillMat.color.lerp(TMP_COLOR2.setHex(0xffffff), ft * 0.6);
+        }
+        mesh.scale.set(width, 0.03, curLen);
+        mesh.position.set(x + ux * curLen / 2, 0.02, y + uy * curLen / 2);
+        fillMat.opacity = opac;
+      },
+    });
   }
 
   _fxSlash(x, y, opts) {
@@ -1643,6 +1668,24 @@ export class Renderer {
     });
   }
 
+  // Small bright pop layered on top of the hit burst so crits read as extra punchy.
+  _fxCritFlash(x, y) {
+    const mat = new THREE.SpriteMaterial({
+      map: this._tex.glow, color: 0xfff3b0, transparent: true, opacity: 0.9,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+    const spr = new THREE.Sprite(mat);
+    spr.position.set(x, 0.5, y);
+    spr.scale.setScalar(0.3);
+    this.scene.add(spr);
+    this.effects.push({
+      obj: spr, mats: [mat], age: 0, duration: CRIT_FLASH_DURATION, update: (t) => {
+        spr.scale.setScalar(THREE.MathUtils.lerp(0.3, 1.5, t));
+        mat.opacity = 0.9 * (1 - t);
+      },
+    });
+  }
+
   _fxLevelup(x, y) {
     const mat = new THREE.MeshBasicMaterial({ color: 0xffd34f, transparent: true, opacity: 0.7, blending: THREE.AdditiveBlending, depthWrite: false });
     const beam = new THREE.Mesh(this._geo.cylinder, mat);
@@ -1677,7 +1720,7 @@ export class Renderer {
     const size = crit ? 22 : 15;
     el.style.cssText = `position:absolute;left:0;top:0;transform:translate(-50%,-50%);font-family:Fredoka,Nunito,Arial,sans-serif;font-weight:700;white-space:nowrap;pointer-events:none;color:${color || '#ffffff'};text-shadow:-1px -1px 0 #000,1px -1px 0 #000,-1px 1px 0 #000,1px 1px 0 #000,0 2px 4px rgba(0,0,0,0.7);font-size:${size}px;`;
     this.overlay.appendChild(el);
-    this._floatTexts.push({ el, wx: x, wy: y, wz: 0.9, age: 0, duration: crit ? 1.2 : 0.9, rise: crit ? 1.4 : 1.0 });
+    this._floatTexts.push({ el, wx: x, wy: y, wz: 0.9, age: 0, duration: crit ? 1.2 : 0.9, rise: crit ? 1.4 : 1.0, crit });
   }
 
   _updateFloatTexts(dt) {
@@ -1693,7 +1736,12 @@ export class Renderer {
       TMP_VEC.project(this.camera);
       const sx = (TMP_VEC.x * 0.5 + 0.5) * w;
       const sy = (1 - (TMP_VEC.y * 0.5 + 0.5)) * h;
-      ft.el.style.transform = `translate(-50%,-50%) translate(${sx}px, ${sy}px)`;
+      let transform = `translate(-50%,-50%) translate(${sx}px, ${sy}px)`;
+      if (ft.crit && ft.age < CRIT_FLOAT_POP_DURATION) {
+        const pop = 1 + CRIT_FLOAT_POP_AMOUNT * (1 - ft.age / CRIT_FLOAT_POP_DURATION);
+        transform += ` scale(${pop})`;
+      }
+      ft.el.style.transform = transform;
       ft.el.style.opacity = String(1 - t * t);
       ft.el.style.display = (TMP_VEC.z > 1 || TMP_VEC.z < -1) ? 'none' : '';
     }

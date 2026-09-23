@@ -195,11 +195,17 @@ const SLOT_BASE_STATS = {
   },
 };
 
+// Attribute stats grow slowly (~0.25-0.4/level in SLOT_BASE_STATS and most affixes) — rounding
+// them to whole numbers made items feel identical for several levels in a row. Keeping one
+// decimal place instead (same trick already used for hpRegen/manaRegen) makes every level read
+// as a real upgrade without touching the growth formulas or inflating power.
+const ONE_DECIMAL_KEYS = new Set(['hpRegen', 'manaRegen', 'str', 'dex', 'int', 'vit', 'def']);
+
 function finalizeStats(stats) {
   for (const k of Object.keys(stats)) {
     let v = stats[k];
     if (k === 'critChance' || k === 'moveSpeed') v = Math.round(v * 100) / 100;
-    else if (k === 'hpRegen' || k === 'manaRegen') v = Math.round(v * 10) / 10;
+    else if (ONE_DECIMAL_KEYS.has(k)) v = Math.round(v * 10) / 10;
     else v = Math.round(v);
     if (!v) { delete stats[k]; continue; }
     stats[k] = v;
@@ -362,19 +368,29 @@ export function rollLoot(enemy, depth, rng) {
   if (isBoss) {
     const n = rng.int(3, 5);
     let haveRarePlus = false;
+    // The boss's guaranteed drop is at least rare, with a shot at epic/legendary that
+    // improves slightly the deeper the run goes.
+    const depthBonus = clamp(depth / 40, 0, 1);
+    const legendaryChance = 0.05 + depthBonus * 0.05; // 5% -> 10%
+    const epicChance = 0.25 + depthBonus * 0.10;      // 25% -> 35%
+    let guaranteedMin = 'rare';
+    if (rng.chance(legendaryChance)) guaranteedMin = 'legendary';
+    else if (rng.chance(epicChance)) guaranteedMin = 'epic';
     for (let i = 0; i < n; i++) {
-      const forceMin = (!haveRarePlus && i === n - 1) ? 'rare' : null;
+      const forceMin = (!haveRarePlus && i === n - 1) ? guaranteedMin : null;
       const item = generateItem(depth, rng, { boss: true, minRarity: forceMin });
       if (RARITY_ORDER.indexOf(item.rarity) >= RARITY_ORDER.indexOf('rare')) haveRarePlus = true;
       drops.push(item);
     }
+    // Bosses always leave a health potion behind, on top of the mob potion roll below.
+    drops.push(generateItem(depth, rng, { type: 'potion', potionKind: 'health' }));
   } else {
     const dropChance = isElite ? 0.6 : 0.18;
     if (rng.chance(dropChance)) drops.push(generateItem(depth, rng, { elite: isElite }));
   }
 
-  // Potion
-  if (rng.chance(0.12)) {
+  // Potion (bosses already got a guaranteed health potion above)
+  if (!isBoss && rng.chance(0.12)) {
     const kind = rng.chance(0.65) ? 'health' : 'mana';
     drops.push(generateItem(depth, rng, { type: 'potion', potionKind: kind }));
   }
@@ -422,6 +438,7 @@ export function useItem(game, item) {
       const healed = player.hp - before;
       game.floatText?.(player.x, player.y, `+${healed} HP`, '#4caf50');
       game.effect?.('heal', player.x, player.y);
+      game.bus?.emit('potionUsed', { kind: 'heal' });
       used = true;
     }
   }
@@ -432,6 +449,7 @@ export function useItem(game, item) {
       const gained = player.mana - before;
       game.floatText?.(player.x, player.y, `+${gained} MP`, '#4f8cff');
       game.effect?.('heal', player.x, player.y);
+      game.bus?.emit('potionUsed', { kind: 'mana' });
       used = true;
     }
   }
@@ -459,6 +477,14 @@ export function dropItem(game, item) {
 
 export function sellValue(item) {
   return Math.max(1, Math.round(item.value * 0.35));
+}
+
+// Merchant buy price. Chosen so sellValue/buyPrice lands around 27% (within the ~25-35%
+// "sell back a fraction of what you paid" range) while keeping potions and a magic item or
+// two affordable at a merchant depth, with rares costing a more serious chunk of savings.
+export const BUY_MULT = 1.3;
+export function buyPrice(item) {
+  return Math.max(1, Math.round(item.value * BUY_MULT));
 }
 
 export function addToInventory(player, item) {
@@ -489,6 +515,7 @@ function escapeHtml(s) {
 function formatStatValue(key, val) {
   if (key === 'critChance' || key === 'moveSpeed') return `${(val * 100).toFixed(1)}%`;
   if (key === 'hpRegen' || key === 'manaRegen') return `${val.toFixed(1)}/s`;
+  if (ONE_DECIMAL_KEYS.has(key)) return `${val.toFixed(1)}`;
   return `${Math.round(val)}`;
 }
 
@@ -558,9 +585,8 @@ export function itemTooltip(item, player) {
 
   if (item.type === 'potion') {
     parts.push(`<div class="tt-stack">Stack: ${item.stack}/${item.maxStack}</div>`);
-  } else {
-    parts.push(`<div class="tt-ilvl">Item Level ${item.itemLevel}</div>`);
   }
+  parts.push(`<div class="tt-ilvl">Item Level ${item.itemLevel}</div>`);
   parts.push(`<div class="tt-value">Value: ${item.value}g</div>`);
 
   if (item.type !== 'potion' && player?.equipment) {
