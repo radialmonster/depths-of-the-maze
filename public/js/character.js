@@ -6,7 +6,7 @@
 // ---------------------------------------------------------------------------
 export const ATTRIBUTES = [
   { id: 'str', name: 'Strength', description: 'Increases melee damage and adds a small amount of max HP.' },
-  { id: 'dex', name: 'Dexterity', description: 'Increases crit chance, dodge chance, and move speed slightly. Arcane Bolt aim assist (max 20%).' },
+  { id: 'dex', name: 'Dexterity', description: 'Increases crit chance, dodge chance, and move speed slightly. Improves Aim.' },
   { id: 'int', name: 'Intelligence', description: 'Increases max mana, spell power, and mana regen.' },
   { id: 'vit', name: 'Vitality', description: 'Increases max HP and HP regen.' },
   { id: 'def', name: 'Defense', description: 'Reduces incoming damage (diminishing returns).' },

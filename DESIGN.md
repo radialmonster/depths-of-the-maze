@@ -141,7 +141,7 @@ player = {
   hp, mana,
   stats: { maxHp, maxMana, meleeMin, meleeMax, rangedMin, rangedMax, spellPower, defense, critChance, critMult,
            moveCooldown /*s per tile, ~0.14*/, hpRegen, manaRegen /*per s*/, dodgeChance,
-           autoAimAssist /*0..0.20, dex-driven Arcane Bolt aim nudge, see §17.5*/ },
+           autoAimAssist /*0..0.20, dex-driven ranged-skill aim nudge (currently Arcane Bolt), see §17.5*/ },
   equipment: { weapon:null, offhand:null, helm:null, armor:null, boots:null, ring:null, amulet:null },
   inventory: [],               // max 24 item objects (INVENTORY_SIZE exported)
   skills: [skill, skill, skill, skill],        // from skills.js createSkillLoadout()
@@ -377,10 +377,13 @@ Decisions made with the user while building. Keep this section current — when 
 - Hit-stop freezes the whole sim briefly (crit 45ms, kill 60ms, boss hit 50ms, boss kill 150ms); input still registers.
 - Camera shake: crit, boss hit, light on kills (shakes take the max, never stack). Crits: bigger popping numbers + sparks.
 - Player hit: red screen-edge pulse scaled by damage fraction.
-- **Dex aim assist** (`stats.autoAimAssist` = dex × 0.001, cap 0.20 at 200 dex): when Arcane Bolt is cast, its direction
-  is blended by that fraction toward the closest living enemy within bolt range (10), inside a 40° half-angle cone
-  of the aim, and in line of sight. Only the initial direction is nudged (max ~8°) — the bolt then flies straight, no
-  homing, so enemies can still sidestep. No target = fires exactly where aimed. Not a lock-on; keep it small.
+- **Dex aim assist** (`stats.autoAimAssist` = dex × 0.001, cap 0.20 at 200 dex): applies to the player's ranged skill
+  (currently Arcane Bolt in skill slot 2 — `skills.js`'s `assistAim()` helper isn't tied to that skill's identity, so
+  it keeps working if a different ranged skill ever occupies that slot). On cast, the fire direction is blended by
+  that fraction toward the closest living enemy within range (10), inside a 40° half-angle cone of the aim, and in
+  line of sight. Only the initial direction is nudged (max ~8°) — the projectile then flies straight, no homing, so
+  enemies can still sidestep. No target = fires exactly where aimed. Not a lock-on; keep it small. Character screen
+  describes this to the player simply as "Improves Aim" (no skill name, no numbers).
 
 ### 17.6 Elements & resistances
 - Damage has an **element**: physical, arcane, frost, fire, poison, lightning (fire/poison/lightning reserved for future

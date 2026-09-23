@@ -18,9 +18,11 @@ const BOLT_BASE_CD = 0.6;
 const BOLT_MANA = 6;
 const BOLT_SPEED = 14;
 const BOLT_RANGE = 10;
-// Dex auto-aim assist (player.stats.autoAimAssist, 0..0.20): at cast time only, blend the fire direction toward
-// the closest visible enemy inside this forward cone and BOLT_RANGE. The bolt still flies straight (no homing).
-const BOLT_ASSIST_CONE_COS = Math.cos(40 * Math.PI / 180); // 40deg half-angle, like main.js BUMP_CONE; max nudge ~8deg
+// Dex auto-aim assist (player.stats.autoAimAssist, 0..0.20): applies to the player's ranged skill (currently
+// Arcane Bolt, skill slot 2 — assistAim() is generic and isn't tied to that skill's identity, so it keeps working
+// if a different ranged skill ever occupies that slot). At cast time only, blend the fire direction toward the
+// closest visible enemy inside this forward cone and BOLT_RANGE. The bolt still flies straight (no homing).
+const RANGED_ASSIST_CONE_COS = Math.cos(40 * Math.PI / 180); // 40deg half-angle, like main.js BUMP_CONE; max nudge ~8deg
 
 const NOVA_BASE_CD = 6.0;
 const NOVA_MANA = 20;
@@ -257,8 +259,10 @@ function castArcaneBolt(game, player, skill) {
   return true;
 }
 
-// Nudge the initial bolt direction toward the closest enemy that is in range, inside the forward cone, and in
-// line of sight, by player.stats.autoAimAssist. Returns `aim` unchanged when there is no assist or no target.
+// Generic ranged-skill aim assist: nudges the initial fire direction toward the closest enemy that is in range,
+// inside the forward cone, and in line of sight, by player.stats.autoAimAssist. Not tied to any one skill's
+// identity — any ranged skill's cast function can call this. Returns `aim` unchanged when there is no assist
+// or no target.
 function assistAim(game, player, aim, ox, oy) {
   const assist = (player.stats && player.stats.autoAimAssist) || 0;
   const alen = Math.hypot(aim.x, aim.y);
@@ -270,7 +274,7 @@ function assistAim(game, player, aim, ox, oy) {
     const ex = e.x - ox, ey = e.y - oy;
     const d = Math.hypot(ex, ey);
     if (d === 0 || d >= bestD) continue;
-    if ((ex * ax + ey * ay) / d < BOLT_ASSIST_CONE_COS) continue;
+    if ((ex * ax + ey * ay) / d < RANGED_ASSIST_CONE_COS) continue;
     if (canSee && !game.hasLineOfSight(player.x, player.y, e.x, e.y)) continue;
     best = { x: ex / d, y: ey / d };
     bestD = d;
