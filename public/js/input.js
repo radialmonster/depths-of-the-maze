@@ -97,6 +97,7 @@ export class Input {
     // Keyboard state.
     this._heldKeys = new Set();       // codes currently down
     this._kbQueue = [];               // queued non-repeat keydown codes, flushed in update()
+    this._virtualQueue = [];          // action names queued via queueAction() (e.g. mouse-clicked HUD icons), flushed in update()
 
     // Cross-device directional held-state (combined keyboard + dpad + stick).
     this._dirHeldNow = { up: false, down: false, left: false, right: false };
@@ -111,6 +112,7 @@ export class Input {
     // Gamepad state (per button index -> pressed bool from previous poll).
     this._padButtonsPrev = {};
     this._padButtonsNow = {};
+    this._stickActivePrev = false; // was the left stick past STICK_DEADZONE last poll? (for lastDevice edge-detection)
 
     this._lastTime = (typeof performance !== 'undefined' ? performance.now() : Date.now());
 
@@ -165,6 +167,16 @@ export class Input {
       this._kbQueue.length = 0;
     }
 
+    // --- Flush queued virtual (mouse-clicked HUD) edges ---
+    // Goes through the same pressed()-edge path as a real key/button, so a click behaves
+    // identically to pressing the bound key (facing/aim setup, dash position-sync, etc. in
+    // main.js's per-action handling all still run).
+    if (this._virtualQueue.length) {
+      for (const a of this._virtualQueue) this._frameEdges.add(a);
+      this._anyEdgeThisFrame = true;
+      this._virtualQueue.length = 0;
+    }
+
     // --- Keyboard directional held-state ---
     const kbDir = { up: false, down: false, left: false, right: false };
     for (const dir of DIR_NAMES) {
@@ -196,15 +208,21 @@ export class Input {
     this._padButtonsNow = {};
 
     if (pad) {
-      let padActive = false;
+      // padFreshInput drives lastDevice/padStyle (which controls the keyboard-vs-gamepad hint
+      // icons): true only on a NEW gamepad edge this frame (a button going down, or the stick
+      // crossing INTO its deadzone), never merely "still held/still outside the deadzone".
+      // Otherwise, holding a direction on the stick (normal continuous movement) would reassert
+      // lastDevice = 'gamepad' every single frame and fight a keyboard press made while still
+      // holding it — pressing a keyboard key would appear to never switch the icons back.
+      let padFreshInput = false;
 
       // Face/shoulder/trigger buttons.
       for (let i = 0; i < pad.buttons.length; i++) {
         const pressed = !!(pad.buttons[i] && pad.buttons[i].pressed);
         this._padButtonsNow[i] = pressed;
-        if (pressed) padActive = true;
         const wasPressed = !!this._padButtonsPrev[i];
         if (pressed && !wasPressed) {
+          padFreshInput = true;
           const actions = BUTTON_TO_ACTIONS[i];
           if (actions) for (const a of actions) this._frameEdges.add(a);
           this._anyEdgeThisFrame = true;
@@ -222,21 +240,25 @@ export class Input {
       const ay = pad.axes[1] || 0;
       // Free-movement vector: radial deadzone, magnitude rescaled to 0..1.
       const len = Math.hypot(ax, ay);
-      if (len > STICK_DEADZONE) {
+      const stickActiveNow = len > STICK_DEADZONE;
+      if (stickActiveNow) {
         const mag = Math.min(1, (len - STICK_DEADZONE) / (1 - STICK_DEADZONE));
         this._stick = { x: ax / len, y: ay / len, mag };
-        padActive = true;
       }
+      if (stickActiveNow && !this._stickActivePrev) padFreshInput = true;
+      this._stickActivePrev = stickActiveNow;
       if (Math.abs(ax) > Math.abs(ay)) {
-        if (Math.abs(ax) > GAMEPAD_DEADZONE) { padDir[ax < 0 ? 'left' : 'right'] = true; padActive = true; }
+        if (Math.abs(ax) > GAMEPAD_DEADZONE) padDir[ax < 0 ? 'left' : 'right'] = true;
       } else {
-        if (Math.abs(ay) > GAMEPAD_DEADZONE) { padDir[ay < 0 ? 'up' : 'down'] = true; padActive = true; }
+        if (Math.abs(ay) > GAMEPAD_DEADZONE) padDir[ay < 0 ? 'up' : 'down'] = true;
       }
 
-      if (padActive) {
+      if (padFreshInput) {
         this.lastDevice = 'gamepad';
         this.padStyle = PS_PAD_ID_RE.test(pad.id || '') ? 'playstation' : 'xbox';
       }
+    } else {
+      this._stickActivePrev = false; // no pad connected — a later reconnect+engage counts as fresh
     }
 
     // --- Combine directional sources ---
@@ -302,6 +324,16 @@ export class Input {
   // -------------------------------------------------------------------
   pressed(action) {
     return this._frameEdges.has(action);
+  }
+
+  // -------------------------------------------------------------------
+  // queueAction(action) -> queues a synthetic one-frame press of `action`, picked up on the
+  // next update() exactly like a real key/button edge. For UI elements (e.g. clicking a HUD
+  // skill icon) that should trigger the same behavior as their bound key, without ui.js
+  // reaching into game logic directly.
+  // -------------------------------------------------------------------
+  queueAction(action) {
+    this._virtualQueue.push(action);
   }
 
   // -------------------------------------------------------------------
