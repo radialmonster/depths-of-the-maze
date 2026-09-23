@@ -961,7 +961,7 @@ export class Renderer {
     const fromX = pe ? pe.vx : enemy.x, fromY = pe ? pe.vy : enemy.y;
     let dx = entry.vx - fromX, dy = entry.vy - fromY;
     const d = Math.hypot(dx, dy);
-    if (d < 1e-3) { dx = enemy.facing?.x || 0; dy = enemy.facing?.y || 1; }
+    if (d < 1e-3) { dx = enemy.facing?.x || 0; dy = enemy.facing?.y || 0; }
     else { dx /= d; dy /= d; }
     entry.hitRecoilDir = { x: dx, y: dy };
     entry.hitRecoilTime = HIT_RECOIL_DURATION;
