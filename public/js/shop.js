@@ -199,9 +199,9 @@ export function buyFromMerchant(game, merchant, stockKind, index) {
 }
 
 // Sells one bag slot (by inventory index) to the merchant. Equipped items aren't in the bag
-// array so this can never touch them. Mirrors the existing salvage-on-shift-click pricing:
-// the whole stack is removed for a single unit's sellValue. When `merchant` is given, the sold
-// item (whole stack) and the gold it fetched are appended to merchant.buyback (capped FIFO).
+// array so this can never touch them. The whole stack is removed for sellValue(item), which
+// covers every unit in it. When `merchant` is given, the sold item (whole stack) and the gold
+// it fetched are appended to merchant.buyback (capped FIFO).
 export function sellToMerchant(game, invIndex, merchant) {
   const p = game && game.player;
   if (!p) return { ok: false, reason: 'invalid' };

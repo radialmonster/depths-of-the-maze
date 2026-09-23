@@ -535,8 +535,10 @@ export function dropItem(game, item) {
   return true;
 }
 
+// Selling/salvaging always removes the whole inventory entry (the entire stack for a
+// potion), so the price must cover every unit in it, not just one.
 export function sellValue(item) {
-  return Math.max(1, Math.round(item.value * 0.35));
+  return Math.max(1, Math.round(item.value * 0.35 * (item.stack || 1)));
 }
 
 // Merchant buy price. Chosen so sellValue/buyPrice lands around 27% (within the ~25-35%
