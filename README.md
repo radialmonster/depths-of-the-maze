@@ -32,6 +32,20 @@ npm run preview   # serve the build locally at http://localhost:4321/
 
 Inventory: click = equip/use, right-click = drop, shift-click = salvage for gold. Walking into an enemy attacks it.
 
+## Ideas / possible improvements
+- [ ] **Automated tests** for the pure-math modules (`character.js` stat formulas, `items.js` pricing/compareGear,
+      `shop.js` pricing) — cheap to test, and would have caught real bugs we hit by hand (the potion-stack
+      `sellValue` bug, the `dy || 1` rotation bug) instantly instead of by playtesting.
+- [ ] **Audit for more "falsy zero" bugs** like the `someDir || 1` pattern found in `renderer.js` (a real `0`
+      direction/angle/percentage component gets silently replaced by a non-zero fallback). Worth a full sweep of
+      `public/js/*.js`, especially direction/velocity math in `enemies.js`/`main.js`.
+- [ ] **More build diversity for ranged/AoE.** Only one ranged skill (Arcane Bolt) and one AoE (Frost Nova) exist —
+      a second option in either category would give attribute investment (dex/int) more reason to diverge.
+- [ ] **Attribute respec.** Spent str/dex/int/vit/def points are currently permanent; a gold-cost respec (maybe via
+      the merchant, alongside Buyback) would make experimenting with builds less risky.
+- [ ] **More shop depth.** No reroll/reforge on gear affixes yet — could pair well with the existing salvage-to-gold
+      path now that Buyback gives selling more of a safety net.
+
 ## Layout
 See `DESIGN.md` for the full module contract. `js/main.js` is the glue/loop; each other module in `js/` is a
 self-contained system (map, renderer, textures, character, skills, enemies, items, input, ui).
