@@ -7,6 +7,7 @@ import {
   SKILL_DEFS, SLOT_CATEGORIES, WEAPON_CLASSES, CLASS_DEFAULT_ATTACK, CATEGORY_DEFAULT, MAX_SKILL_RANK,
   validateSkillRegistry, activeSkill, effectiveCooldown, createSkillState, normalizeSkillState,
   skillRank, upgradeSkill, useSkill, updateSkills, weaponClass, skillCooldown,
+  assignSkill, learnSkill, knownSkills, attackSkillForClass,
 } from '../public/js/skills.js';
 import { createPlayer, recalcStats } from '../public/js/character.js';
 
@@ -198,6 +199,69 @@ test('normalizeSkillState tolerates missing / garbage input', () => {
     p.skillState = normalizeSkillState(raw);
     assert.deepEqual([0, 1, 2, 3].map((i) => activeSkill(p, i).id), ['cleave', 'arcaneBolt', 'frostNova', 'shadowDash']);
   }
+});
+
+console.log('assignSkill / learnSkill');
+test('assignSkill sets a class pick (even for a class not equipped) and activeSkill honors it', () => {
+  withTempDefs({ tAlt: fakeAttack('tAlt', ['melee1h']) }, () => {
+    const p = freshPlayer('sword');
+    assert.equal(assignSkill(p, 'melee1h', 'tAlt'), false, 'not known yet');
+    p.skillState.known.tAlt = 1;
+    assert.ok(assignSkill(p, 'melee1h', 'tAlt'));
+    assert.equal(p.skillState.loadout.attack.melee1h, 'tAlt');
+    assert.equal(activeSkill(p, 0).id, 'tAlt');
+    assert.equal(attackSkillForClass(p, 'melee1h').id, 'tAlt');
+    assert.ok(assignSkill(p, 'melee1h', 'cleave'));
+    assert.equal(activeSkill(p, 0).id, 'cleave');
+  });
+});
+test('assignSkill rejects wrong class, wrong category, unknown ids and bad targets', () => {
+  withTempDefs({ tBow: fakeAttack('tBow', ['bow']) }, () => {
+    const p = freshPlayer('sword');
+    p.skillState.known.tBow = 1;
+    assert.equal(assignSkill(p, 'melee1h', 'tBow'), false, 'bow-only skill on melee1h');
+    assert.equal(assignSkill(p, 'melee1h', 'arcaneBolt'), false, 'spell into attack');
+    assert.equal(assignSkill(p, 'spell', 'frostNova'), false, 'special into spell');
+    assert.equal(assignSkill(p, 'attack', 'cleave'), false, 'attack needs a class, not the category');
+    assert.equal(assignSkill(p, 'nonsense', 'cleave'), false);
+    assert.equal(assignSkill(p, 'spell', 'nope'), false);
+    assert.equal(p.skillState.loadout.attack.melee1h, 'cleave');
+    assert.equal(p.skillState.loadout.spell, 'arcaneBolt');
+  });
+});
+test('assignSkill sets a slot 2-4 category pick', () => {
+  withTempDefs({ tSpell: { ...fakeAttack('tSpell', undefined), category: 'spell' } }, () => {
+    const p = freshPlayer();
+    p.skillState.known.tSpell = 1;
+    assert.ok(assignSkill(p, 'spell', 'tSpell'));
+    assert.equal(activeSkill(p, 1).id, 'tSpell');
+  });
+});
+test('learnSkill: new skill -> rank 1 + 1 free skill point; duplicate -> +1 rank; capped', () => {
+  withTempDefs({ tAlt: fakeAttack('tAlt', ['melee1h']) }, () => {
+    const p = freshPlayer();
+    p.skillPoints = 0;
+    assert.ok(learnSkill(p, 'tAlt'));
+    assert.equal(skillRank(p, 'tAlt'), 1);
+    assert.equal(p.skillPoints, 1);
+    assert.ok(learnSkill(p, 'tAlt'));
+    assert.equal(skillRank(p, 'tAlt'), 2);
+    assert.equal(p.skillPoints, 1, 'duplicate gives rank, not a point');
+    while (learnSkill(p, 'tAlt'));
+    assert.equal(skillRank(p, 'tAlt'), MAX_SKILL_RANK);
+    assert.equal(learnSkill(p, 'nope'), false);
+    assert.ok(learnSkill(p, 'cleave'), 'defaults are known: duplicate path');
+    assert.equal(skillRank(p, 'cleave'), 2);
+  });
+});
+test('knownSkills lists only known skills of that category', () => {
+  withTempDefs({ tAlt: fakeAttack('tAlt', ['bow']) }, () => {
+    const p = freshPlayer();
+    assert.deepEqual(knownSkills(p, 'attack').map((d) => d.id), ['cleave']);
+    p.skillState.known.tAlt = 1;
+    assert.deepEqual(knownSkills(p, 'attack').map((d) => d.id), ['cleave', 'tAlt']);
+    assert.deepEqual(knownSkills(p, 'movement').map((d) => d.id), ['shadowDash']);
+  });
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

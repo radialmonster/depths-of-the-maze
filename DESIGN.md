@@ -198,7 +198,13 @@ export function useSkill(game, index) -> bool   // checks cooldown/mana/dead; ca
 export function updateSkills(game, dt)          // ticks player.skillCooldowns
 export function upgradeSkill(player, skillId) -> bool   // spends 1 skillPoint, that skill's known rank++ (max 5)
 export function assignSkill(player, categoryOrClass, skillId) -> bool  // Skills-tab picker: sets loadout.attack[class] or loadout[category]
-export function learnSkill(player, skillId) -> bool     // from a skill book: adds to known (or +1 rank if already known, capped 5)
+                                                //   (known skill of the right category; for a class the skill must list that class, but the
+                                                //   class need not be the equipped one). 'attack' itself is not a valid target — pass a class.
+export function learnSkill(player, skillId) -> bool     // from a skill book: new skill -> known at rank 1 AND +1 skillPoint (§17.11);
+                                                //   already known -> +1 rank; false (book not consumed) at max rank / unknown id
+export function attackSkillForClass(player, cls) -> skillDef  // slot-1 resolution for any class (activeSkill uses it for the equipped one)
+export function knownSkills(player, category) -> skillDef[]  // known skills of a category, registry order (Skills-tab list)
+export function skillEligible(player, def, category, cls) -> bool  // the eligibility rule activeSkill and the Skills tab share
 export function skillDescription(skillId, rank, player) -> string  // for tooltips / Skills tab
 export function effectiveCooldown(skillDef, rank, player) -> number  // base * 0.95^(rank-1) * (1 - clamp(cooldownReduction,0,0.4))
 ```
@@ -286,12 +292,15 @@ export class Input {
 actions: 'skill1'..'skill4' (1-4 / gamepad A,X,B,Y → 1,2,3,4; the skill each slot casts is resolved live via
          `activeSkill()` — §9 — so which concrete skill A/X/B/Y triggers depends on equipped weapon + loadout, not a
          fixed name)
-         'character' (C / gamepad Back/View or LB), 'skills' (K — opens the Skills tab directly, §17.10),
-         'inventory' (I / gamepad RB), 'pause' (Esc, P / Start),
+         'character' (C / gamepad Back/View or LB — from gameplay the pad opens whichever tab has unspent points, §13),
+         'skills' (K — opens the Skills tab directly, §17.10; no pad button: LB then RB),
+         'inventory' (I, Tab / gamepad RB), 'tab_prev'/'tab_next' (LB/RB, and Tab = tab_next — cycle window tabs;
+         checked before character/inventory while a window is open), 'pause' (Esc, P / Start),
          'ui_up','ui_down','ui_left','ui_right' (arrows/WASD/dpad edges), 'confirm' (Enter/E / A), 'cancel' (Esc / B), 'drop' (Q/Delete / X),
          'potion' (5 / gamepad LT), 'mana_potion' (6 / gamepad RT) → drink items.js `activePotion(player, kind)`:
          the pinned stack if any, else the strongest stack of that kind (see §17.8b),
-         'quick_equip' (R / Y, Bag only), 'pin_potion' (F / gamepad LT or RT, Bag only: pin/unpin focused potion)
+         'quick_equip' (R / Y, Bag only), 'pin_potion' (F / gamepad LT or RT, Bag only: pin/unpin focused potion),
+         'rank_up' (R, =/+, Numpad + / Y, Skills tab only: spend a skill point on the focused skill)
 ```
 
 ## 13. UI (ui.js)
@@ -299,7 +308,8 @@ actions: 'skill1'..'skill4' (1-4 / gamepad A,X,B,Y → 1,2,3,4; the skill each s
 export class UI {
   constructor(game, input)      // builds DOM under #ui, injects <style>
   update(game, dt)              // refresh HUD (cheap; only touch DOM when values change)
-  toggleCharacter(); toggleInventory(); closeAll(); isModalOpen() -> bool
+  toggleCharacter(); toggleSkills(); toggleInventory(); closeAll(); isModalOpen() -> bool
+  openPendingPointsTab()        // HUD points badge + pad LB: Character if any attribute points (or none), else Skills
   handleInput(game, input)      // navigation inside open panels (gamepad/keyboard), called by main when modal open
   log(text, color)              // combat/event log (last ~6 lines, fade)
   banner(title, subtitle)       // big centered fading text (e.g. "Depth 3")
@@ -310,14 +320,23 @@ export class UI {
 HUD: HP orb/bar, Mana bar, XP bar with level, depth indicator, gold, 4 skill slots (icon/name/cooldown sweep/mana cost
 resolved live via `activeSkill()`, §9) with key hint (show gamepad glyphs when input.lastDevice==='gamepad'), minimap
 (draw map.explored/visible on a <canvas>, player dot, exits, enemies visible), potion counts, pending attr/skill point
-indicator (routes to the Character tab for attribute points, the Skills tab for skill points).
+indicator (routes to the Character tab for attribute points, the Skills tab for skill points). One pill shows both
+counts ("✦ 2 attribute + 1 skill points to spend · C"); click / pad LB go to Character while any attribute points are
+pending, else to Skills. The minimap's menu buttons are Character (C) · Skills (K) · Bag (I), each with a "+" marker
+when that tab has points to spend.
 Three tabs in one window — **Character | Skills | Bag** (LB/RB or Tab cycle all three, like the shop's Buy/Sell/Buyback):
 - Character: attributes with + buttons, derived stats (now 3 damage rows: Melee / Ranged / Spell Power — §17.9; the
   role you aren't using shows dimmed "—").
 - **Skills** (new, K opens it directly): left side = the 4 slot cards (skill in each, rank, cooldown, mana cost; the
   Attack card is labelled by the equipped weapon's class and also shows the other classes' current assignments);
   right side = known skills for the selected slot's category, eligible ones first, weapon-locked ones dimmed with
-  "Requires {weapon}". Click/A assigns a skill to the slot; +/Y spends a rank point. See §17.10.
+  "Requires {weapon}". Click/A assigns a skill to the slot; +/Y spends a rank point. See §17.10. This is the only
+  place skills are ranked up (the Character tab no longer has a skills section).
+  Navigation: up/down within a column (on the cards this also changes the selected slot), right/left between cards
+  and list, A/Enter on a card enters its list, Y/R/+ on a card ranks up the skill in that slot. The Attack card's
+  class row is a set of chips (hidden while only one weapon class exists); clicking one — or X/Q — switches which
+  class's pick the list edits, so a class's assignment can be set while another weapon is equipped (§17.10).
+  Weapon-locked rows can still be ranked up but not assigned.
 - Bag: paperdoll equipment slots (off-hand shown locked + tooltip while a two-handed weapon is equipped, §17.9) +
   24-slot grid, rarity-colored borders, hover tooltips with comparison, click=equip/use, right-click or drop
   action=drop, shift-click=sell (to gold, "salvage"). Full keyboard/gamepad navigation.

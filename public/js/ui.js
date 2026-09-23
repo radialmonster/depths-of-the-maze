@@ -1,4 +1,4 @@
-// HUD, Character panel (C), Inventory panel (I), messages, death/menu screens.
+// HUD, Character (C) | Skills (K) | Inventory (I) window, messages, death/menu screens.
 // Owned by the UI agent — see DESIGN.md §13. Injects its own <style>.
 // IMPORTANT: game.player / game.map are REPLACED on restart & depth change.
 // This module never caches those sub-references across frames — it re-reads
@@ -6,7 +6,9 @@
 // itself is assumed stable for the lifetime of this UI instance.
 
 import { ATTRIBUTES, xpForLevel, spendAttribute } from './character.js';
-import { upgradeSkill, skillDescription, activeSkill, skillRank, skillCooldown, effectiveCooldown, MAX_SKILL_RANK } from './skills.js';
+import { upgradeSkill, skillDescription, activeSkill, skillRank, skillCooldown, effectiveCooldown, MAX_SKILL_RANK,
+  assignSkill, knownSkills, attackSkillForClass, skillEligible, weaponClass, weaponClassName, WEAPON_CLASSES,
+  SLOT_CATEGORIES } from './skills.js';
 import { equipItem, unequipItem, useItem, dropItem, sellValue, itemTooltip, compareGear, equipUpgrades, SLOTS, INVENTORY_SIZE,
   activePotion, pinnedPotion, potionHotbarKind, togglePotionPin } from './items.js';
 import { buyFromMerchant, sellToMerchant, buybackFromMerchant, nearbyMerchant, shopPrice } from './shop.js';
@@ -24,6 +26,8 @@ function exitRGB(depth) {
 
 const SKILL_KEY_LABEL = ['1', '2', '3', '4'];
 const SKILL_PAD_LABEL = ['A', 'X', 'Y', 'B'];
+const CATEGORY_LABEL = { attack: 'Attack', spell: 'Spell', special: 'Special', movement: 'Movement' };
+const WINDOW_TABS = ['char', 'skills', 'inv']; // Character | Skills | Bag, in LB/RB/Tab cycle order (DESIGN §13)
 const PAD_COLOR = {
   A: '#3ecf5a', B: '#e05a4e', X: '#3e8cf0', Y: '#e0c23e',
   // PlayStation face-button colors, keyed by the glyph padLabel() produces.
@@ -109,6 +113,7 @@ const CONTROLS = [
   ['Mana potion', ['6'], ['RT']],
   ['Trade', ['E'], ['A']],
   ['Character', ['C'], ['LB']],
+  ['Skills menu', ['K'], ['LB', '›', 'RB']],
   ['Inventory', ['I'], ['RB']],
   ['Pause', ['Esc'], ['Start']],
   ['Drop item', ['Q'], ['X']],
@@ -182,6 +187,11 @@ function mk(tag, cls, parent, text) {
   return el;
 }
 
+// Only touch the DOM when the text actually changed (panels refresh every frame while open).
+function setText(el, text) {
+  if (el.textContent !== text) el.textContent = text;
+}
+
 function kbd(parent, text, cls) {
   return mk('span', `dm-kbd${cls ? ' ' + cls : ''}`, parent, text);
 }
@@ -222,6 +232,7 @@ function buildControlsTable(parent, padEls) {
     for (const key of keys) kbd(k, key);
     const g = mk('div', 'dm-controls-keys', row);
     for (const b of pad) {
+      if (b === '›') { mk('span', 'dm-controls-then', g, b); continue; } // "LB › RB" = press LB, then RB
       const el = kbd(g, b, 'dm-kbd-pad');
       if (PAD_COLOR[b]) el.style.color = PAD_COLOR[b];
       if (padEls) padEls.push({ el, name: b });
@@ -300,10 +311,14 @@ export class UI {
     }
 
     this._characterOpen = false;
+    this._skillsOpen = false;
     this._inventoryOpen = false;
+    // Skills tab cursor: col 'slots' (left, the 4 slot cards) or 'list' (right, known skills for the selected slot);
+    // index null = "land on the skill currently in the slot" (resolved in _skillsModel).
+    this._skillsCursor = { col: 'slots', slot: 0, index: null };
+    this._skillsAttackClass = null; // weapon class whose slot-1 pick the list edits; null = the equipped weapon's class
     this._charCursor = 0;
     this._lastCharCursor = -1;
-    this._charColSwitchArmed = true;
     this._invCursor = { area: 'grid', index: 0 };
     this._lastInvCursorKey = null;
 
@@ -375,6 +390,7 @@ export class UI {
     scrim.addEventListener('click', () => this.closeAll());
     this.dom.scrim = scrim;
     this._buildCharacterPanel(root);
+    this._buildSkillsPanel(root);
     this._buildInventoryPanel(root);
     this._buildShopPanel(root);
     this._buildTooltip(root);
@@ -382,7 +398,7 @@ export class UI {
     this._updatePanelScale();
     window.addEventListener('resize', () => {
       this._updatePanelScale();
-      if (this._characterOpen || this._inventoryOpen) this._syncPanelSize();
+      if (this._windowOpen()) this._syncPanelSize();
     });
   }
 
@@ -413,7 +429,7 @@ export class UI {
     mk('span', 'dm-chip-icon', killsChip, '💀');
     const killsText = mk('span', '', killsChip, '0');
     const pointsPill = mk('button', 'dm-points-pill', hud);
-    pointsPill.addEventListener('click', () => this.toggleCharacter());
+    pointsPill.addEventListener('click', () => this.openPendingPointsTab());
 
     // --- minimap (top-right) ---
     const mmWrap = mk('div', 'dm-minimap-wrap', hud);
@@ -432,12 +448,18 @@ export class UI {
     mk('span', 'dm-menubtn-label', btnC, 'Character');
     const btnCKey = kbd(btnC, 'C');
     const plusC = mk('span', 'dm-menubtn-plus', btnC, '+');
+    const btnK = mk('button', 'dm-menubtn', mmButtons);
+    mk('span', 'dm-menubtn-icon', btnK, '✨');
+    mk('span', 'dm-menubtn-label', btnK, 'Skills');
+    const btnKKey = kbd(btnK, 'K');
+    const plusK = mk('span', 'dm-menubtn-plus', btnK, '+');
     const btnI = mk('button', 'dm-menubtn', mmButtons);
     mk('span', 'dm-menubtn-icon', btnI, '🎒');
     mk('span', 'dm-menubtn-label', btnI, 'Bag');
     const bagCount = mk('span', 'dm-menubtn-count', btnI, '0/24');
     const btnIKey = kbd(btnI, 'I');
     btnC.addEventListener('click', () => this.toggleCharacter());
+    btnK.addEventListener('click', () => this.toggleSkills());
     btnI.addEventListener('click', () => this.toggleInventory());
 
     // --- boss HP bar (top center, clear of the plate and minimap) ---
@@ -539,7 +561,7 @@ export class UI {
 
     Object.assign(this.dom, {
       hud, lvl, lvlNum, depthText, goldChip, goldText, killsText, pointsPill,
-      canvas, ctx: canvas.getContext('2d'), btnC, btnCKey, plusC, btnI, btnIKey, bagCount,
+      canvas, ctx: canvas.getContext('2d'), btnC, btnCKey, plusC, btnK, btnKKey, plusK, btnI, btnIKey, bagCount,
       bossBar, bossName, bossTrack, bossTrail, bossFill, bossResist, bossPhase,
       vignette, hitVignette, banner, bannerTitle, bannerSub, tradePrompt, soundHint,
       log, logLines,
@@ -549,25 +571,25 @@ export class UI {
     });
   }
 
+  // Character | Skills | Bag are three tabs of one window (DESIGN §13): three panels, each with the same tab strip.
   _buildPanelShell(root, cls, active) {
     const panel = mk('div', `dm-panel ${cls}`, root);
     const header = mk('div', 'dm-panel-header', panel);
     const tabs = mk('div', 'dm-tabs', header);
-    const tabC = mk('button', `dm-tab${active === 'char' ? ' dm-tab-active' : ''}`, tabs);
-    mk('span', '', tabC, '⚔️ Character');
-    const tabCKey = kbd(tabC, 'C');
-    const tabI = mk('button', `dm-tab${active === 'inv' ? ' dm-tab-active' : ''}`, tabs);
-    mk('span', '', tabI, '🎒 Inventory');
-    const tabIKey = kbd(tabI, 'I');
-    tabC.addEventListener('click', () => { if (!this._characterOpen) this.toggleCharacter(); });
-    tabI.addEventListener('click', () => { if (!this._inventoryOpen) this.toggleInventory(); });
+    const tabKeys = [];
+    for (const [tab, label, key] of [['char', '⚔️ Character', 'C'], ['skills', '✨ Skills', 'K'], ['inv', '🎒 Inventory', 'I']]) {
+      const btn = mk('button', `dm-tab${active === tab ? ' dm-tab-active' : ''}`, tabs);
+      mk('span', '', btn, label);
+      tabKeys.push(kbd(btn, key));
+      btn.addEventListener('click', () => this._openTab(tab));
+    }
     const extra = mk('div', 'dm-panel-extra', header);
     const closeBtn = mk('button', 'dm-panel-close', header, '✕');
     closeBtn.title = 'Close (Esc)';
     closeBtn.addEventListener('click', () => this.closeAll());
     const body = mk('div', 'dm-panel-body', panel);
     const foot = mk('div', 'dm-panel-foot', panel);
-    return { panel, header, extra, body, foot, tabKeys: [tabCKey, tabIKey] };
+    return { panel, header, extra, body, foot, tabKeys, active };
   }
 
   _buildCharacterPanel(root) {
@@ -612,33 +634,54 @@ export class UI {
       derivedRows[d.k] = mk('div', 'dm-derived-value', row, '-');
     }
 
-    // Skills
-    const skillSection = mk('div', 'dm-section dm-section-skills', body);
-    const skillHead = mk('div', 'dm-section-title', skillSection);
-    mk('span', '', skillHead, 'Skills');
-    const skillPoints = mk('span', 'dm-points-badge', skillHead, '');
-    const skillList = mk('div', 'dm-charskill-list', skillSection);
-    const skillRows = [];
-    for (let i = 0; i < 4; i++) {
-      const row = mk('div', 'dm-charskill-row', skillList);
-      row.dataset.index = String(i);
-      const icon = mk('div', 'dm-charskill-icon', row, '');
-      const key = mk('div', 'dm-charskill-key', icon, SKILL_KEY_LABEL[i]);
-      const main = mk('div', 'dm-charskill-main', row);
-      const head = mk('div', 'dm-charskill-head', main);
-      const name = mk('div', 'dm-charskill-name', head, '');
-      const pips = mk('div', 'dm-pips', head);
-      const desc = mk('div', 'dm-charskill-desc', main, '');
-      const upgradeBtn = mk('button', 'dm-plus dm-plus-wide', row, 'Upgrade');
-      // row.dataset.skillId tracks the skill currently resolved into slot i (set in _refreshCharacterPanel).
-      upgradeBtn.addEventListener('click', () => this._upgradeSkill(row.dataset.skillId));
-      skillRows.push({ row, icon, key, name, pips, pipEls: [], upgradeBtn, desc });
-    }
-
     Object.assign(this.dom, {
       charPanel: panel, charShell: shell,
       charLvlText: lvlText, charXpFill: xpFill, charXpText: xpText,
-      attrPoints, skillPoints, attrRows, derivedRows, charSkillRows: skillRows,
+      attrPoints, attrRows, derivedRows,
+    });
+  }
+
+  // Skills tab (DESIGN §13 / §17.10): left = the 4 HUD slot cards, right = known skills for the selected slot.
+  _buildSkillsPanel(root) {
+    const shell = this._buildPanelShell(root, 'dm-skillspanel', 'skills');
+    const { panel, extra, body } = shell;
+    body.classList.add('dm-skills-body');
+    const weaponText = mk('div', 'dm-skills-weapon', extra, ''); // equipped weapon + its class (drives slot 1)
+
+    const left = mk('div', 'dm-section dm-skills-slotcol', body);
+    mk('div', 'dm-section-title', left, 'Skill slots');
+    const cardList = mk('div', 'dm-charskill-list', left);
+    const slotCards = [];
+    for (let i = 0; i < SLOT_CATEGORIES.length; i++) {
+      const row = mk('div', 'dm-charskill-row dm-slotcard', cardList);
+      const icon = mk('div', 'dm-charskill-icon', row, '');
+      const iconGlyph = mk('span', '', icon, '');
+      const key = mk('div', 'dm-charskill-key', icon, SKILL_KEY_LABEL[i]);
+      const main = mk('div', 'dm-charskill-main', row);
+      const cat = mk('div', 'dm-slotcard-cat', main, '');
+      const head = mk('div', 'dm-charskill-head', main);
+      const name = mk('div', 'dm-charskill-name', head, '');
+      const pips = mk('div', 'dm-pips', head);
+      const pipEls = [];
+      for (let r = 0; r < MAX_SKILL_RANK; r++) pipEls.push(mk('i', 'dm-pip', pips));
+      const meta = mk('div', 'dm-slotcard-meta', main, '');
+      // Slot 1 only: the other weapon classes' remembered attack picks (§17.10). Hidden while only one class exists.
+      const classes = i === 0 ? mk('div', 'dm-slotcard-classes', main) : null;
+      row.addEventListener('click', () => this._selectSkillSlot(i));
+      slotCards.push({ row, icon, iconGlyph, key, cat, name, pips, pipEls, meta, classes, classSig: '' });
+    }
+
+    const right = mk('div', 'dm-section dm-skills-listcol', body);
+    const listHead = mk('div', 'dm-section-title', right);
+    const listTitle = mk('span', '', listHead, '');
+    const listPoints = mk('span', 'dm-points-badge', listHead, '');
+    const list = mk('div', 'dm-charskill-list', right);
+    const listNote = mk('div', 'dm-skills-note', right, '');
+
+    Object.assign(this.dom, {
+      skillsPanel: panel, skillsShell: shell, skillsWeaponText: weaponText, slotCards,
+      skillList: list, skillListTitle: listTitle, skillListPoints: listPoints, skillListNote: listNote,
+      skillListRows: [], skillListSig: '',
     });
   }
 
@@ -851,15 +894,47 @@ export class UI {
   // =====================================================================
   toggleCharacter() {
     if (this._characterOpen) { this._characterOpen = false; sfx.uiClick(); }
-    else { this._inventoryOpen = false; this._characterOpen = true; this._charCursor = 0; this._lastCharCursor = -1; this._charColSwitchArmed = true; sfx.uiOpen(); }
+    else { this._inventoryOpen = false; this._skillsOpen = false; this._characterOpen = true; this._charCursor = 0; this._lastCharCursor = -1; sfx.uiOpen(); }
     if (this._characterOpen) this._syncPanelSize();
     this._applyPanelVisibility();
   }
 
+  toggleSkills() {
+    if (this._skillsOpen) { this._skillsOpen = false; sfx.uiClick(); }
+    else {
+      this._characterOpen = false; this._inventoryOpen = false; this._skillsOpen = true;
+      this._skillsCursor = { col: 'slots', slot: 0, index: null };
+      this._skillsAttackClass = null;
+      this._lastSkillsFocusKey = null;
+      sfx.uiOpen();
+    }
+    if (this._skillsOpen) this._syncPanelSize();
+    this._applyPanelVisibility();
+  }
+
+  // HUD "points to spend" pill (mouse-only — gamepad LB always opens Character, see main.js): open the window on
+  // the tab that has unspent points — Character for attribute points (also when both kinds are pending, or none),
+  // Skills when only skill points are pending (DESIGN §13).
+  openPendingPointsTab() {
+    const p = this.game && this.game.player;
+    const ap = (p && p.attrPoints) || 0, sp = (p && p.skillPoints) || 0;
+    this._openTab(ap <= 0 && sp > 0 ? 'skills' : 'char');
+  }
+
+  // Open (never close) one tab of the Character | Skills | Bag window.
+  _openTab(tab) {
+    if (tab === 'char' && !this._characterOpen) this.toggleCharacter();
+    else if (tab === 'skills' && !this._skillsOpen) this.toggleSkills();
+    else if (tab === 'inv' && !this._inventoryOpen) this.toggleInventory();
+    this._hideTooltip();
+  }
+
+  _windowOpen() { return this._characterOpen || this._skillsOpen || this._inventoryOpen; }
+
   toggleInventory() {
     if (this._inventoryOpen) { this._inventoryOpen = false; sfx.uiClick(); }
     else {
-      this._characterOpen = false; this._inventoryOpen = true; this._invCursor = { area: 'grid', index: 0 };
+      this._characterOpen = false; this._skillsOpen = false; this._inventoryOpen = true; this._invCursor = { area: 'grid', index: 0 };
       this._hoverInvIndex = null; // mouseleave never fires if the panel closed under the cursor
       // Gamepad users get the cursor tooltip immediately; keyboard/mouse users only once they move the cursor.
       this._lastInvCursorKey = this.input && this.input.lastDevice === 'gamepad' ? null : 'grid:0';
@@ -873,6 +948,7 @@ export class UI {
     if (!merchant) return;
     this._characterOpen = false;
     this._inventoryOpen = false;
+    this._skillsOpen = false;
     this._shopOpen = true;
     this._shopMerchant = merchant;
     this._shopTab = 'buy';
@@ -888,20 +964,19 @@ export class UI {
   }
 
   _cycleTab(dir) {
-    const tabs = [() => this.toggleCharacter(), () => this.toggleInventory()];
-    const cur = this._characterOpen ? 0 : 1;
-    tabs[(cur + dir + tabs.length) % tabs.length]();
-    this._hideTooltip();
+    const cur = this._characterOpen ? 0 : this._skillsOpen ? 1 : 2;
+    this._openTab(WINDOW_TABS[(cur + dir + WINDOW_TABS.length) % WINDOW_TABS.length]);
   }
 
-  // Character and Inventory are tabs of one window: give both the taller one's natural height so
-  // switching tabs never resizes it. Hidden panels are still laid out (visibility), so both measure.
+  // Character, Skills and Inventory are tabs of one window: give all three the tallest one's natural height so
+  // switching tabs never resizes it. Hidden panels are still laid out (visibility), so all of them measure.
   _syncPanelSize() {
     const d = this.dom;
-    if (!d.charPanel || !d.invPanel) return;
+    if (!d.charPanel || !d.skillsPanel || !d.invPanel) return;
     this._refreshCharacterPanel();
+    this._refreshSkillsPanel();
     this._refreshInventoryPanel();
-    const panels = [d.charPanel, d.invPanel];
+    const panels = [d.charPanel, d.skillsPanel, d.invPanel];
     for (const el of panels) el.style.height = '';
     this.root.style.setProperty('--dm-panel-scale', '1'); // measure at 1x so max-height can't clip
     const h = Math.max(...panels.map((el) => el.offsetHeight));
@@ -912,6 +987,7 @@ export class UI {
 
   closeAll() {
     this._characterOpen = false;
+    this._skillsOpen = false;
     this._inventoryOpen = false;
     if (this._shopOpen) sfx.uiClick();
     this._shopOpen = false;
@@ -921,11 +997,12 @@ export class UI {
   }
 
   isModalOpen() {
-    return this._characterOpen || this._inventoryOpen || this._shopOpen;
+    return this._windowOpen() || this._shopOpen;
   }
 
   _applyPanelVisibility() {
     this.dom.charPanel.classList.toggle('dm-open', this._characterOpen);
+    this.dom.skillsPanel.classList.toggle('dm-open', this._skillsOpen);
     this.dom.invPanel.classList.toggle('dm-open', this._inventoryOpen);
     this.dom.shopPanel.classList.toggle('dm-open', this._shopOpen);
     this.dom.scrim.classList.toggle('dm-open', this.isModalOpen());
@@ -1097,6 +1174,7 @@ export class UI {
       this._cache.soundHintShow = needSound;
     }
     if (this._characterOpen) this._refreshCharacterPanel();
+    if (this._skillsOpen) this._refreshSkillsPanel();
     if (this._inventoryOpen) this._refreshInventoryPanel();
     if (this._shopOpen) this._refreshShopPanel();
   }
@@ -1307,15 +1385,25 @@ export class UI {
     const style = (this.input && this.input.padStyle) || 'xbox';
     const d = this.dom;
     d.btnCKey.textContent = gamepad ? padLabel('LB', style) : 'C';
+    d.btnKKey.textContent = 'K';
+    d.btnKKey.style.display = gamepad ? 'none' : ''; // no dedicated pad button (LB › RB)
     d.btnIKey.textContent = gamepad ? padLabel('RB', style) : 'I';
     d.potHeal.key.textContent = gamepad ? padLabel('LT', style) : '5';
     d.potMana.key.textContent = gamepad ? padLabel('RT', style) : '6';
-    for (const shell of [d.charShell, d.invShell]) {
-      shell.tabKeys[0].textContent = gamepad ? padLabel('LB', style) : 'C';
-      shell.tabKeys[1].textContent = gamepad ? padLabel('RB', style) : 'I';
+    // Tab hints: keyboard shows each tab's own key; a pad shows LB / RB on the neighbours of the active tab
+    // (exactly where the bumpers go from here), and nothing on the active tab itself.
+    const tabKeyboard = ['C', 'K', 'I'];
+    for (const shell of [d.charShell, d.skillsShell, d.invShell]) {
+      const a = WINDOW_TABS.indexOf(shell.active), n = WINDOW_TABS.length;
+      shell.tabKeys.forEach((el, t) => {
+        const label = !gamepad ? tabKeyboard[t]
+          : t === (a + n - 1) % n ? padLabel('LB', style) : t === (a + 1) % n ? padLabel('RB', style) : '';
+        el.textContent = label;
+        el.style.display = label ? '' : 'none';
+      });
     }
-    for (let i = 0; i < 4; i++) {
-      const k = d.charSkillRows[i].key;
+    for (let i = 0; i < d.slotCards.length; i++) {
+      const k = d.slotCards[i].key;
       const key = gamepad ? padLabel(SKILL_PAD_LABEL[i], style) : SKILL_KEY_LABEL[i];
       k.textContent = key;
       k.style.color = gamepad ? (PAD_COLOR[key] || '') : '';
@@ -1323,8 +1411,15 @@ export class UI {
     const hint = (pairs) => pairs.map(([k, a]) => `<span class="dm-foot-item"><span class="dm-kbd">${k}</span>${a}</span>`).join('');
     const lbrb = `${padLabel('LB', style)} / ${padLabel('RB', style)}`;
     d.charShell.foot.innerHTML = gamepad
-      ? hint([['D-pad ↑↓', 'Navigate'], ['D-pad ←→', 'Attributes / Skills'], [padLabel('A', style), 'Spend point'], [lbrb, 'Switch tab'], [padLabel('B', style), 'Close']])
-      : hint([['Click +', 'Spend point'], ['↑↓', 'Navigate'], ['←→', 'Attributes / Skills'], ['Enter', 'Spend'], ['I', 'Inventory'], ['Esc', 'Close']]);
+      ? hint([['D-pad ↑↓', 'Navigate'], [padLabel('A', style), 'Spend point'], [lbrb, 'Switch tab'], [padLabel('B', style), 'Close']])
+      : hint([['Click +', 'Spend point'], ['↑↓', 'Navigate'], ['Enter', 'Spend'], ['K', 'Skills'], ['I', 'Inventory'], ['Esc', 'Close']]);
+    // Weapon-class switching in the Skills tab only exists once there's more than one weapon class (§17.10).
+    const multiClass = WEAPON_CLASSES.length > 1;
+    d.skillsShell.foot.innerHTML = gamepad
+      ? hint([['D-pad', 'Navigate'], [padLabel('A', style), 'Assign'], [padLabel('Y', style), 'Rank up'],
+        ...(multiClass ? [[padLabel('X', style), 'Weapon class']] : []), [lbrb, 'Switch tab'], [padLabel('B', style), 'Close']])
+      : hint([['Click', 'Assign'], ['Arrows', 'Navigate'], ['Enter', 'Assign'], ['R / +', 'Rank up'],
+        ...(multiClass ? [['Q', 'Weapon class']] : []), ['Tab', 'Switch tab'], ['Esc', 'Close']]);
     d.invShell.foot.innerHTML = gamepad
       ? hint([['D-pad', 'Navigate'], [padLabel('A', style), 'Equip / Use'], [padLabel('Y', style), 'Equip upgrades'], [padLabel('X', style), 'Drop'], [`${padLabel('LT', style)} / ${padLabel('RT', style)}`, 'Pin potion'], [lbrb, 'Switch tab'], [padLabel('B', style), 'Close']])
       : hint([['Click', 'Equip / Use'], ['R', 'Equip upgrades'], ['Q / Right-click', 'Drop'], ['Shift+Click', 'Salvage for gold'], ['F / ☆', 'Pin potion'], ['Esc', 'Close']]);
@@ -1410,14 +1505,21 @@ export class UI {
     if (c.killsStr !== killsStr) { d.killsText.textContent = killsStr; c.killsStr = killsStr; }
 
     // Unspent points.
-    const totalPts = (p.attrPoints || 0) + (p.skillPoints || 0);
+    // Attribute points live on the Character tab, skill points on the Skills tab; the pill (click, or pad LB via
+    // openPendingPointsTab) goes to Character while any attribute points are pending, else to Skills.
+    const ap = p.attrPoints || 0, sp = p.skillPoints || 0;
     const gamepad = !!(this.input && this.input.lastDevice === 'gamepad');
     const style = (this.input && this.input.padStyle) || 'xbox';
-    const ptsStr = totalPts > 0 ? `✦ ${totalPts} point${totalPts === 1 ? '' : 's'} to spend · ${gamepad ? padLabel('LB', style) : 'C'}` : '';
+    const plural = (n) => (n === 1 ? '' : 's');
+    const ptsWhat = ap > 0 && sp > 0 ? `${ap} attribute + ${sp} skill point${plural(ap + sp)}`
+      : ap > 0 ? `${ap} attribute point${plural(ap)}` : `${sp} skill point${plural(sp)}`;
+    const ptsKey = gamepad ? padLabel('LB', style) : ap > 0 ? 'C' : 'K';
+    const ptsStr = ap + sp > 0 ? `✦ ${ptsWhat} to spend · ${ptsKey}` : '';
     if (c.ptsStr !== ptsStr) {
       d.pointsPill.textContent = ptsStr;
-      d.pointsPill.classList.toggle('dm-show', totalPts > 0);
-      d.plusC.classList.toggle('dm-show', totalPts > 0);
+      d.pointsPill.classList.toggle('dm-show', ap + sp > 0);
+      d.plusC.classList.toggle('dm-show', ap > 0);
+      d.plusK.classList.toggle('dm-show', sp > 0);
       c.ptsStr = ptsStr;
     }
 
@@ -1626,16 +1728,6 @@ export class UI {
     }
   }
 
-  _upgradeSkill(skillId) {
-    const p = this.game && this.game.player;
-    if (!p || !skillId) return;
-    if (upgradeSkill(p, skillId)) {
-      const row = this.dom.charSkillRows.find((r) => r.row.dataset.skillId === skillId);
-      if (row) flash(row.icon, 'dm-bump');
-      this._refreshCharacterPanel();
-    }
-  }
-
   // Writes formatted derived stats into whichever of `rows` (k -> value element) exist.
   _fillDerived(rows, s) {
     for (const k in rows) {
@@ -1654,11 +1746,9 @@ export class UI {
     d.charXpText.textContent = `${Math.floor(p.xp)} / ${need} XP`;
     d.charXpFill.style.width = `${clamp(p.xp / Math.max(1, need), 0, 1) * 100}%`;
 
-    const ap = p.attrPoints || 0, sp = p.skillPoints || 0;
+    const ap = p.attrPoints || 0;
     d.attrPoints.textContent = ap > 0 ? `${ap} point${ap === 1 ? '' : 's'}` : '';
     d.attrPoints.classList.toggle('dm-show', ap > 0);
-    d.skillPoints.textContent = sp > 0 ? `${sp} point${sp === 1 ? '' : 's'}` : '';
-    d.skillPoints.classList.toggle('dm-show', sp > 0);
 
     for (const row of d.attrRows) {
       const v = String(p.base[row.attr.id]);
@@ -1667,35 +1757,6 @@ export class UI {
     }
 
     this._fillDerived(d.derivedRows, p.stats);
-
-    for (let i = 0; i < d.charSkillRows.length; i++) {
-      const row = d.charSkillRows[i];
-      const sk = activeSkill(p, i);
-      if (!sk) continue;
-      const rank = skillRank(p, sk.id);
-      row.row.dataset.skillId = sk.id;
-      if (row.icon.firstChild && row.icon.firstChild.nodeType === 3) {
-        if (row.icon.firstChild.nodeValue !== sk.icon) row.icon.firstChild.nodeValue = sk.icon || '';
-      } else {
-        row.icon.insertBefore(document.createTextNode(sk.icon || ''), row.icon.firstChild);
-      }
-      if (row.name.textContent !== sk.name) row.name.textContent = sk.name || '';
-      if (row.pipEls.length !== MAX_SKILL_RANK) {
-        row.pips.textContent = '';
-        row.pipEls = [];
-        for (let r = 0; r < MAX_SKILL_RANK; r++) row.pipEls.push(mk('i', 'dm-pip', row.pips));
-      }
-      row.pipEls.forEach((el, r) => el.classList.toggle('dm-on', r < rank));
-      row.pips.title = `Rank ${rank} / ${MAX_SKILL_RANK}`;
-      const desc = skillDescription(sk.id, rank, p);
-      if (row._desc !== desc) { row.desc.innerHTML = desc; row._desc = desc; }
-      const canUp = sp > 0 && rank < MAX_SKILL_RANK;
-      const maxed = rank >= MAX_SKILL_RANK;
-      row.upgradeBtn.textContent = maxed ? 'Max' : 'Upgrade';
-      row.upgradeBtn.disabled = !canUp;
-      row.upgradeBtn.classList.toggle('dm-maxed', maxed);
-      row.row.classList.toggle('dm-can-spend', canUp);
-    }
 
     this._applyCharacterFocus();
   }
@@ -1708,9 +1769,199 @@ export class UI {
   }
 
   _charFocusList() {
-    const list = this.dom.attrRows.map((r) => ({ el: r.row, kind: 'attr', ref: r }));
-    for (const r of this.dom.charSkillRows) list.push({ el: r.row, kind: 'skill', ref: r });
-    return list;
+    return this.dom.attrRows.map((r) => ({ el: r.row, kind: 'attr', ref: r }));
+  }
+
+  // ---------------------------------------------------------------------
+  // Skills panel (DESIGN §13 / §17.10)
+  // ---------------------------------------------------------------------
+  // What the right-hand list shows for the selected slot: every known skill of that slot's category, eligible ones
+  // first (registry order within each group — sort is stable). Slot 1 checks eligibility against the weapon class
+  // being edited (the equipped one unless another class chip was picked); slots 2-4 against the equipped weapon.
+  // Also resolves a null list cursor to the row of the skill currently in the slot.
+  _skillsModel(p) {
+    const cur = this._skillsCursor;
+    const slot = cur.slot;
+    const cat = SLOT_CATEGORIES[slot];
+    const equippedCls = weaponClass(p);
+    const ctxCls = WEAPON_CLASSES.includes(this._skillsAttackClass) ? this._skillsAttackClass : equippedCls;
+    const cls = slot === 0 ? ctxCls : equippedCls;
+    const current = slot === 0 ? attackSkillForClass(p, ctxCls) : activeSkill(p, slot);
+    const entries = knownSkills(p, cat).map((def) => ({
+      def, ok: skillEligible(p, def, cat, cls), current: !!current && def.id === current.id,
+    }));
+    entries.sort((a, b) => Number(b.ok) - Number(a.ok));
+    if (cur.index == null || cur.index >= entries.length) cur.index = Math.max(0, entries.findIndex((e) => e.current));
+    return { slot, cat, equippedCls, ctxCls, current, entries };
+  }
+
+  _skillMetaText(sk, rank, p) {
+    const cd = effectiveCooldown(sk, rank, p);
+    return `⏱ ${cd.toFixed(2)}s cooldown · ${sk.manaCost ? `💧 ${sk.manaCost} mana` : 'no mana cost'}`;
+  }
+
+  _selectSkillSlot(i) {
+    const cur = this._skillsCursor;
+    cur.col = 'slots';
+    if (cur.slot !== i) { cur.slot = i; cur.index = null; }
+    this._refreshSkillsPanel();
+  }
+
+  // Slot 1's list edits one weapon class's remembered pick at a time (§17.10: a class's pick can be set while a
+  // different weapon is equipped). null / the equipped class = follow the equipped weapon.
+  _setSkillsAttackClass(cls) {
+    const p = this.game && this.game.player;
+    if (!p || !WEAPON_CLASSES.includes(cls)) return;
+    this._skillsAttackClass = cls === weaponClass(p) ? null : cls;
+    const cur = this._skillsCursor;
+    cur.slot = 0; cur.index = null;
+    this._refreshSkillsPanel();
+  }
+
+  _cycleSkillsAttackClass(dir) {
+    const p = this.game && this.game.player;
+    if (!p || WEAPON_CLASSES.length < 2) return;
+    const i = WEAPON_CLASSES.indexOf(this._skillsModel(p).ctxCls);
+    this._setSkillsAttackClass(WEAPON_CLASSES[(i + dir + WEAPON_CLASSES.length) % WEAPON_CLASSES.length]);
+    sfx.uiClick();
+  }
+
+  // Click / A on a right-hand list row: put that skill in the selected slot (for slot 1: in the edited class's pick).
+  _assignSkillAt(k) {
+    const p = this.game && this.game.player;
+    if (!p) return;
+    const model = this._skillsModel(p);
+    const e = model.entries[k];
+    if (!e || e.current) return;
+    if (!e.ok) { sfx.denied(); return; } // weapon-locked: shown dimmed with "Requires {class}"
+    const target = model.slot === 0 ? model.ctxCls : model.cat;
+    if (assignSkill(p, target, e.def.id)) {
+      sfx.uiClick();
+      flash(this.dom.slotCards[model.slot].icon, 'dm-bump');
+      this._refreshSkillsPanel();
+    }
+  }
+
+  _upgradeSkill(skillId) {
+    const p = this.game && this.game.player;
+    if (!p || !skillId) return;
+    if (upgradeSkill(p, skillId)) {
+      const row = this.dom.skillListRows.find((r) => r.id === skillId);
+      if (row) flash(row.icon, 'dm-bump');
+      this.dom.slotCards.forEach((card, i) => { if (activeSkill(p, i)?.id === skillId) flash(card.icon, 'dm-bump'); });
+      this._refreshSkillsPanel();
+    } else {
+      sfx.denied();
+    }
+  }
+
+  _refreshSkillsPanel() {
+    const p = this.game && this.game.player;
+    if (!p) return;
+    const d = this.dom;
+    const cur = this._skillsCursor;
+    const sp = p.skillPoints || 0;
+    setText(d.skillListPoints, sp > 0 ? `${sp} point${sp === 1 ? '' : 's'}` : '');
+    d.skillListPoints.classList.toggle('dm-show', sp > 0);
+
+    const model = this._skillsModel(p);
+    const weapon = p.equipment && p.equipment.weapon;
+    setText(d.skillsWeaponText, `${weapon ? `${weapon.icon || '🗡️'} ${weapon.name}` : '✊ Unarmed'} · ${weaponClassName(model.equippedCls)}`);
+
+    // Left: the 4 slot cards — what each slot resolves to right now (activeSkill, same as the HUD).
+    for (let i = 0; i < d.slotCards.length; i++) {
+      const card = d.slotCards[i];
+      const sk = activeSkill(p, i);
+      if (!sk) continue;
+      const rank = skillRank(p, sk.id);
+      setText(card.cat, i === 0 ? `Attack · ${weaponClassName(model.equippedCls)}` : CATEGORY_LABEL[SLOT_CATEGORIES[i]]);
+      setText(card.iconGlyph, sk.icon || '');
+      setText(card.name, sk.name || '');
+      card.pipEls.forEach((el, r) => el.classList.toggle('dm-on', r < rank));
+      card.pips.title = `Rank ${rank} / ${MAX_SKILL_RANK}`;
+      setText(card.meta, this._skillMetaText(sk, rank, p));
+      card.row.classList.toggle('dm-selected', i === cur.slot);
+      card.row.classList.toggle('dm-focused', cur.col === 'slots' && i === cur.slot);
+      if (card.classes) this._refreshClassChips(card, p, model);
+    }
+
+    // Right: known skills for the selected slot. Rebuilt only when the set/order of rows changes.
+    const sig = `${model.slot}|${model.ctxCls}|${model.entries.map((e) => e.def.id).join(',')}`;
+    if (d.skillListSig !== sig) {
+      d.skillListSig = sig;
+      d.skillList.textContent = '';
+      d.skillListRows = model.entries.map((e, k) => {
+        const row = mk('div', 'dm-charskill-row dm-skillpick', d.skillList);
+        const icon = mk('div', 'dm-charskill-icon', row, e.def.icon || '');
+        const main = mk('div', 'dm-charskill-main', row);
+        const head = mk('div', 'dm-charskill-head', main);
+        mk('div', 'dm-charskill-name', head, e.def.name || '');
+        const tag = mk('span', 'dm-skilltag', head, '');
+        const pips = mk('div', 'dm-pips', head);
+        const pipEls = [];
+        for (let r = 0; r < MAX_SKILL_RANK; r++) pipEls.push(mk('i', 'dm-pip', pips));
+        const desc = mk('div', 'dm-charskill-desc', main, '');
+        const meta = mk('div', 'dm-slotcard-meta', main, '');
+        const upgradeBtn = mk('button', 'dm-plus dm-plus-wide', row, '+ Rank up');
+        row.addEventListener('click', () => {
+          this._skillsCursor.col = 'list';
+          this._skillsCursor.index = k;
+          this._assignSkillAt(k);
+          this._refreshSkillsPanel();
+        });
+        upgradeBtn.addEventListener('click', (ev) => { ev.stopPropagation(); this._upgradeSkill(e.def.id); });
+        return { id: e.def.id, row, icon, tag, pips, pipEls, desc, meta, upgradeBtn, _desc: null };
+      });
+    }
+    model.entries.forEach((e, k) => {
+      const r = d.skillListRows[k];
+      if (!r) return;
+      const rank = skillRank(p, e.def.id);
+      r.pipEls.forEach((el, i) => el.classList.toggle('dm-on', i < rank));
+      r.pips.title = `Rank ${rank} / ${MAX_SKILL_RANK}`;
+      const desc = skillDescription(e.def.id, rank, p);
+      if (r._desc !== desc) { r.desc.innerHTML = desc; r._desc = desc; }
+      setText(r.meta, this._skillMetaText(e.def, rank, p));
+      const requires = `Requires ${(e.def.classes || []).map(weaponClassName).join(' / ')}`;
+      setText(r.tag, e.current ? 'In slot' : e.ok ? 'Assign' : requires);
+      r.tag.className = `dm-skilltag ${e.current ? 'dm-skilltag-on' : e.ok ? 'dm-skilltag-assign' : 'dm-skilltag-locked'}`;
+      r.row.classList.toggle('dm-ineligible', !e.ok);
+      r.row.classList.toggle('dm-current', e.current);
+      const maxed = rank >= MAX_SKILL_RANK;
+      const canUp = sp > 0 && !maxed;
+      setText(r.upgradeBtn, maxed ? 'Max' : '+ Rank up');
+      r.upgradeBtn.disabled = !canUp;
+      r.upgradeBtn.classList.toggle('dm-maxed', maxed);
+      r.row.classList.toggle('dm-can-spend', canUp);
+      r.row.classList.toggle('dm-focused', cur.col === 'list' && k === cur.index);
+    });
+
+    const catName = CATEGORY_LABEL[model.cat];
+    setText(d.skillListTitle, model.slot === 0
+      ? `Attack skills · ${weaponClassName(model.ctxCls)}${model.ctxCls !== model.equippedCls ? ' (not equipped)' : ''}`
+      : `${catName} skills`);
+    setText(d.skillListNote, model.entries.length <= 1 ? `You don't know any other ${catName.toLowerCase()} skills yet.` : '');
+  }
+
+  // Slot 1's weapon-class row: every class's remembered attack pick, the equipped class marked, the class the list is
+  // editing highlighted. Hidden while only one weapon class exists (today: melee1h only).
+  _refreshClassChips(card, p, model) {
+    const show = WEAPON_CLASSES.length > 1;
+    card.classes.style.display = show ? '' : 'none';
+    if (!show) return;
+    const sig = `${WEAPON_CLASSES.map((c) => `${c}:${attackSkillForClass(p, c).id}`).join(',')}|${model.equippedCls}|${model.ctxCls}`;
+    if (card.classSig === sig) return;
+    card.classSig = sig;
+    card.classes.textContent = '';
+    for (const cls of WEAPON_CLASSES) {
+      const sk = attackSkillForClass(p, cls);
+      const chip = mk('button', 'dm-classchip', card.classes, `${weaponClassName(cls)}: ${sk.name}`);
+      chip.classList.toggle('dm-equipped', cls === model.equippedCls);
+      chip.classList.toggle('dm-active', cls === model.ctxCls);
+      chip.title = cls === model.equippedCls ? 'Your equipped weapon class'
+        : `Choose the attack used whenever a ${weaponClassName(cls)} weapon is equipped`;
+      chip.addEventListener('click', (ev) => { ev.stopPropagation(); this._setSkillsAttackClass(cls); });
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -2191,47 +2442,65 @@ export class UI {
     // tabs instead of opening Character/Inventory on top of it.
     if (this._shopOpen) { this._handleShopInput(input); return; }
 
-    // Controller bumpers cycle tabs (checked first: they also map to character/inventory).
+    // Controller bumpers / Tab cycle tabs (checked first: they also map to character/inventory).
     if (input.pressed('tab_prev') || input.pressed('tab_next')) { this._cycleTab(input.pressed('tab_next') ? 1 : -1); return; }
     if (input.pressed('character')) { if (this._characterOpen) this.closeAll(); else this.toggleCharacter(); return; }
+    if (input.pressed('skills')) { if (this._skillsOpen) this.closeAll(); else this.toggleSkills(); return; }
     if (input.pressed('inventory')) { if (this._inventoryOpen) this.closeAll(); else this.toggleInventory(); return; }
 
     if (this._characterOpen) this._handleCharacterInput(input);
+    else if (this._skillsOpen) this._handleSkillsInput(input);
     else if (this._inventoryOpen) this._handleInventoryInput(input);
   }
 
   _handleCharacterInput(input) {
     const list = this._charFocusList();
     if (!list.length) return;
-    // Two columns: attributes (left) and skills (right). Up/down move within the current column
-    // (wrapping), left/right jump across to the same row of the other column.
-    const cur = list[this._charCursor] || list[0];
-    const column = (kind) => list.map((e, i) => (e.kind === kind ? i : -1)).filter((i) => i >= 0);
-    const col = column(cur.kind);
-    const row = Math.max(0, col.indexOf(this._charCursor));
     let next = this._charCursor;
-    if (input.pressed('ui_up')) next = col[(row - 1 + col.length) % col.length];
-    if (input.pressed('ui_down')) next = col[(row + 1) % col.length];
-    // Column jump is a single toggle, not a scroll — ui_left/ui_right auto-repeat while held
-    // (same as up/down) would otherwise flip it back and forth every ~120ms on a held press.
-    // Only react to the first edge of a hold; re-arm once both directions are released.
-    if (!input.held('ui_left') && !input.held('ui_right')) this._charColSwitchArmed = true;
-    else if ((input.pressed('ui_left') || input.pressed('ui_right')) && this._charColSwitchArmed) {
-      this._charColSwitchArmed = false;
-      const other = column(cur.kind === 'attr' ? 'skill' : 'attr');
-      if (other.length) next = other[Math.min(row, other.length - 1)];
-    }
+    if (input.pressed('ui_up')) next = (next - 1 + list.length) % list.length;
+    if (input.pressed('ui_down')) next = (next + 1) % list.length;
     if (next !== this._charCursor) { this._charCursor = next; this._applyCharacterFocus(); }
     const focused = list[this._charCursor];
     if (focused && this._lastCharCursor !== this._charCursor) {
       this._lastCharCursor = this._charCursor;
       if (focused.el.scrollIntoView) focused.el.scrollIntoView({ block: 'nearest' });
     }
-    if (input.pressed('confirm') && focused) {
-      const p = this.game && this.game.player;
-      if (!p) return;
-      if (focused.kind === 'attr') this._spendAttr(focused.ref.attr.id);
-      else this._upgradeSkill(focused.el.dataset.skillId);
+    if (input.pressed('confirm') && focused) this._spendAttr(focused.ref.attr.id);
+  }
+
+  // Skills tab: left column = the 4 slot cards, right column = known skills for the selected slot. Up/down move
+  // within a column (wrapping; in the slot column that also changes the selected slot), right/left move between
+  // columns, A/Enter on a card jumps into its list and on a list row assigns it, Y/R/+ ranks up the focused skill
+  // (on a card: the skill in that slot), X/Q cycles which weapon class slot 1's list edits (only with >1 class).
+  _handleSkillsInput(input) {
+    const p = this.game && this.game.player;
+    if (!p) return;
+    const cur = this._skillsCursor;
+    const n = SLOT_CATEGORIES.length;
+    let model = this._skillsModel(p);
+    if (cur.col === 'slots') {
+      if (input.pressed('ui_up')) { cur.slot = (cur.slot - 1 + n) % n; cur.index = null; }
+      if (input.pressed('ui_down')) { cur.slot = (cur.slot + 1) % n; cur.index = null; }
+      if (input.pressed('ui_right') || input.pressed('confirm')) cur.col = 'list';
+    } else {
+      const len = Math.max(1, model.entries.length);
+      if (input.pressed('ui_up')) cur.index = (cur.index - 1 + len) % len;
+      if (input.pressed('ui_down')) cur.index = (cur.index + 1) % len;
+      if (input.pressed('ui_left')) cur.col = 'slots';
+      else if (input.pressed('confirm')) this._assignSkillAt(cur.index);
+    }
+    if (input.pressed('drop') && cur.slot === 0) this._cycleSkillsAttackClass(1);
+    model = this._skillsModel(p);
+    if (input.pressed('rank_up')) {
+      const sk = cur.col === 'list' ? (model.entries[cur.index] || {}).def : model.current;
+      if (sk) this._upgradeSkill(sk.id);
+    }
+    this._refreshSkillsPanel();
+    const focusKey = `${cur.col}:${cur.slot}:${cur.index}`;
+    if (focusKey !== this._lastSkillsFocusKey) {
+      this._lastSkillsFocusKey = focusKey;
+      const el = cur.col === 'slots' ? this.dom.slotCards[cur.slot].row : (this.dom.skillListRows[cur.index] || {}).row;
+      if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
     }
   }
 
@@ -2711,7 +2980,6 @@ const CSS_TEXT = `
 .dm-foot-item .dm-kbd { font-size: 10px; height: 1.9em; }
 
 .dm-section { flex: 1 1 250px; min-width: 230px; }
-.dm-section-skills { flex-basis: 300px; }
 .dm-section-title {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   font-family: 'Fredoka', sans-serif; font-weight: 600; color: var(--dm-ink-soft); font-size: clamp(13px, 1.7vmin, 15px);
@@ -2783,6 +3051,42 @@ const CSS_TEXT = `
 .dm-pip { width: 9px; height: 9px; border-radius: 3px; background: #dee2e6; box-shadow: inset 0 -1px 0 rgba(0,0,0,0.1); }
 .dm-pip.dm-on { background: linear-gradient(180deg, #ffd43b, #f59f00); }
 .dm-charskill-desc { font-size: 12px; color: var(--dm-text-dim); margin-top: 2px; font-weight: 600; line-height: 1.35; }
+
+/* ---------- skills tab ---------- */
+.dm-skills-body { flex-wrap: nowrap; align-items: flex-start; }
+.dm-skills-slotcol { flex: 0 0 340px; min-width: 0; }
+.dm-skills-listcol { flex: 1 1 auto; min-width: 0; }
+.dm-skills-weapon { font-weight: 800; font-size: 13px; color: var(--dm-text-dim); background: #eef2f8; padding: 3px 12px; border-radius: 999px; }
+.dm-slotcard { cursor: pointer; }
+.dm-slotcard:hover { background: #eaf1fa; }
+.dm-slotcard.dm-selected { background: #e7f5ff; border-color: #a5d8ff; }
+.dm-slotcard.dm-focused { border-color: var(--dm-blue-deep); }
+.dm-slotcard-cat {
+  font-family: 'Fredoka', sans-serif; font-weight: 600; font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--dm-blue-deep);
+}
+.dm-slotcard-meta { font-size: 11px; font-weight: 700; color: var(--dm-text-dim); margin-top: 3px; }
+.dm-slotcard-classes { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.dm-classchip {
+  font-size: 11px; font-weight: 800; padding: 1px 8px; border-radius: 999px; background: #fff; border: 1.5px solid var(--dm-edge);
+  color: var(--dm-text-dim);
+}
+.dm-classchip.dm-equipped { color: var(--dm-text); }
+.dm-classchip.dm-equipped::after { content: ' ●'; color: var(--dm-mint-deep); }
+.dm-classchip.dm-active { border-color: var(--dm-blue-deep); color: var(--dm-blue-deep); background: #e7f5ff; }
+.dm-skillpick { cursor: pointer; }
+.dm-skillpick:hover { background: #eaf1fa; }
+.dm-skillpick.dm-current { background: #ebfbee; border-color: #b2f2bb; }
+.dm-skillpick.dm-can-spend { background: #f4fce3; border-color: #c0eb75; }
+.dm-skillpick.dm-focused { border-color: var(--dm-blue-deep); background: #e7f5ff; }
+.dm-skillpick.dm-ineligible { cursor: default; }
+.dm-skillpick.dm-ineligible .dm-charskill-icon, .dm-skillpick.dm-ineligible .dm-charskill-name,
+.dm-skillpick.dm-ineligible .dm-charskill-desc, .dm-skillpick.dm-ineligible .dm-slotcard-meta { opacity: 0.45; filter: grayscale(0.8); }
+.dm-skilltag { font-size: 10px; font-weight: 900; padding: 1px 7px; border-radius: 999px; white-space: nowrap; }
+.dm-skilltag-on { background: #d3f9d8; color: var(--dm-mint-deep); }
+.dm-skilltag-assign { background: #d0ebff; color: var(--dm-blue-deep); }
+.dm-skilltag-locked { background: #f1f3f5; color: #868e96; }
+.dm-skills-note { font-size: 12px; font-weight: 700; color: var(--dm-text-dim); margin-top: 10px; font-style: italic; }
 
 /* ---------- inventory ---------- */
 .dm-inv-gold { font-weight: 900; color: #b35c00; background: #fff3d1; padding: 3px 12px; border-radius: 999px; font-size: 14px; }
@@ -2987,7 +3291,8 @@ const CSS_TEXT = `
 }
 .dm-controls-row:last-child { border-bottom: none; }
 .dm-controls-head { font-family: 'Fredoka', sans-serif; font-weight: 600; color: var(--dm-blue-deep); font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
-.dm-controls-keys { display: flex; flex-wrap: wrap; gap: 4px; }
+.dm-controls-keys { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.dm-controls-then { font-weight: 900; opacity: 0.6; }
 .dm-controls .dm-kbd { font-size: 11px; height: 22px; min-width: 22px; }
 
 .dm-death-skull { font-size: clamp(40px, 7vmin, 60px); line-height: 1; animation: dm-bob 2.4s ease-in-out infinite; }
@@ -3033,6 +3338,8 @@ const CSS_TEXT = `
   .dm-inv-col-grid { align-self: stretch; }
   .dm-inv-grid { --cell: clamp(34px, 9vw, 56px); gap: 5px; }
   .dm-inv-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .dm-skills-body { flex-direction: column; align-items: stretch; }
+  .dm-skills-slotcol { flex-basis: auto; }
   .dm-death-summary { grid-template-columns: repeat(3, 1fr); }
   .dm-mm-legend { display: none; }
   .dm-menubtn-label { display: none; }

@@ -728,7 +728,11 @@ function drinkPotion(kind) {
 let lastNearMerchant = null; // merchant greeting plays when one first comes into trade range
 function handleGameplayInput(dt) {
   if (input.pressed('pause')) { pauseGame(); return; }
+  // LB and keyboard C both always mean Character — predictable regardless of pending points.
+  // The on-screen "points to spend" HUD pill (mouse-only) is the one control that routes to
+  // whichever tab actually has unspent points, via ui.openPendingPointsTab() (DESIGN §13).
   if (input.pressed('character')) { ui.toggleCharacter(); return; }
+  if (input.pressed('skills')) { ui.toggleSkills(); return; }
   if (input.pressed('inventory')) { ui.toggleInventory(); return; }
 
   // In range of a merchant, confirm opens the shop instead of attacking. On gamepad, A is both

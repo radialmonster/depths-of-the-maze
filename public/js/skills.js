@@ -72,6 +72,11 @@ export const SLOT_CATEGORIES = ['attack', 'spell', 'special', 'movement'];
 // (validated at startup). Later phases add melee2h / bow / wand / staff along with their default attacks.
 export const WEAPON_CLASSES = ['melee1h'];
 
+// Display names for weapon classes (Skills tab labels, "Requires {class}"). Lists every class in DESIGN §17.9 so a
+// class that lands later already reads correctly; only WEAPON_CLASSES decides which ones exist.
+export const WEAPON_CLASS_NAMES = { melee1h: 'Melee', melee2h: 'Two-handed', bow: 'Bow', wand: 'Wand', staff: 'Staff' };
+export function weaponClassName(cls) { return WEAPON_CLASS_NAMES[cls] || cls; }
+
 // Weapon kind -> class. Transitional stand-in for items.js WEAPON_KIND_INFO (DESIGN §17.9): today bows and staves
 // still behave as melee weapons (they Cleave and feed meleeMin/Max), so they map to melee1h until the phase that
 // gives them their own class + default attack. Unarmed / unknown kinds are melee1h too.
@@ -263,8 +268,9 @@ export function skillRank(player, skillId) {
   return defaultSkillIds().includes(skillId) ? 1 : 0;
 }
 
-// Is `def` usable in a slot of `category` for a player whose weapon class is `cls`?
-function eligible(player, def, category, cls) {
+// Is `def` usable in a slot of `category` for a player whose weapon class is `cls`? (Known + right category +
+// weapon-class match: attack skills must list `cls`; slot 2-4 skills must be unrestricted or list `cls`.)
+export function skillEligible(player, def, category, cls) {
   if (!def || def.category !== category || skillRank(player, def.id) < 1) return false;
   const classes = Array.isArray(def.classes) ? def.classes : [];
   if (category === 'attack') return classes.includes(cls);
@@ -281,15 +287,64 @@ export function activeSkill(player, slotIndex) {
   const category = SLOT_CATEGORIES[slotIndex];
   if (!category) return null;
   const cls = weaponClass(player);
+  if (category === 'attack') return attackSkillForClass(player, cls);
   const loadout = (player && player.skillState && player.skillState.loadout) || {};
-  if (category === 'attack') {
-    const choice = SKILL_DEFS[(loadout.attack || {})[cls]];
-    if (eligible(player, choice, 'attack', cls)) return choice;
-    return SKILL_DEFS[CLASS_DEFAULT_ATTACK[cls]] || SKILL_DEFS[CLASS_DEFAULT_ATTACK[UNARMED_CLASS]];
-  }
   const choice = SKILL_DEFS[loadout[category]];
-  if (eligible(player, choice, category, cls)) return choice;
+  if (skillEligible(player, choice, category, cls)) return choice;
   return SKILL_DEFS[CATEGORY_DEFAULT[category]];
+}
+
+// The attack skill slot 1 would hold with a `cls` weapon equipped: the player's remembered pick for that class if
+// still eligible, else the class default. activeSkill() uses it for the equipped class; the Skills tab uses it to show
+// the other classes' assignments (§17.10).
+export function attackSkillForClass(player, cls) {
+  const loadout = (player && player.skillState && player.skillState.loadout) || {};
+  const choice = SKILL_DEFS[(loadout.attack || {})[cls]];
+  if (skillEligible(player, choice, 'attack', cls)) return choice;
+  return SKILL_DEFS[CLASS_DEFAULT_ATTACK[cls]] || SKILL_DEFS[CLASS_DEFAULT_ATTACK[UNARMED_CLASS]];
+}
+
+// Every skill the player knows (rank >= 1) in `category`, in registry order. For the Skills tab's picker list.
+export function knownSkills(player, category) {
+  return Object.values(SKILL_DEFS).filter((d) => d.category === category && skillRank(player, d.id) >= 1);
+}
+
+// ---------------------------------------------------------------------------
+// assignSkill — the Skills-tab picker (§17.10). `categoryOrClass` is a weapon class (sets loadout.attack[class]; the
+// skill must be a known attack skill usable by that class — it need NOT match the currently equipped weapon, so a
+// class's pick can be set while holding something else) or a slot 2-4 category (sets loadout[category]; the skill
+// must be a known skill of that category). Returns false, changing nothing, for anything else.
+// ---------------------------------------------------------------------------
+export function assignSkill(player, categoryOrClass, skillId) {
+  const def = SKILL_DEFS[skillId];
+  if (!player || !def || skillRank(player, skillId) < 1) return false;
+  if (!player.skillState) player.skillState = createSkillState();
+  const loadout = player.skillState.loadout || (player.skillState.loadout = {});
+  if (WEAPON_CLASSES.includes(categoryOrClass)) {
+    if (def.category !== 'attack' || !(def.classes || []).includes(categoryOrClass)) return false;
+    if (!loadout.attack) loadout.attack = {};
+    loadout.attack[categoryOrClass] = skillId;
+    return true;
+  }
+  if (categoryOrClass === 'attack' || !SLOT_CATEGORIES.includes(categoryOrClass)) return false;
+  if (def.category !== categoryOrClass) return false;
+  loadout[categoryOrClass] = skillId;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// learnSkill — a skill book was read (§17.11). Unknown skill: learned at rank 1, plus 1 free skill point. Already
+// known: +1 rank (a duplicate book is never dead weight), capped at MAX_SKILL_RANK. Returns false (nothing changed —
+// the caller should not consume the book) for an unknown id or a skill already at max rank.
+// ---------------------------------------------------------------------------
+export function learnSkill(player, skillId) {
+  if (!player || !SKILL_DEFS[skillId]) return false;
+  if (!player.skillState) player.skillState = createSkillState();
+  const rank = skillRank(player, skillId);
+  if (rank >= MAX_SKILL_RANK) return false;
+  player.skillState.known[skillId] = rank + 1;
+  if (rank === 0) player.skillPoints = (player.skillPoints || 0) + 1;
+  return true;
 }
 
 // ---------------------------------------------------------------------------

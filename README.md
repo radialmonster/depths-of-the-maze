@@ -25,9 +25,11 @@ npm run preview   # serve the build locally at http://localhost:4321/
 |---|---|---|
 | Move (orthogonal) | WASD / Arrows | Left stick / D-pad |
 | Cleave · Arcane Bolt · Frost Nova · Shadow Dash | 1 · 2 · 3 · 4 | A · X · Y · B |
-| Character sheet | C | Back / RB |
-| Inventory | I / Tab | LB |
-| Health / Mana potion | H / M | LT / RT |
+| Character sheet | C | LB / Back (always opens Character, regardless of pending points) |
+| Inventory | I / Tab | RB |
+| Skills (loadout + rank-ups) | K | LB, then RB (no dedicated pad button — LB opens Character, RB then cycles to Skills) |
+| Switch Character / Skills / Bag tab | Tab | LB / RB (cycles all three while any tab is open) |
+| Health / Mana potion | 5 / 6 | LT / RT |
 | Pause | Esc / P | Start |
 
 Inventory: click = equip/use, right-click = drop, shift-click = salvage for gold. Walking into an enemy attacks it.

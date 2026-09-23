@@ -22,7 +22,9 @@ const ACTION_KEYS = {
   skill3: ['Digit3', 'Numpad3'],
   skill4: ['Digit4', 'Numpad4'],
   character: ['KeyC'],
+  skills: ['KeyK'],              // opens the Skills tab directly (no dedicated pad button — LB then RB, see ui.js)
   inventory: ['KeyI', 'Tab'],
+  tab_next: ['Tab'],             // inside the Character/Skills/Bag window Tab cycles tabs (checked before 'inventory')
   pause: ['Escape', 'KeyP'],
   confirm: ['Enter', 'KeyE', 'Space'],
   cancel: ['Escape'],
@@ -32,6 +34,7 @@ const ACTION_KEYS = {
   mute: ['KeyU'],
   quick_equip: ['KeyR'], // Bag: equip every upgrade
   pin_potion: ['KeyF'],  // Bag: pin/unpin focused potion as the 5/6 hotbar potion
+  rank_up: ['KeyR', 'Equal', 'NumpadAdd'], // Skills tab: spend a skill point on the focused skill
 };
 
 // Gamepad action -> array of standard-mapping button indices.
@@ -52,6 +55,7 @@ const ACTION_BUTTONS = {
   tab_next: [5],     // RB
   quick_equip: [3],  // Y — Bag: equip every upgrade
   pin_potion: [6, 7], // LT / RT — Bag: pin focused potion to its hotbar trigger (same buttons drink in play)
+  rank_up: [3],      // Y — Skills tab: spend a skill point on the focused skill
 };
 
 // Directional keys used for both orthogonal movement and ui_* navigation.
