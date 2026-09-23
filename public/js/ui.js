@@ -85,6 +85,7 @@ function potionKindOf(item) {
 
 const ATTR_ICON ={ str: '💪', dex: '🎯', int: '🧠', vit: '❤️', def: '🛡️' };
 
+// The one ordered stat list: drives both the Character "Derived" list and the Bag "Gear Stats" list.
 const DERIVED = [
   { k: 'maxHp', label: 'Max HP', icon: '❤️' },
   { k: 'maxMana', label: 'Max Mana', icon: '💧' },
@@ -98,8 +99,6 @@ const DERIVED = [
   { k: 'manaRegen', label: 'Mana Regen', icon: '🔹' },
   { k: 'moveSpeed', label: 'Move Speed', icon: '👟' },
 ];
-// Subset shown under the backpack so gear changes can be judged without switching tabs.
-const GEAR_STATS = ['melee', 'spellPower', 'defense', 'maxHp', 'maxMana', 'critChance', 'dodgeChance', 'moveSpeed'];
 
 // [action, keyboard keys, controller buttons]
 const CONTROLS = [
@@ -636,12 +635,11 @@ export class UI {
     mk('div', 'dm-section-title dm-inv-stats-title', right, 'Gear Stats');
     const statsList = mk('div', 'dm-derived-list dm-inv-stats', right);
     const gearStatRows = {};
-    for (const k of GEAR_STATS) {
-      const def = DERIVED.find((x) => x.k === k);
+    for (const d of DERIVED) {
       const row = mk('div', 'dm-derived-row', statsList);
-      mk('div', 'dm-derived-icon', row, def.icon);
-      mk('div', 'dm-derived-name', row, def.label);
-      gearStatRows[k] = mk('div', 'dm-derived-value', row, '-');
+      mk('div', 'dm-derived-icon', row, d.icon);
+      mk('div', 'dm-derived-name', row, d.label);
+      gearStatRows[d.k] = mk('div', 'dm-derived-value', row, '-');
     }
 
     Object.assign(this.dom, {
@@ -1741,7 +1739,7 @@ export class UI {
     this._previewItem = item;
     const gc = item ? compareGear(item, p) : null;
     const rows = this.dom.gearStatRows;
-    for (const k of GEAR_STATS) {
+    for (const { k } of DERIVED) {
       const el = rows[k];
       const now = derivedText(k, p.stats);
       const next = gc ? derivedText(k, gc.after) : now;

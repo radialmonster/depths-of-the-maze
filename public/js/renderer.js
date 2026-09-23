@@ -862,7 +862,7 @@ export class Renderer {
       this.playerEntry = this._buildPlayerMesh();
       this.scene.add(this.playerEntry.root);
       this.playerEntry.vx = p.fx ?? p.x; this.playerEntry.vy = p.fy ?? p.y;
-      this.playerEntry.angle = facingAngle(p.facing?.x || 0, p.facing?.y || 1);
+      this.playerEntry.angle = facingAngle(p.facing?.x || 0, p.facing?.y || 0);
     }
     const entry = this.playerEntry;
     // Held weapon / off-hand mirror the equipped items (rebuilt only when they change).
@@ -872,7 +872,7 @@ export class Renderer {
     this._lerpEntry(entry, p.fx ?? p.x, p.fy ?? p.y, dt);
     const moving = Math.hypot(entry.vx - prevX, entry.vy - prevY) > 0.001;
     const look = p.aim || p.facing;
-    const targetAngle = facingAngle(look?.x || 0, look?.y || 1);
+    const targetAngle = facingAngle(look?.x || 0, look?.y || 0);
     this._rotateEntryTowards(entry, targetAngle, dt);
 
     this.models.animatePlayer(entry, dt, moving, this._time);
@@ -1049,7 +1049,7 @@ export class Renderer {
         this.scene.add(entry.root);
         this.enemyEntries.set(enemy.id, entry);
         entry.vx = enemy.x; entry.vy = enemy.y;
-        entry.angle = facingAngle(enemy.facing?.x || 0, enemy.facing?.y || 1);
+        entry.angle = facingAngle(enemy.facing?.x || 0, enemy.facing?.y || 0);
       }
       const visible = this._tileVisible(map, enemy.x, enemy.y) || this._tileVisible(map, entry.vx, entry.vy);
       entry.root.visible = visible;
@@ -1112,7 +1112,7 @@ export class Renderer {
         this._lerpEntry(entry, enemy.x, enemy.y, dt, 16);
       }
       const moved = Math.hypot(entry.vx - prevX, entry.vy - prevY) > 0.001;
-      const targetAngle = facingAngle(enemy.facing?.x || 0, enemy.facing?.y || 1);
+      const targetAngle = facingAngle(enemy.facing?.x || 0, enemy.facing?.y || 0);
       this._rotateEntryTowards(entry, targetAngle, dt);
       this._applyStatusEffects(entry, enemy);
       this._animateEnemyEntry(entry, enemy, dt, moved);
@@ -1417,7 +1417,7 @@ export class Renderer {
       }
       entry.root.position.x = p.x;
       entry.root.position.z = p.y;
-      entry.root.rotation.y = facingAngle(p.dx || 0, p.dy || 1);
+      entry.root.rotation.y = facingAngle(p.dx || 0, p.dy || 0);
       const visible = this._tileVisible(map, p.x, p.y);
       entry.root.visible = visible;
       if (visible) {

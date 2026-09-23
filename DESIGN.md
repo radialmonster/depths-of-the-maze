@@ -406,6 +406,8 @@ Decisions made with the user while building. Keep this section current — when 
   Mixed-but-clear verdicts say "(with trade-offs)" in the tooltip.
 - Shown as a corner badge on Bag cells and on shop **Buy** cells (not Sell), a verdict line in the item tooltip, and a
   live `now → after` preview (green/red) in the Bag's Gear Stats list for the hovered / gamepad-focused item.
+- Bag's Gear Stats list = the Character screen's Derived list: all 11 stats, same order, both built from `DERIVED`
+  (ui.js) — the only stat key list, so the two can't drift. No curated subset.
 - **Quick-equip**: R / gamepad Y in the Bag, or the "▲ Equip upgrades" button, equips the single best ▲ item per slot.
   Click / A still equips one item.
 - Character/Bag/Shop panels are laid out ~1000px wide and scaled up (never down, max 1.75×) to fit the window
