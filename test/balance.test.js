@@ -7,7 +7,7 @@
 import assert from 'node:assert/strict';
 import { RNG, isBossDepth, bossForDepth } from '../public/js/core.js';
 import { ARENA_MIN, HIDDEN_ROOM_MIN_DEPTH } from '../public/js/map.js';
-import { computeSpawnCount } from '../public/js/enemies.js';
+import { computeSpawnCount, DENSITY_BASE, DENSITY_PER_DEPTH } from '../public/js/enemies.js';
 import {
   floorSample, simulateRun, mixSeed, spawnDensity, designTreasureItems, tierLevelRange, placedArenaStats, isGeneral,
 } from '../tools/simlib.js';
@@ -117,8 +117,8 @@ test('treasure item levels: exact per-tier offsets (Cache max(1,d-1)±1, Hoard d
 });
 
 test('enemy density (general spawns / 100 populated floor) within ±10% of density(depth) at every depth (§17.16)', () => {
-  assert.equal(spawnDensity(1), 1.36);
-  assert.ok(Math.abs(spawnDensity(20) - (1.36 + 0.065 * 19)) < 1e-9);
+  assert.equal(spawnDensity(1), DENSITY_BASE);
+  assert.ok(Math.abs(spawnDensity(20) - (DENSITY_BASE + DENSITY_PER_DEPTH * 19)) < 1e-9);
   assert.equal(computeSpawnCount(10, 1500), Math.round(spawnDensity(10) * 15));
   for (let d = 1; d <= MAX_DEPTH; d++) {
     const fl = byDepth(d);

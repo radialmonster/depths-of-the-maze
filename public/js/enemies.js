@@ -253,8 +253,12 @@ export function createEnemy(typeId, x, y, depth, rng, opts = {}) {
 // General population scales with floor size, not just depth (§16/§17.16): density(depth) enemies per 100 populated
 // floor tiles (map.populatedFloor — already excludes treasure wings, the merchant's room and the boss arena, which
 // get their own guard budgets). Boss + boss guards, treasure guards and exit sentries are NOT part of this count.
-export const DENSITY_BASE = 1.36;
-export const DENSITY_PER_DEPTH = 0.065;
+// Solved against measured map.populatedFloor (300 samples/depth) to hit the confirmed depth-10/20 targets of
+// 30/54 general enemies exactly, rather than the total-floor-calibrated 1.36/0.065 this replaced (which undershot
+// once populatedFloor started excluding treasure/boss/merchant rooms — ~23/~43 at depth 10/20). Also raises early
+// (depth 1-4) density ~25%, addressing separately-reported "enemies feel sparse at low levels" playtesting.
+export const DENSITY_BASE = 1.70;
+export const DENSITY_PER_DEPTH = 0.077;
 export function spawnDensity(depth) {
   return DENSITY_BASE + DENSITY_PER_DEPTH * (Math.max(1, depth) - 1);
 }
