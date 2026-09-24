@@ -210,16 +210,34 @@ const game = {
     const spots = [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]];
     let i = 0;
     for (const item of list) {
-      let sx = x, sy = y;
+      let sx = x, sy = y, found = false;
       for (let k = 0; k < spots.length; k++) {
         const [ox, oy] = spots[(i + k) % spots.length];
-        const t = this.map.get(x + ox, y + oy);
         // Never under an NPC (merchant / chest): its tile can't be walked onto, so the item couldn't be picked up.
-        if (this.isWalkable(x + ox, y + oy) && t !== TILE.EXIT && t !== TILE.ENTRANCE && !this.npcAt(x + ox, y + oy)) { sx = x + ox; sy = y + oy; break; }
+        if (this._dropSpotOk(x + ox, y + oy)) { sx = x + ox; sy = y + oy; found = true; break; }
+      }
+      // The immediate 3x3 can be fully blocked (a multi-chest Vault room, guards packed in, tight walls) — search
+      // outward ring by ring rather than silently dropping onto the origin tile, which for a chest is a permanently
+      // solid NPC (opening it doesn't remove it), so an item placed there could never actually be picked up.
+      if (!found) {
+        for (let r = 2; r <= 8 && !found; r++) {
+          for (let ox = -r; ox <= r && !found; ox++) {
+            for (let oy = -r; oy <= r; oy++) {
+              if (Math.max(Math.abs(ox), Math.abs(oy)) !== r) continue; // only this ring's perimeter
+              if (this._dropSpotOk(x + ox, y + oy)) { sx = x + ox; sy = y + oy; found = true; break; }
+            }
+          }
+        }
       }
       i++;
       this.groundItems.push({ id: uid(), x: sx, y: sy, item, noPickup: false });
     }
+  },
+
+  // A tile dropLoot can place an item on: walkable, not a stairway, and not already under an NPC.
+  _dropSpotOk(x, y) {
+    const t = this.map.get(x, y);
+    return this.isWalkable(x, y) && t !== TILE.EXIT && t !== TILE.ENTRANCE && !this.npcAt(x, y);
   },
 };
 window.game = game; // handy for debugging in devtools
