@@ -81,9 +81,9 @@ const genAll = summarize(allGen);
 
 // Layer 2 ---------------------------------------------------------------
 const ECON_METRICS = ['income', 'goldMob', 'goldChest', 'sellIncome', 'goldOnHand', 'affordRegular', 'affordFeatured',
-  'affordAny', 'affordTogether', 'cheapestPrice', 'featuredPrice', 'goldVsCheapest', 'stockUpgrades', 'bought', 'spent',
+  'affordAny', 'affordTogether', 'cheapestPrice', 'featuredPrice', 'stockTotal', 'onHandVsFeatured', 'goldVsCheapest', 'stockUpgrades', 'bought', 'spent',
   'goldAfter', 'itemsLooted', 'potionsLooted', 'books', 'bossBooks', 'bagMax', 'overflow', 'overflowValue', 'killed',
-  'chestsOpened', 'treasureReached', 'treasureRooms', 'gearIlvl', 'gearValue', 'melee', 'defense', 'maxHp', 'level',
+  'chestsOpened', 'treasureReached', 'treasureRooms', 'gearIlvl', 'gearValue', 'gearRarity', 'melee', 'defense', 'maxHp', 'level',
   'levelMinusDepth'];
 const econRows = {};
 for (let d = args.depths[0]; d <= args.depths[1]; d++) econRows[d] = [];
@@ -143,17 +143,18 @@ if (!args.quiet) {
 
   const E = Object.entries(economy);
   table(`LAYER 2a — run economy, gold (explore ${args.explore}; gold on hand = after selling, before buying)`,
-    ['depth', 'income', 'mob', 'chest', 'sold', 'onHand', 'cheapest', 'featured', 'afford 4reg', 'featOK', 'anyOK', 'together', 'upgrades', 'bought', 'after'],
+    ['depth', 'income', 'mob', 'chest', 'sold', 'onHand', 'cheapest', 'featured', 'stock$', 'hand/feat', 'afford 4reg', 'featOK', 'anyOK', 'together', 'upgrades', 'bought', 'after'],
     E.map(([d, a]) => [d, mpp(a.income, 0), f(a.goldMob.mean, 0), f(a.goldChest.mean, 0), f(a.sellIncome.mean, 0),
-      mpp(a.goldOnHand, 0), f(a.cheapestPrice.mean, 0), f(a.featuredPrice.mean, 0), mpp(a.affordRegular, 2),
+      mpp(a.goldOnHand, 0), f(a.cheapestPrice.mean, 0), f(a.featuredPrice.mean, 0), f(a.stockTotal.mean, 0),
+      f(a.onHandVsFeatured.mean, 2), mpp(a.affordRegular, 2),
       pct(a.affordFeatured.mean), pct(a.affordAny.mean), f(a.affordTogether.mean, 2), f(a.stockUpgrades.mean, 2),
       f(a.bought.mean, 2), f(a.goldAfter.mean, 0)]));
   table('LAYER 2b — run economy, character (level target: ~1 level per floor, §16)',
-    ['depth', 'level', 'lvl-depth', 'killed', 'items', 'potions', 'books', 'trReached', 'bagMax', 'bagFull', 'overflow', 'lostGold', 'gear ilvl', 'gearValue', 'melee', 'def', 'maxHp'],
+    ['depth', 'level', 'lvl-depth', 'killed', 'items', 'potions', 'books', 'trReached', 'bagMax', 'bagFull', 'overflow', 'lostGold', 'gear ilvl', 'gearValue', 'gearRar', 'melee', 'def', 'maxHp'],
     E.map(([d, a]) => [d, mpp(a.level), f(a.levelMinusDepth.mean, 2), f(a.killed.mean), f(a.itemsLooted.mean),
       f(a.potionsLooted.mean), f(a.books.mean, 2), `${f(a.treasureReached.mean, 2)}/${f(a.treasureRooms.mean, 2)}`,
       mpp(a.bagMax, 0), pct(a.bagFullRate.mean), f(a.overflow.mean, 2), f(a.overflowValue.mean, 0), mpp(a.gearIlvl),
-      f(a.gearValue.mean, 0), f(a.melee.mean), f(a.defense.mean), f(a.maxHp.mean, 0)]));
+      f(a.gearValue.mean, 0), f(a.gearRarity.mean, 2), f(a.melee.mean), f(a.defense.mean), f(a.maxHp.mean, 0)]));
   console.log(`\nDone in ${elapsed.toFixed(1)} s.`);
 }
 

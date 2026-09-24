@@ -213,9 +213,12 @@ function gearSnapshot(player) {
   const eq = Object.values(player.equipment);
   const lv = eq.reduce((a, it) => a + (it ? it.itemLevel : 0), 0) / eq.length;
   const value = eq.reduce((a, it) => a + (it ? it.value : 0), 0);
+  // Mean rarity index of what's worn (0 common .. 4 legendary; empty slot = 0) — how far the character's own loot has
+  // outgrown a stock tier (§17.4's stock-rarity steps were set from this).
+  const rarity = eq.reduce((a, it) => a + (it ? rarityIdx(it.rarity) : 0), 0) / eq.length;
   const st = player.stats;
   return {
-    gearIlvl: lv, gearValue: value, slotsFilled: eq.filter(Boolean).length,
+    gearIlvl: lv, gearValue: value, gearRarity: rarity, slotsFilled: eq.filter(Boolean).length,
     melee: st.meleeMin == null ? 0 : (st.meleeMin + st.meleeMax) / 2, defense: st.defense, maxHp: st.maxHp,
   };
 }
@@ -324,6 +327,9 @@ export function simulateRun(seed, opts = {}) {
       rec.affordTogether = n;
       rec.cheapestPrice = Math.min(...regular);
       rec.featuredPrice = prices[prices.length - 1];
+      // Supply vs. demand (§17.4): the price of the whole gear stock, and gold on hand measured in Featured items.
+      rec.stockTotal = prices.reduce((a, b) => a + b, 0);
+      rec.onHandVsFeatured = player.gold / rec.featuredPrice;
       rec.goldVsCheapest = player.gold / rec.cheapestPrice;
       // How many stock items are an actual upgrade for this character (what a player would want to buy).
       rec.stockUpgrades = stock.filter((s) => { const gc = compareGear(s.item, player); return gc && gc.verdict === 'up'; }).length;

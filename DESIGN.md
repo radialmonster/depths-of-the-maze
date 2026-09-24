@@ -576,17 +576,61 @@ Decisions made with the user while building. Keep this section current — when 
   `placeMerchant` uses `map.merchantRoomId`; its old pick only runs for maps generated without the flag.
   `MERCHANT_ENEMY_CLEARANCE` (3 tiles) stays as a harmless safety margin just outside the walls; treasure guards are
   exempt from it (they're in their own walled wing).
-- Stock is fresh each depth and never carries over: health + mana potions (unlimited), 4 magic-or-better items and one
-  **Featured** premium item (rare; epic chance rises with depth), all at exact item level depth + 1.
+- Stock is fresh each depth and never carries over: health + mana potions (unlimited), 4 regular gear items and one
+  **Featured** premium item, all at exact item level depth + 1. **Stock rarity steps up with depth**
+  (`STOCK_RARITY_STEPS` in shop.js), at the first two boss milestones:
+
+  | Depths | Regular gear floor | Featured | Featured one tier up (`featuredUpChance`) |
+  |---|---|---|---|
+  | 1-4 | magic | rare | epic, `0.05 + 0.02·depth`: 7% at d1 → 13% at d4 |
+  | 5-9 | rare | epic | legendary, 15% at d5 → 23% at d9 |
+  | 10+ | epic | epic | legendary, 25% at d10 → 45% at d20 (cap 50%) |
+
+  Depths 1-4 are exactly the old stock (same RNG calls). The reason is the late-game gold surplus, see "Late-game gold
+  surplus" below: the character's own loot outgrows a magic-floor merchant by ~depth 6, so the stock has to keep up
+  with what is actually being worn or gold has nothing to go to.
 - Enemies don't respawn, so gold can't be ground on a level. Intended tension: if you can't afford the Featured item,
   skip shopping and save for the next depth's merchant.
 - Pricing: sell = value × 0.35 always. Buy: potions stay flat at value × 1.3 (`BUY_MULT`, §16 — never a per-level
-  curve). Regular gear and the Featured item each get their own markup on top of that base, both rising with item
-  level but at different rates — `regularGearPriceMult`/`featuredPriceMult` in shop.js — so Featured stays the
-  pricier "splurge" pick (~2.5-3.5 depths of typical income) while gear is a milder, broader sink (~1.3× at low
-  levels rising to ~2× by depth 20). The gear markup (added later, §17.16/§17.17) exists because the simulation
-  harness found gold income far outpacing what there was to spend it on once treasure tiers landed — it measurably
-  helps (13-22% less unspent gold at depths 5+) but doesn't fully close the gap; still a known open balance item.
+  curve). Regular gear and the Featured item each get their own markup on top of that base (`regularGearPriceMult`/
+  `featuredPriceMult` in shop.js, both multiplying `buyPrice`, i.e. on top of the 1.3): Featured `1.5 + 0.13·(ilvl-1)`,
+  the "save up for it" pick; regular gear exactly **1.0 through item level 5** (the depth 1-4 stock — the part the
+  treasure tiers fixed, left untouched) then `+0.05` per level (1.05 at depth 5, 1.8 at depth 20). Measured Featured
+  price: ~220g at d3 / ~1.1k at d8 / ~2.9k at d15 / ~4.7k at d20, ~1-1.5 depths of income, affordable on arrival
+  47% / 72% / 86% / 88% of the time (it was ~100% from d5 on before the fix below — no "save for it" tension left).
+  *History:* the gear markup first shipped as `1.3 + 0.05·(ilvl-1)`; the 1.3 stacked on `BUY_MULT` (1.69× value at
+  depth 1) and silently cut depth-1 "can afford anything" from 42% to 23% (d2 89% → 79%). Fixed to 1.0 at shallow
+  levels; the balance test now asserts shallow gear costs exactly `buyPrice`.
+- **Late-game gold surplus — root cause and fix (sim-measured, §17.17; 500 runs, explore 0.7).** Once the §17.14
+  treasure tiers landed, gold on hand at the merchant reached ~4.2k at d10 / ~23.6k at d20 with ~0.6 purchases per
+  shop. The first fix (the gear markup alone) only reached 3.6k / 19.6k. Investigation:
+  - *Where the gold comes from* (d19, a non-boss depth): sold loot 1665 (54%), chest gold 1079 (35%), mob gold 334
+    (11%). Boss depths add a spike (boss gold + its 3-5 rare+ items sold).
+  - *Supply was never short.* The whole gear stock's price exceeded a depth's income at every depth (d10 ~2.4k vs
+    ~0.9-1.9k, d20 ~6.3k vs ~3.1-4.3k). Buying everything would have gone broke. Tripling the regular slots by d20
+    (4 + depth/2) only halved unspent gold (d20 18.3k → 9.5k) and it still grew ~1.2k/depth — *not* the dominant driver.
+  - *Demand was.* By d6 the character already wore ~3.4 epic/legendary items of 7 (d10: 5.1, d20: 6.5), mostly from
+    elites, Hoards/Vaults and bosses, while the stock was a magic floor at depth+1. Stock items that were an actual
+    upgrade: 2.8 of 5 at d4 → 1.5 at d6 → 1.0 at d10 → 0.6 at d20. Gold piled up because nothing was worth buying.
+  - *Fix:* stock rarity steps (table above), which restores demand at the source. Result vs. the committed-before
+    state (gear markup only) and the original pre-markup baseline: gold on hand d8 1.9k/2.2k → **1.6k**, d10
+    3.6k/4.2k → **3.1k**, d15 9.5k/11.4k → **5.5k**, d20 19.6k/23.6k → **9.3k**; gold left after shopping d10
+    3.0k/3.8k → **1.6k**, d20 18.4k/22.9k → **6.3k**. The better yardstick is gold on hand measured in Featured prices
+    (`onHandVsFeatured` in the sim): it was 3.1× at d5, 5.3× at d10, 7.5× at d15, 9.5× at d20 and still climbing;
+    now **1.4-2.35× from d5 through d20**, i.e. the pile scales with prices instead of compounding. Items bought per
+    shop 0.6-1.5 → 1.2-1.9, stock upgrades 0.6-2.0 → 1.5-2.7. Depths 1-4: identical to the pre-markup baseline (0
+    drift, e.g. d1 "can afford anything" 42%, d3 95%, d4 100%).
+  - *Cost:* gold now converts into power instead of sitting idle — the simulated character ends a bit stronger:
+    melee +7-9% / defense +5-6% / max HP +4-8% at d10-20 vs before. Watch this in playtesting; the softer fallback is to
+    drop the epic step (rare floor from d5 only), which the sim put at d20 unspent gold ~7.9k (vs 6.3k) and less creep.
+  - *Rejected levers (sim-measured):* **trimming income** — even removing *all* chest gold from d5 on only got d20
+    unspent gold to 8.9k and it kept growing ~1k/depth, because demand was the problem; cutting the sell rate to 20%
+    got 11.6k *and* hurt depths 1-2 (d1 "afford anything" down another third, 25% → 16%). **Bigger stock** — above. **A reroll/reforge or
+    respec gold sink** (README ideas) — respec is a one-off, not a recurring drain; reroll is an open-ended gamble
+    whose drain is whatever the sim policy assumes (any "reroll until broke" policy reads as "fixed"), and affix
+    magnitudes here are fixed by item level, so a reroll mostly reshuffles which stats — a good *complement* for later
+    (it would soak the remaining ~1-2 Featured prices of savings), not the fix for "the merchant sells nothing I
+    want". **More markup** — the first attempt; price doesn't create demand.
 - **Buyback** tab (Buy / Sell / Buyback; LB/RB or Tab cycle all three): everything sold on the Sell tab lands there,
   newest first, at exactly what it sold for (no markup — a misclick safety net). Potion stacks come back whole.
   Capped at the last 12 sales (`MERCHANT_BUYBACK_CAP`, FIFO). Lives on the merchant (`merchant.buyback`), so it resets
@@ -997,6 +1041,12 @@ version (e.g. depth 10: ~7.4 treasure items vs ~6.0 mob-drop items), vs. the old
 are the pressure points to watch if this turns out to be too much — the fix is trimming Hoard/Vault items-per-chest,
 not the item-level anchors.
 
+**Gold amounts deliberately left as-is** despite the late-game gold surplus they feed (chest gold is ~35% of income
+at d19, sold loot ~54%, §17.4). Trimming them was measured and rejected: even zero chest gold from depth 5 on left
+d20 with ~8.9k unspent gold, still growing ~1k/depth, because the surplus came from the merchant having nothing worth
+buying, not from too much income — fixed on the demand side instead (§17.4 stock-rarity steps). Early depths depend
+on this gold (d3 chest gold is ~47% of income; "can afford anything" at d3 is 95% with the tiers vs 74% without).
+
 **Vault antechamber** (from depth 6, 50% of Vaults, only when placement succeeds — otherwise a plain single-room
 Vault): a medium guard room attached as a leaf of the parent, with the Vault itself a leaf of the antechamber (two
 doors total, still never touches any start-to-exit path). 60% of the Vault's guards wait in the antechamber, the
@@ -1216,5 +1266,11 @@ one piece that still needs to move out of main.js for this to cover treasure too
     per shop to buy.
   - *Levels lag the "~1 level per floor" target:* level 2.8 at d3 (on target), 7.1 at d10, 12.9 at d20.
   - *Bag pressure is low:* the bag overflows on <5% of depths up to d14, and 12-20% on the deep boss depths (15, 20).
+  - *Follow-up — fixed (§17.4 "Late-game gold surplus"):* the surplus was a demand problem (the character outgrows a
+    magic-floor stock by ~d6), not supply or income. Merchant stock rarity now steps up at d5/d10; gold on hand is
+    now 1.4-2.35 Featured prices from d5 to d20 (was 3.1× → 9.5×), ~3.1k at d10 / ~9.3k at d20; depths 1-4 unchanged.
+    Metrics added for this: `stockTotal` (the whole gear stock's price — "supply"), `onHandVsFeatured` (gold on hand in
+    Featured prices — the surplus yardstick, table column `hand/feat`), `gearRarity` (mean rarity index worn, 0 common
+    .. 4 legendary; column `gearRar`). The baseline was regenerated with the fix.
   - Treasure items/depth run 0-10% under the design table (the one-Vault cap). Antechamber placement fails 10-19% of
     rolls at depths 18-30 (Phase 2 measured 10.5% overall); wings fail < 2%. Generation p50 2.1 ms / p99 10.1 ms.

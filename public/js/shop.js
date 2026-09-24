@@ -12,7 +12,7 @@
 // `buyback` holds what the player sold to this merchant (a misclick safety net); it lives on the
 // merchant object, so it resets with the stock every depth.
 
-import { uid, TILE, dist, clamp } from './core.js';
+import { uid, TILE, dist, clamp, RARITY_ORDER } from './core.js';
 import { generateItem, addToInventory, sellValue, buyPrice, INVENTORY_SIZE } from './items.js';
 
 // A merchant shows up on every Nth depth. Kept as one constant/function so it's easy to tune;
@@ -28,39 +28,71 @@ export const MERCHANT_RANGE = 1.5;
 // How many tiles of clearance around a freshly-placed merchant should be kept enemy-free.
 export const MERCHANT_ENEMY_CLEARANCE = 3;
 
-// 4 "regular" magic/rare items (roughly a single depth's income each) plus 1 "featured" premium
-// item (see featuredRarity/featuredPriceMult below).
+// 4 "regular" items (each at most about one depth's income) plus 1 "featured" premium item (see
+// stockRarityFloor/featuredRarity/featuredPriceMult below). The count stays fixed on purpose: the §17.17 sim showed
+// the stock's total price already exceeded a depth's income at every depth even before the rarity steps (d10 ~2.4k vs
+// ~0.9-1.9k income, d20 ~6.3k vs ~3-4.3k), so the late-game surplus was never "too little to buy" — it was "nothing
+// worth buying" (below). Tripling the regular slots by depth 20 was tried in the sim: it only cut unspent gold ~half.
 const REGULAR_GEAR_COUNT = 4;
 
 // How many recently-sold items the merchant keeps on the Buyback tab. Selling past the cap
 // evicts the oldest entry (FIFO).
 export const MERCHANT_BUYBACK_CAP = 12;
 
-// The featured item is rare at shallow depths, with a rising chance of epic the deeper you go.
-function featuredRarity(depth, rng) {
-  const epicChance = clamp(0.05 + depth * 0.02, 0.05, 0.5);
-  return rng.chance(epicChance) ? 'epic' : 'rare';
+// Stock rarity tracks what a character is actually wearing at that depth (DESIGN §17.4). The §17.17 sim measured the
+// real cause of the late-game gold pile: from ~depth 6 the character's own loot (§17.14 treasure tiers, elites,
+// bosses) already dresses them mostly in rare/epic/legendary gear, so a magic-floor depth+1 stock stopped being an
+// upgrade (only ~1 of the 5 stock items was an upgrade at d10, ~0.6 at d20) and gold had nothing to go to. So the
+// floor of the 4 regular items steps up at the first two boss milestones: magic (d1-4, unchanged) -> rare (d5-9) ->
+// epic (d10+). Each step: from `depth` on, regular gear rolls at least `gear`; the Featured item is `featured`, with
+// featuredUpChance(depth) of one tier higher.
+export const STOCK_RARITY_STEPS = Object.freeze([
+  Object.freeze({ depth: 1, gear: 'magic', featured: 'rare' }),
+  Object.freeze({ depth: 5, gear: 'rare', featured: 'epic' }),
+  Object.freeze({ depth: 10, gear: 'epic', featured: 'epic' }),
+]);
+function stockRarityStep(depth) {
+  let step = STOCK_RARITY_STEPS[0];
+  for (const s of STOCK_RARITY_STEPS) if (depth >= s.depth) step = s;
+  return step;
+}
+export function stockRarityFloor(depth) { return stockRarityStep(depth).gear; }
+
+// Every gear stock item is at exactly this item level (see generateMerchantStock).
+export function stockItemLevel(depth) { return depth + 1; }
+
+// The Featured item's chance of one tier above its step's base rarity (rare->epic at d1-4, epic->legendary from
+// d5) — the same curve the old rare-or-epic Featured used.
+export function featuredUpChance(depth) {
+  return clamp(0.05 + depth * 0.02, 0.05, 0.5);
+}
+export function featuredRarity(depth, rng) {
+  const base = stockRarityStep(depth).featured;
+  const up = RARITY_ORDER[Math.min(RARITY_ORDER.length - 1, RARITY_ORDER.indexOf(base) + 1)];
+  return rng.chance(featuredUpChance(depth)) ? up : base;
 }
 
-// Extra markup on top of buyPrice() for the featured item, so it costs roughly 2-3 depths of
-// typical income instead of one. Gold income grows faster with depth than item value does, so
-// the markup rises with item level to hold that 2-3 depth target (est. income ~35g/depth at
-// depth 1, ~120g at 5, ~260g at 10 → featured ≈ 110g / 285g / 600g).
+// Extra markup on top of buyPrice() for the featured item, so it's the "save up for it" pick rather than an every-
+// depth purchase. Gold income grows faster with depth than item value does, so the markup rises with item level.
+// Measured by the §17.17 sim (with the stock-rarity steps above): Featured ~220g at d3 / ~1.1k at d8 / ~2.9k at d15
+// / ~4.7k at d20, ~1-1.5 depths of income, affordable on arrival 47% / 72% / 86% / 88% of the time.
 const FEATURED_MULT_BASE = 1.5;
 const FEATURED_MULT_PER_LEVEL = 0.13;
 export function featuredPriceMult(itemLevel) {
   return FEATURED_MULT_BASE + FEATURED_MULT_PER_LEVEL * Math.max(0, (itemLevel || 1) - 1);
 }
 
-// Same idea, gentler, on the 4 regular gear slots (§17.14/§17.17's simulation found gold income
-// far outpacing merchant spend from depth 5+ once treasure tiers landed — e.g. ~1790g by depth 10
-// vs a ~260g estimate — with players sitting on far more gold than there's anything left to buy).
-// Stays well under featuredPriceMult at every level so Featured keeps its "the splurge item"
-// identity; this is a broader, milder sink across the whole stock instead.
-const REGULAR_MULT_BASE = 1.3; // matches today's flat BUY_MULT at item level 1 — no early-game change
+// Same idea, gentler, on the 4 regular gear slots. Stays well under featuredPriceMult at every level so Featured
+// keeps its "the splurge item" identity. It multiplies buyPrice(), which already includes BUY_MULT (1.3), so it is
+// exactly 1.0 through the shallow stock (depths 1-4 sell item levels 2-5, the part §17.4's affordability fix made
+// work) and only starts climbing with the first stock-rarity step (depth 5 -> item level 6): 1.05 there, 1.8 at
+// depth 20. (The first version was 1.3 + 0.05/level from level 1, which stacked on BUY_MULT, made depth-1 gear 1.69x
+// value and cut depth-1 "can afford anything" from 42% to 23%.)
 const REGULAR_MULT_PER_LEVEL = 0.05;
+// Last item level still at 1.0: the stock of the depth just before the first rarity step (depth 4 -> level 5).
+const REGULAR_MULT_FREE_LEVEL = stockItemLevel(STOCK_RARITY_STEPS[1].depth - 1);
 export function regularGearPriceMult(itemLevel) {
-  return REGULAR_MULT_BASE + REGULAR_MULT_PER_LEVEL * Math.max(0, (itemLevel || 1) - 1);
+  return 1 + REGULAR_MULT_PER_LEVEL * Math.max(0, (itemLevel || 1) - REGULAR_MULT_FREE_LEVEL);
 }
 
 // The price to buy a given stock entry. Potions use buyPrice() as-is (§16: potions stay in flat
@@ -85,8 +117,9 @@ export function generateMerchantStock(depth, rng) {
   // An exact itemLevel (not generateItem's usual +/-1 jitter) so each deeper shop's stock is
   // strictly stronger/pricier than the last depth's — the randomness that stays is rarity/affix
   // rolls, which is what makes two shops at the same depth feel different.
-  const itemLevel = depth + 1;
-  for (let i = 0; i < REGULAR_GEAR_COUNT; i++) gear.push(generateItem(depth + 1, rng, { minRarity: 'magic', itemLevel }));
+  const itemLevel = stockItemLevel(depth);
+  const minRarity = stockRarityFloor(depth);
+  for (let i = 0; i < REGULAR_GEAR_COUNT; i++) gear.push(generateItem(depth + 1, rng, { minRarity, itemLevel }));
   const featured = generateItem(depth + 1, rng, { rarity: featuredRarity(depth, rng), itemLevel });
   return { heal, mana, gear, featured };
 }

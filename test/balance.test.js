@@ -2,12 +2,18 @@
 // (tools/sim.js). Fixed seeds, 50 floors per depth over depths 1-20, asserting bands rather than exact numbers:
 // treasure rooms are genuine single-door leaves and the boss arena is the seed room, every boss room meets §17.15's
 // minimum, at most one Vault per depth, the hidden-book rate, exact item-level offsets per tier, enemy density vs
-// density(depth) (§17.16), treasure items/depth vs the §17.14 design table, and generation time.
+// density(depth) (§17.16), treasure items/depth vs the §17.14 design table, generation time, and the §17.4 merchant
+// stock rarity steps / shallow-stock pricing.
 //   node test/balance.test.js      (or: npm test)
 import assert from 'node:assert/strict';
-import { RNG, isBossDepth, bossForDepth } from '../public/js/core.js';
+import { RNG, isBossDepth, bossForDepth, RARITY_ORDER } from '../public/js/core.js';
 import { ARENA_MIN, HIDDEN_ROOM_MIN_DEPTH } from '../public/js/map.js';
 import { computeSpawnCount, DENSITY_BASE, DENSITY_PER_DEPTH } from '../public/js/enemies.js';
+import { buyPrice } from '../public/js/items.js';
+import {
+  generateMerchantStock, shopPrice, regularGearPriceMult, featuredPriceMult, stockRarityFloor, stockItemLevel,
+  featuredUpChance, STOCK_RARITY_STEPS,
+} from '../public/js/shop.js';
 import {
   floorSample, simulateRun, mixSeed, spawnDensity, designTreasureItems, tierLevelRange, placedArenaStats, isGeneral,
 } from '../tools/simlib.js';
@@ -175,6 +181,40 @@ test('run-economy policy (Layer 2) runs end to end and reports sane numbers', ()
       assert.ok(r.level >= prevLevel); prevLevel = r.level;
     }
   }
+});
+
+// §17.4: merchant stock rarity tracks the depth (the late-game gold-surplus fix), and the regular-gear markup never
+// touches the shallow stock (depths before the first rarity step price exactly like the pre-markup shop).
+test('merchant stock: rarity floor per step, Featured base tier (+ featuredUpChance one up), shallow gear unmarked', () => {
+  const ri = (r) => RARITY_ORDER.indexOf(r);
+  const firstStep = STOCK_RARITY_STEPS[1].depth;
+  const SHOPS = 200;
+  for (let d = 1; d <= 25; d++) {
+    const step = [...STOCK_RARITY_STEPS].reverse().find((s) => d >= s.depth);
+    assert.equal(stockRarityFloor(d), step.gear);
+    const rng = new RNG(mixSeed(SEED, d, 7));
+    const featured = {};
+    for (let i = 0; i < SHOPS; i++) {
+      const st = generateMerchantStock(d, rng);
+      for (const g of st.gear) {
+        assert.ok(ri(g.rarity) >= ri(step.gear), `depth ${d}: ${g.rarity} gear under the ${step.gear} floor`);
+        assert.equal(g.itemLevel, stockItemLevel(d));
+        assert.equal(shopPrice('gear', g), Math.max(1, Math.round(buyPrice(g) * regularGearPriceMult(g.itemLevel))));
+        if (d < firstStep) assert.equal(shopPrice('gear', g), buyPrice(g), `depth ${d}: shallow gear must not be marked up`);
+      }
+      const f = st.featured;
+      assert.equal(f.itemLevel, stockItemLevel(d));
+      assert.equal(shopPrice('featured', f), Math.max(1, Math.round(buyPrice(f) * featuredPriceMult(f.itemLevel))));
+      featured[f.rarity] = (featured[f.rarity] || 0) + 1;
+    }
+    const up = RARITY_ORDER[Math.min(RARITY_ORDER.length - 1, ri(step.featured) + 1)];
+    const seen = Object.keys(featured);
+    assert.ok(seen.every((r) => r === step.featured || r === up), `depth ${d}: featured rolled ${seen}`);
+    const upShare = (featured[up] || 0) / SHOPS;
+    assert.ok(Math.abs(upShare - featuredUpChance(d)) < 0.1, `depth ${d}: featured ${up} ${upShare} vs ${featuredUpChance(d)}`);
+  }
+  // The gear markup stays under Featured's at every level (Featured keeps its "splurge item" identity).
+  for (let lvl = 1; lvl <= 40; lvl++) assert.ok(regularGearPriceMult(lvl) < featuredPriceMult(lvl));
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
