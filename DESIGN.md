@@ -334,7 +334,9 @@ actions: 'skill1'..'skill4' (1-4 / gamepad A,X,B,Y → 1,2,3,4; the skill each s
          'potion' (5 / gamepad LT), 'mana_potion' (6 / gamepad RT) → drink items.js `activePotion(player, kind)`:
          the pinned stack if any, else the strongest stack of that kind (see §17.8b),
          'quick_equip' (R / Y, Bag only), 'pin_potion' (F / gamepad LT or RT, Bag only: pin/unpin focused potion),
-         'rank_up' (R, =/+, Numpad + / Y, Skills tab only: spend a skill point on the focused skill)
+         'rank_up' (R, =/+, Numpad + / Y, Skills tab only: spend a skill point on the focused skill),
+         'salvage' (G / gamepad L3, Bag only: sell the focused item for gold — the non-mouse path to what
+         Shift+Click already does, since gamepad/keyboard-confirm never carries a shiftKey)
 ```
 
 ## 13. UI (ui.js)
@@ -373,7 +375,9 @@ Three tabs in one window — **Character | Skills | Bag** (LB/RB or Tab cycle al
   Weapon-locked rows can still be ranked up but not assigned.
 - Bag: paperdoll equipment slots (off-hand shown locked + tooltip while a two-handed weapon is equipped, §17.9) +
   24-slot grid, rarity-colored borders, hover tooltips with comparison, click=equip/use, right-click or drop
-  action=drop, shift-click=sell (to gold, "salvage"). Full keyboard/gamepad navigation.
+  action=drop, shift-click=sell (to gold, "salvage"; also G / gamepad L3 on the cursor-focused cell, since
+  Shift+Click has no non-mouse equivalent — `_salvageInvCell()` in ui.js is the single shared path for both).
+  Full keyboard/gamepad navigation.
 
 ## 14. Renderer (renderer.js)
 ```js

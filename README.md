@@ -32,7 +32,8 @@ npm run preview   # serve the build locally at http://localhost:4321/
 | Health / Mana potion | 5 / 6 | LT / RT |
 | Pause | Esc / P | Start |
 
-Inventory: click = equip/use, right-click = drop, shift-click = salvage for gold. Walking into an enemy attacks it.
+Inventory: click = equip/use, right-click = drop, shift-click (or G / gamepad L3) = salvage for gold. Walking into
+an enemy attacks it.
 
 ## Ideas / possible improvements
 - [x] **Automated tests** for the pure-math modules — done: `test/*.test.js` (skills, combat, items, unlock; run via

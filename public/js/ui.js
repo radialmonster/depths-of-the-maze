@@ -1442,8 +1442,8 @@ export class UI {
       : hint([['Click', 'Assign'], ['Arrows', 'Navigate'], ['Enter', 'Assign'], ['R / +', 'Rank up'],
         ...(multiClass ? [['Q', 'Weapon class']] : []), ['Tab', 'Switch tab'], ['Esc', 'Close']]);
     d.invShell.foot.innerHTML = gamepad
-      ? hint([['D-pad', 'Navigate'], [padLabel('A', style), 'Equip / Use'], [padLabel('Y', style), 'Equip upgrades'], [padLabel('X', style), 'Drop'], [`${padLabel('LT', style)} / ${padLabel('RT', style)}`, 'Pin potion'], [lbrb, 'Switch tab'], [padLabel('B', style), 'Close']])
-      : hint([['Click', 'Equip / Use'], ['R', 'Equip upgrades'], ['Q / Right-click', 'Drop'], ['Shift+Click', 'Salvage for gold'], ['F / ☆', 'Pin potion'], ['Esc', 'Close']]);
+      ? hint([['D-pad', 'Navigate'], [padLabel('A', style), 'Equip / Use'], [padLabel('Y', style), 'Equip upgrades'], [padLabel('X', style), 'Drop'], [padLabel('L3', style), 'Salvage for gold'], [`${padLabel('LT', style)} / ${padLabel('RT', style)}`, 'Pin potion'], [lbrb, 'Switch tab'], [padLabel('B', style), 'Close']])
+      : hint([['Click', 'Equip / Use'], ['R', 'Equip upgrades'], ['Q / Right-click', 'Drop'], ['G / Shift+Click', 'Salvage for gold'], ['F / ☆', 'Pin potion'], ['Esc', 'Close']]);
     d.invUpBtnKey.textContent = gamepad ? padLabel('Y', style) : 'R';
   }
 
@@ -2036,16 +2036,29 @@ export class UI {
     }
   }
 
+  // Sell one bag item straight to gold with no merchant trip. Reachable by Shift+Click (mouse) and by the
+  // dedicated 'salvage' action (G / gamepad L3) for keyboard/gamepad play, which have no shift-click equivalent.
+  _salvageInvCell(index) {
+    const p = this.game && this.game.player;
+    const item = p && p.inventory[index];
+    if (!item) return;
+    const value = sellValue(item);
+    p.gold = (p.gold || 0) + value;
+    p.inventory.splice(index, 1);
+    this.log(`Salvaged ${item.name} for ${value}g.`, '#f08c00');
+    this._hideTooltip();
+    this._previewItem = null;
+    this._refreshInventoryPanel();
+  }
+
   _clickInvCell(index, e) {
     const p = this.game && this.game.player;
     if (!p) return;
     const item = p.inventory[index];
     if (!item) return;
     if (e && e.shiftKey) {
-      const value = sellValue(item);
-      p.gold = (p.gold || 0) + value;
-      p.inventory.splice(index, 1);
-      this.log(`Salvaged ${item.name} for ${value}g.`, '#f08c00');
+      this._salvageInvCell(index);
+      return;
     } else if (item.type === 'potion' || item.type === 'skillbook') {
       useItem(this.game, item); // a skill book is read (learn / +1 rank) — §17.11
     } else if (equipItem(p, item, (t, c) => this.log(t, c))) {
@@ -2628,6 +2641,10 @@ export class UI {
     }
     if (input.pressed('drop') && cur.area === 'grid') {
       this._dropInvCell(cur.index);
+      this._lastInvCursorKey = null;
+    }
+    if (input.pressed('salvage') && cur.area === 'grid') {
+      this._salvageInvCell(cur.index);
       this._lastInvCursorKey = null;
     }
   }

@@ -29,6 +29,7 @@ const ACTION_KEYS = {
   confirm: ['Enter', 'KeyE', 'Space'],
   cancel: ['Escape'],
   drop: ['KeyQ', 'Delete'],
+  salvage: ['KeyG'], // Bag: sell the focused item for gold (mouse-only Shift+Click's keyboard/gamepad equivalent)
   potion: ['Digit5', 'Numpad5'],
   mana_potion: ['Digit6', 'Numpad6'],
   mute: ['KeyU'],
@@ -49,6 +50,7 @@ const ACTION_BUTTONS = {
   confirm: [0],      // A
   cancel: [1],       // B
   drop: [2],         // X
+  salvage: [10],     // L3 (left stick click) — Bag: sell the focused item for gold
   potion: [6],       // LT
   mana_potion: [7],  // RT
   tab_prev: [4],     // LB — cycles panel tabs while a panel is open
