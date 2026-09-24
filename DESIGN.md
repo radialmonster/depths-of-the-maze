@@ -109,33 +109,65 @@ projectile's current position (with 0.25-tile substeps an arrow enters a tile 2 
 export function generateDungeon(depth, rng) -> map
 export function computeFOV(map, x, y, radius)   // updates map.visible (clears first) and ORs into map.explored
 map = {
-  width, height,               // grows with depth, cropped to the used area: ~ 50x50 at depth 1 up to ~ 85x85 (never > 90)
+  width, height,               // grows with depth, cropped to the used area (§17.13/§17.14 grow this further than
+                                // the old ~50x50 -> ~85x85 curve; still never > 90, §17.14's headroom check confirmed why)
   tiles: Uint8Array(width*height),       // TILE values
   visible: Uint8Array(width*height),     // 1 = currently in FOV
   explored: Uint8Array(width*height),    // 1 = ever seen
-  rooms: [{ id, x, y, w, h, cx, cy, size:'small'|'medium'|'large', doors:[{x,y}], kind:'normal'|'start'|'exit'|'treasure'|'boss',
-             hidden?, secretDoor?:{x,y} /*hidden treasure room only*/ }],
+  archetype,                    // this depth's generation profile (§17.13) — 'halls'|'catacombs'|'caverns'|'keep'|'wings'
+  populatedFloor,               // floor-tile count used for general spawning (§17.16): excludes treasure-wing rooms
+                                 // and the boss arena, which are populated separately
+  rooms: [{ id, x, y, w, h, cx, cy, size:'small'|'medium'|'large'|'grand', shape, doors:[{x,y}],
+             kind:'normal'|'start'|'exit'|'treasure'|'boss'|'merchant',
+             treasureTier?:'cache'|'hoard'|'vault' /*treasure rooms only, §17.14*/,
+             arena?:bossTypeId /*boss room only — which BOSS_ARENAS entry it used, §17.15*/,
+             hidden?, secretDoor?:{x,y} /*hidden treasure room only, §17.11/§17.14*/ }],
+             // shape is the room-shape function's own id (rect/pillars/Lshape/overlap/cave/cross/octagon/gallery/
+             // ringHall/splitHall/cavern, §17.13) — carried through so a future visual/texture pass has a real hook,
+             // same idea as archetype/treasureTier/arena; none of these fields currently change rendering
   entrance: {x, y, dir, front, freestanding?}, // ENTRANCE tile: a cubby in the start room's wall (up-stairs);
                                // dir = unit step from the cubby into the room, front = floor tile in front (player spawn)
   exits: [{x, y, dir, front, freestanding?}],  // 1-3 EXIT cubbies (down-stairs), far from entrance; walking in descends
-  secrets: [{x, y, roomId, revealed}],   // hidden treasure-room doorways: WALL tiles until revealed (§17.11)
+  secrets: [{x, y, roomId, revealed}],   // hidden treasure-room doorways: WALL tiles until revealed (§17.11/§17.14)
   secretAt(x,y), revealSecret(x,y) -> secret|null,  // reveal = WALL -> DOOR (main.js calls it, then renderer.revealTile)
   idx(x,y), inBounds(x,y), get(x,y), isWalkable(x,y), isOpaque(x,y),
   spawnCandidates(rng, count, minDistFromEntrance) -> [{x,y,roomId}] // floor tiles for enemies/loot
   hasLineOfSight(x0,y0,x1,y1)
 }
 ```
-Requirements: classic "large rooms linked together" layout — NOT a maze. 10–16 rooms per level (count grows with depth),
-mostly medium/large (8x8 .. 18x14) plus a few small ones; room interiors are ~90%+ of all floor. Room shapes: rectangles,
-pillared halls (isolated single WALL pillars, never blocking), L-shapes, two overlapping rectangles, rounded caves.
+Requirements: classic "large rooms linked together" layout — NOT a maze; room interiors are ~90%+ of all floor.
+Base room count: `min(22, 11 + floor((depth-1)*0.6))` — 11 at depth 1, up to 22 by depth 20+ (raised from the old
+10-16 cap once §17.14's headroom check confirmed 24-28 rooms place at a 100% success rate within the existing 86-tile
+generation cap). Treasure-room wings (§17.14) and the boss arena (§17.15) add more rooms on top of this base count,
+and are placed by a different mechanism (leaf-attachment / seed-room) than the base growth pass below.
 `x,y,w,h` is the room's bounding box; `cx,cy` is always a walkable floor tile of that room.
-Algorithm: growth placement — each new room is attached to an existing room on one side, either sharing a wall (single
-doorway in the common wall) or 3–7 tiles away with a short straight corridor; these parent links form the spanning tree.
-Then a few extra links between nearby rooms add loops, and rooms are topped up to 2–4 links (large) / 1–3 (medium),
-capped at 4/3/2 (large/medium/small). Corridors are short, straight or L-shaped, 1 wide (some straight ones widen to 2
-between 1-wide doorways), always join two rooms (no dead ends), and never touch any other space. Every room doorway is a
-TILE.DOOR. A BFS safety net guarantees all floor is reachable from the entrance; outer border always WALL.
-Deterministic for a given rng.
+
+**Base algorithm (unchanged): growth placement.** Each new room is attached to an existing room on one side, either
+sharing a wall (single doorway in the common wall) or 3–7 tiles away with a short straight corridor; these parent
+links form the spanning tree. Then a few extra links between nearby rooms add loops, and rooms are topped up to 2–4
+links (large) / 1–3 (medium), capped at 4/3/2 (large/medium/small). Corridors are short, straight or L-shaped, 1 wide
+(some straight ones widen to 2 between 1-wide doorways), always join two rooms (no dead ends from this pass — dead
+ends are now created deliberately, only by treasure wings, §17.14), and never touch any other space. Every room
+doorway is a TILE.DOOR. A BFS safety net guarantees all floor is reachable from the entrance; outer border always
+WALL. Deterministic for a given rng.
+
+**What varies per depth now (§17.13):** room-shape catalog, size mix (small/medium/large weights), corridor-gap
+distribution, loop fraction, and the parent-weighting function are no longer fixed constants — they're set by the
+depth's `archetype`, so different floors actually feel structurally different, not just re-skinned with the same
+shape distribution.
+
+**Generation pipeline order** (changed by §17.14/§17.15 — wings/arena need real detour-from-entrance data, which
+didn't exist until after the old crop step):
+1. base growth placement (rooms + spanning-tree links)
+2. loop pass + link top-up
+3. BFS connectivity safety net
+4. choose start room, exits, and (on boss depths) the arena — then BFS again on the *uncropped* grid to rank every
+   room's detour distance from the entrance (§17.14/§17.15 both need this ranking)
+5. attach treasure wings as leaves, ordered Vault first then Hoards then Caches (a leaf has exactly one door, so it
+   can never alter any start-to-exit path or invalidate step 4's ranking)
+6. apply the hidden-room modifier (§17.11/§17.14) to one eligible Cache/Hoard
+7. crop to the used bounding box, shifting entrance/exits/secrets to match — this step moved to *last*; it used to
+   run right after placement
 
 ## 8. Player (character.js)
 ```js
@@ -430,6 +462,8 @@ book was read) · `secretFound {x, y}` (a hidden doorway revealed) · `chestOpen
 - Depth 1 enemies die in 2–3 Cleaves; player survives ~8–10 hits from depth-appropriate enemies.
 - Level ~1 per floor early. xpForLevel(L) ≈ 50 * L^1.5.
 - Enemy stats scale ~12%/depth; elites (10%) ×2 HP, ×1.3 dmg, better loot. Boss every 5 depths.
+- Enemy **count** scales with floor size, not just depth, since maps now grow with depth (§17.13/§17.16):
+  `density(depth) = 1.36 + 0.065·(depth-1)` enemies per 100 populated floor tiles.
 - Per level: +5 attr points? No — +3 attribute points, +1 skill point.
 - Gear: base stats and value grow **every item level** (linear formulas in items.js). Attribute stats (str/dex/int/vit/def)
   keep one decimal so each level reads as an upgrade. Randomness (rarity, affixes, ±1 item level on drops) is welcome, but
@@ -568,6 +602,9 @@ Decisions made with the user while building. Keep this section current — when 
   for 1s), Spiral + skeletons in phase 2. Resist `{ arcane: 0.3, physical: -0.25, fire: -0.2, freeze: 0.6, slow: 0.5 }`.
 - Boss HP bar lists weaknesses/resists in element colours, e.g. "Weak: Frost · Resists: Physical".
 - Guaranteed loot: at least one rare-or-better item (epic ~25-35%, legendary ~5-10%, rising with depth) plus a health potion.
+- **Boss room is now a dedicated, per-boss-shaped arena, not whichever room the boss happened to land in** — see
+  §17.15. Reaching the boss/its arena is optional, same as before: descending was never gated on the boss, and stays
+  that way.
 
 ### 17.8 Item compare & quick-equip (Bag)
 - `compareGear(item, player)` (items.js) simulates wearing the item via `recalcStats` on a copy of the player and diffs the
@@ -741,14 +778,14 @@ No random enemy drops. Three sources, all via the `skillbook` item type (§11):
 - **Repeat kill of an already-defeated boss** (first possible at depth 15/20, since bosses only repeat every 5
   depths): a small chance (~20%) at a random book from the generic pool, and a much smaller chance (~3%) at another
   copy of that boss's own unique book.
-- **Hidden treasure room chest**: builds on the *existing* treasure-room system (`map.js` already tags one room per
-  depth as `kind:'treasure'`; `seedTreasure()` in main.js already scatters loot there) rather than a new one. The
-  room must additionally be a dead-end with exactly one doorway (so hiding it can never cut off other floor), never
-  the start/exit/boss/merchant room; ~35% chance per depth from depth 2 on (~1 book every 3 depths). Its one doorway
-  starts as a wall tile flagged `secret`; when the player is within 1 tile of it and it's in view, it reveals (via
-  `renderer.revealTile`, §14) with a shimmer + sound + "You found a hidden passage." log line. A chest object (in
-  `game.npcs`, existing chest model) sits inside, opened like trading a merchant (confirm-when-adjacent); opening it
-  drops one random generic-pool book via `dropLoot`.
+- **Hidden treasure room chest**: a **concealment modifier applied to one Cache- or Hoard-tier treasure room**
+  (§17.14), not a separate room type of its own. That room's single doorway (every treasure room is a purpose-built
+  leaf with exactly one door, §17.14) starts as a wall tile flagged `secret` instead of a normal door; never applied
+  to a Vault (a Vault's cost is its guards, not concealment — sealing guards inside it would be a softlock risk) and
+  never to the start/exit/boss/merchant room. ~35% chance per depth from depth 2 on (~1 book every 3 depths). When
+  the player is within 1 tile of the secret wall and it's in view, it reveals (via `renderer.revealTile`, §14) with
+  a shimmer + sound + "You found a hidden passage." log line. That room's chest(s) additionally hold one random
+  generic-pool book, on top of whatever its tier already grants (§17.14).
 - **Duplicate books** (already known): give **+1 rank** instead of nothing (capped at 5) — otherwise duplicates,
   which will happen often while the generic pool is small, are dead weight.
 - **Learning any brand-new skill also grants +1 free skill point** — softens the "boss reward arrives at rank 1 next
@@ -769,12 +806,13 @@ No random enemy drops. Three sources, all via the `skillbook` item type (§11):
 - Boss drops ride the existing boss loot path: `rollLoot(enemy, depth, rng, { bossesDefeated })` appends the books
   after the guaranteed rare+ item and health potion; `killEnemy` then records the boss type and logs
   "{boss} dropped Skill Book: …".
-- Treasure rooms: previously any small room, 50% of depths. Now **only dead ends** (exactly one door AND exactly one
-  non-wall tile touching the room's floor in the 8-neighbourhood — also catches any safety-net carve), any size,
-  preferring small. **Deviation:** ~25% of layouts have no dead-end candidate, so the hidden roll is 45%
-  (`HIDDEN_ROOM_CHANCE`) to land ~35% of depths ≥ 2 actually having a hidden room (measured 34% over 1000 layouts);
-  otherwise the old 50% (visible) treasure roll applies. Hidden rooms get no spawn candidates, and main.js removes any
-  enemy standing in one; `seedTreasure` loot still spawns there, on top of the chest.
+- Treasure rooms, original Phase 6 version: previously any small room, 50% of depths, hidden-roll raised to 45%
+  (`HIDDEN_ROOM_CHANCE`) as a workaround because only ~75% of layouts had a dead-end room to tag. **Superseded by
+  §17.14**: treasure rooms are now purpose-built leaf wings, so every depth that rolls one gets a genuine single-door
+  dead end by construction — the 45% workaround no longer applies. `HIDDEN_ROOM_CHANCE` reverts to the originally
+  intended **35%**; leaving it at 45% after wings guarantee dead ends would have silently pushed book pacing ~29%
+  faster than designed (caught during the §17.14 design pass, not by a live bug). Hidden rooms get no spawn
+  candidates, and main.js removes any enemy standing in one before applying the modifier.
 - Reveal: checked in `onPlayerMoved` after FOV — Chebyshev distance ≤ 1 from the player's tile and `map.visible`.
   `renderer.revealTile` works because buildMap gives each unrevealed secret a hidden floor slab up front (an
   InstancedMesh can't grow); reveal drops the wall instance, shows the slab, adds the door frame, gold ring + motes.
@@ -816,3 +854,183 @@ No random enemy drops. Three sources, all via the `skillbook` item type (§11):
   projectile position (see §6.1) — otherwise every 2-tile shot counted as point-blank.
   "Fully stuck" (§17.1) uses the 4-way `facing`, so in a diagonal wedge it only attacks when the push is at least as
   much toward the enemy's axis as toward the wall (push mostly into the wall = facing the wall = no attack).
+
+### 17.13 Map variety & archetypes
+Maps were structurally uniform: every depth drew from the same fixed size mix (S18/M44/L38), the same shape weights,
+a compact/blob-shaped topology (parent rooms weighted `1/(1+links)`), and a fixed 25% loop fraction — depth only
+changed room *count*, not *feel*. Fixed by making those constants per-depth instead of global.
+
+- **Archetype** (`map.archetype`, picked per depth, never repeating the previous depth's): sets size mix, shape
+  weights, corridor-gap distribution, loop fraction, and the parent-weighting function. All of the base growth
+  algorithm (§7) is unchanged — an archetype only swaps which constants it's called with.
+
+  | Archetype | Size mix S/M/L | Shapes favored | Topology |
+  |---|---|---|---|
+  | **Halls** | 18/44/38 (today's) | today's catalog, evenly | today's baseline blob |
+  | **Catacombs** | 45/45/10 | rect, cross, T | cluster mode ~40% (below), 50% shared-wall gap, 35% loops; rooms stay ≥5×5, still not a maze |
+  | **Caverns** | 10/40/50 | cave, cavern ~60% | 45% shared-wall gap, more 2-wide corridors |
+  | **Keep** | today's | rect, pillars, ring hall, gallery | 15% loops, a grand seed room (below) |
+  | **Wings** | today's | today's | parents weighted toward the *deepest* spanning-tree nodes (long branches instead of a compact blob); gap 5-12; 15% loops — produces long walks and natural treasure-wing pockets |
+
+- **New room shapes** (masks inside `makeShape`; `canPlace`/`placeRoom`/`connect` handle any mask already, so these
+  are additions to the shape catalog, not new placement logic):
+  - **cross / T**: centred overlapping rectangles.
+  - **octagon**: a rectangle with 2-3 tile chamfered corners.
+  - **gallery**: 3-5 × 14-22, a long hall — breaks the "everything is roughly square" pattern.
+  - **ring hall**: a large rectangle with a solid 3×3+ core. Needs one guard: the core tiles must be marked in the
+    shape (like `pillars` already marks its single-tile pillars) so `doorSlots` never offers a core-wall tile as a
+    door slot.
+  - **split hall**: a partial dividing wall with 1-2 gaps — incidentally gives ranged builds (§17.12) real cover.
+  - **cavern**: cellular-automata blob, largest connected component kept, with enough straight edge that `doorSlots`
+    still finds a 3-tile straight run to place a door on.
+- **Cluster mode**: during growth, after placing a small room, a chance to keep attaching more small rooms *to it*
+  at gap 1 — reuses `placeRoom`/`connect` unchanged, produces cell-block/crypt-row/barracks-suite groupings.
+- **Landmark seed room**: on non-boss depths, the first room (placed near the map centre, §7) can roll "grand"
+  (20-26 × 14-20, ring or pillars) instead of the normal size roll, giving the floor a recognisable centrepiece. On
+  boss depths the seed room is the boss arena instead (§17.15) — the two are mutually exclusive per depth.
+- **Room count**: base curve raised to `min(22, 11 + floor((depth-1)*0.6))` (§7) — confirmed headroom: 24-28 rooms
+  place at 100% success within the existing 86-tile generation cap, cropping to ~81-82 tiles, ~2ms per map.
+
+### 17.14 Treasure tiers: Cache / Hoard / Vault
+Replaces the single flat "one treasure room" concept (the original, pre-tier Phase 6 version, §17.11) with three
+tiers, so treasure rooms vary in richness and difficulty instead of all being the same reward. **Exactly three
+tiers** — item-level offsets only move in whole levels (±1-2), so a 4th tier would sit under one item level from its
+neighbor and be indistinguishable to the player.
+
+| | **Cache** (low) | **Hoard** (medium) | **Vault** (high) |
+|---|---|---|---|
+| Room | new small room (leaf) | new medium room (leaf) | new large room (leaf), optional antechamber from depth 6 (below) |
+| Route | leaf off any non-start/boss/merchant room | leaf off a room in the more-off-path half by BFS detour from entrance | leaf off a room in the top third by detour, far half from entrance |
+| Chests | 1 | 1-2 | 2-3 |
+| Items/chest | 1 | 2 | 2-3 |
+| Item level (`generateItem`'s `opts.itemLevel`, not a shifted `depth`) | depth − 1 (clamped ≥1), ±1 jitter | depth, ±1 jitter (same as a normal mob drop) | depth + 1..2, no downward jitter |
+| Rarity | normal roll | `opts.elite: true` | `opts.elite: true` + one item per chest at `opts.minRarity: 'rare'` |
+| Gold | `int(10,20)·depth` | `int(20,40)·depth` (today's `seedTreasure` amount) | `int(40,70)·depth` |
+| Extras | — | 50% chance of a potion | 1 guaranteed potion |
+| Guards (§17.16 budget, not on top of it) | `int(0,2)`, depth-level, default ~10% elite | `int(2,3)`, depth-level, 25% elite | `3 + floor(depth/8)` capped at 6 + 1 guaranteed elite "Vault Warden", depth+1 level — **all from the current depth's own enemy pool, never a next-depth preview** |
+| Minimum depth | 1 | 1 | 3 |
+
+**Why `opts.itemLevel`, not a shifted `depth` argument:** shifting `depth` moves the legendary-rarity gate too
+(`depth < 4` zeroes legendary weight) and barely moves rarity odds anyway (`depthFactor = depth/20`, so +2 depth is
+only +0.1 to that factor) — `opts.itemLevel` isolates "how good is the gear" from "how good is my luck," which is
+what a tier should control.
+
+**Tier spawn weights drift with depth** the same way rarity odds already do: `t = clamp((depth-1)/19, 0, 1)`, Cache
+60%→40%, Hoard 30%→40%, Vault 10%→20%. **At most one Vault per depth**, so it stays an event, not a routine stop.
+
+**Room count per depth** (max rooms that can roll, independent of tier): `min(5, round(5·(1-e^(-depth/4))))` — 1/2/3
+at depths 1-3 (matches the user's own anchor points exactly), saturating at 5 by depth 10 rather than growing
+linearly forever. From depth 2 the first slot always fills; each additional slot beyond the first fills at 50%.
+
+**Loot volume is a deliberate ~2x increase from depth 3 on** (confirmed intentional — addresses "can't afford
+anything at the merchant early," §17.4): treasure items roughly matched mob-drop item count under the richer
+version (e.g. depth 10: ~7.4 treasure items vs ~6.0 mob-drop items), vs. the old single-treasure-room baseline of
+~1.25 items/depth regardless of depth. The 24-slot bag and per-depth merchant (§17.4, `MERCHANT_DEPTH_INTERVAL = 1`)
+are the pressure points to watch if this turns out to be too much — the fix is trimming Hoard/Vault items-per-chest,
+not the item-level anchors.
+
+**Vault antechamber** (from depth 6, 50% of Vaults, only when placement succeeds — otherwise a plain single-room
+Vault): a medium guard room attached as a leaf of the parent, with the Vault itself a leaf of the antechamber (two
+doors total, still never touches any start-to-exit path). 60% of the Vault's guards wait in the antechamber, the
+warden + the rest wait by the chests. Makes a Vault's difficulty about the *route* (fight, then loot) rather than
+fighting inside the loot room. Capped at 2 rooms/depth, only on depths that already rolled a Vault.
+
+**Hidden-room interaction:** see §17.11 — hidden is a concealment *modifier* applicable to one Cache or Hoard (never
+a Vault), not a 4th tier. A Vault book chance was considered and rejected: it would add only ~10% more total books
+(too small to register as a reward) and blur a cleaner identity — books come from secrets and bosses, gear comes
+from Vaults (full audit in §17.11's implementation notes).
+
+**Implementation split, from `main.js` into pure functions** (needed for §17.17's simulation harness, and generally
+better factoring): chest-content rolling (`seedTreasure`/`openChest` today) moves to something like
+`rollChestContents(tier, depth, rng)` in items.js; tier guard spawning joins `spawnEnemies`.
+
+### 17.15 Boss arenas
+**Confirmed real, not a one-off complaint:** measured over 1000+ generated layouts, depth 5 (Slime King's first
+appearance) put the boss in a room with less than an 80-tile floor 34% of the time, and a *small* room 12% of the
+time — because the boss room was picked as "the largest bounding box among the far third's still-normal rooms," a
+pool that's sometimes just 1-3 rooms, with no minimum-size floor and no protection against pillared/cave/L-shaped
+rooms whose actual clear area (excluding pillars/cave irregularity) is much smaller than their bounding box.
+
+**Minimum arena requirements, derived from the boss's own attack numbers (§17.7), not guessed:**
+- Glob Spray's 16-projectile phase-2 ring only spreads to a dodgeable ~2 tiles between projectiles around radius
+  ≥5 — the player needs ~5-8 tiles of standoff room.
+- Hop Slam's radius-1.8 telegraphed circle needs ~2.5 tiles of clear floor around the player to sidestep.
+- Bone Spears' ±50° (phase 2) fanned lanes are ~7 tiles long and nearly touch each other by distance 4 — the player
+  needs either lateral room to step between lanes or >7 tiles of distance.
+- Guards/summons (2-4 normal-boss guards, 3-4 Slime King splits, 2-3 Bone Tyrant skeletons) all share the room, so
+  it can't just be sized for a 1v1.
+- **Minimum: 16×13 interior (≥180 floor tiles), with a clear core of ≥9×9** (no pillar within 4 tiles of the boss's
+  spawn point) — holds the player ~7 tiles out with room to still move laterally. Today's existing "large" size
+  category (12-18×10-14, §7) can fall under this, which is why arenas need their own size class rather than a tag
+  bolted onto the existing large-room roll.
+
+**Placement: the boss arena is the seed room** (§7's first-placed room, near the map centre) on boss depths, instead
+of being searched for afterward. A room placed first on an empty canvas always fits — this is why arenas don't use
+the leaf-wing mechanism §17.14 uses for treasure (a first-placed room can't fail to place the way a late leaf can).
+Its link cap is 2 with doors on opposite short ends, so the rest of the level grows outward from both sides. The
+start room is then picked from the third of rooms farthest from the arena (as today), and exits exclude the arena
+room — so the arena still ends up far from where the player enters, just now guaranteed to be properly sized.
+
+**Per-boss arena shapes** (`BOSS_ARENAS` table in map.js; `bossForDepth(depth)` moves from enemies.js to core.js
+since map.js may only import from core.js, and both enemies.js and map.js need to know which boss a depth has):
+- **Slime King — "Sump":** a round open cavern, smooth ellipse ~17-19×15-17, open centre. A few isolated pillar
+  islands sit ≥6 tiles from centre as cover, not obstruction. Radius ~8 roughly matches Glob Spray's range, so the
+  ring's danger reads consistently no matter which direction the player retreats.
+- **Bone Tyrant — "Ossuary Hall":** a long hall, ~20-24×13-15, with a two-row colonnade 3 tiles in from each long
+  wall and a clear central aisle. Length gives room to outrun the 7-tile spear lanes; the pillars are tactical using
+  behavior that already exists — spear lanes stop at walls, and Bone Charge hitting a pillar ends the charge early
+  and applies Dazed (+25% damage taken, §17.7) the same as missing a charge normally does. Baiting a charge into a
+  pillar becomes a real, learnable play, not new mechanics.
+- **Future bosses:** each gets one `BOSS_ARENAS` entry; a generic fallback (17×15 rectangle, clear core) covers any
+  boss without a custom entry yet.
+- **Population:** the arena is excluded from general spawn candidates — only the boss and its 2-4 guards spawn
+  there. Treasure wings never attach to it. Tagged `room.kind = 'boss'`, `room.arena = bossTypeId` (§7) as the hook
+  for a future visual/theming pass — deliberately not built this pass (no textures/graphics work, per the original
+  brief). `room.size` stays `'large'` so existing size-based logic elsewhere keeps working.
+- **Reaching the arena stays optional** — descending was never gated on the boss (`descend()`), and stays that way.
+
+### 17.16 Enemy density scales with floor size, not just depth
+`computeSpawnCount(depth)` (enemies.js) used to depend only on depth, which made sense while every floor was
+roughly the same size — but §17.13/§17.14/§17.15 all make floors bigger, so a depth-only count would spread thinner
+as maps grow. Measured implied density on today's layouts (enemies per 100 floor tiles, excluding the start room):
+depth 1 ≈ 1.39, depth 5 ≈ 1.71, depth 10 ≈ 1.87, depth 20 ≈ 2.59 (a curve that was already implicitly drifting
+upward, just never made explicit).
+
+**New formula:** `count = round(density(depth) × map.populatedFloor / 100)`, where `density(depth) = 1.36 +
+0.065·(depth-1)`. `map.populatedFloor` (§7) excludes treasure-wing rooms and the boss arena, which get their own
+guard counts instead (§17.14/§17.15). On today's (pre-§17.13) layout sizes this formula reproduces today's counts
+within ±2, preserving the §16 "2-3 Cleaves per kill, survive 8-10 hits" calibration — it only diverges as floors
+actually get bigger. Confirmed target numbers at the new floor sizes: depth 10 → 30 general enemies (+6-7 treasure
+guards on top), depth 20 → 54 (+7) — both confirmed as the intended late-game intensity, not something to level off.
+
+Distribution keeps the existing `spawnCandidates` system (75% rooms / 25% corridors, plus bat swarms) unchanged,
+with candidates spread per room proportional to room area so a large map fills evenly instead of clumping.
+
+### 17.17 Balance simulation harness
+A `npm test`-style check can catch a formula regressing, but can't answer "does depth-10 loot actually feel
+generous, and can a player afford the depth-10 merchant" — that needs many simulated runs, not one hand-traced
+example. The design rule that makes this possible: **every random roll worth measuring lives in a pure, exported
+function** (already true of `generateDungeon`, `spawnEnemies`, `createEnemy`, `rollLoot`, `generateItem`,
+`sellValue`, `generateMerchantStock`/`shopPrice`, `createPlayer`/`recalcStats`, `equipUpgrades`/`compareGear` — the
+same DOM-free property the existing `test/*.test.js` files already rely on; §17.14's chest-roll extraction is the
+one piece that still needs to move out of main.js for this to cover treasure too).
+
+- **Layer 1 — floor statistics** (fixed seeds, depths 1-30 × N runs): room count, populated floor, map size, enemy
+  count/density/elite share, treasure count/tier mix/chest+item counts/rarity/item-level-vs-depth per tier, gold and
+  potions from mobs vs. chests, books per source, boss-arena size and clear-core size, wing/antechamber placement
+  failure rate, generation time (p50/p99).
+- **Layer 2 — run economy**: a simple player-policy model over depths 1-20, parameterized by how much of the floor
+  the policy explores (**confirmed: 70% explore is the right default**, not a full clear). Per depth: loot everything
+  the policy reaches → `equipUpgrades` → sell the rest at `sellValue` (35%) → record gold on hand and **how many of
+  that depth's `generateMerchantStock` items the player can actually afford** (this is a direct measurement of the
+  "can't afford anything early" complaint that started this whole design pass, §17.4) → track bag-fullness pressure,
+  gear-score growth per depth, and XP level vs. the §16 "~1 level per floor" target.
+- **Tooling:** `npm run sim` (a separate, slower tool — `node tools/sim.js --depths 1-20 --runs 500 [--explore 0.7]
+  [--json out.json] [--compare test/sim/baseline.json]`), printing per-depth mean/p10/p90 and diffing against a
+  committed baseline so any future balance change shows its drift immediately. **Not** part of `npm test` (too slow/
+  statistical for that). A smaller, fast companion, `test/balance.test.js`, *does* join `npm test`'s chain — fixed
+  seeds, N≈50 (a few seconds), asserting bands rather than exact numbers: every treasure room/arena is a genuine
+  single-door leaf (or seed room, for the arena), no room qualifies as a boss room under §17.15's minimum size, at
+  most one Vault/depth, hidden-book rate lands between 30-40%, item-level offsets are exact per tier, enemy density
+  is within ±10% of `density(depth)`, treasure items/depth are within ±25% of the §17.14 design table, and mean
+  generation time stays under 10ms.
