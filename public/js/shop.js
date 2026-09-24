@@ -102,21 +102,26 @@ function findMerchantTile(map, room, rng) {
   return rng.pick(top);
 }
 
-// Places a merchant in a 'normal' room (preferring rooms further from the entrance), generates
-// its stock and pushes it onto game.npcs. Falls back to the start room (findMerchantTile still
-// keeps it off the entrance niche and away from doors) if no normal room exists, so a merchant
-// is placed on every qualifying depth rather than skipped. Returns the merchant, or null only if
-// the map has no rooms at all. `opts.room` lets the debug hook / tests force a specific room.
+// Places a merchant in the room map.js reserved for it (map.merchantRoomId: a kind:'merchant' room that never gets
+// enemy spawns, or the start room when no normal room existed), generates its stock and pushes it onto game.npcs.
+// For a map generated without opts.merchant it falls back to the old pick: a 'normal' room (preferring rooms further
+// from the entrance), else the start room (findMerchantTile still keeps it off the entrance niche and away from
+// doors). Returns the merchant, or null only if the map has no rooms at all. `opts.room` lets the debug hook / tests
+// force a specific room.
 export function placeMerchant(game, opts = {}) {
   const map = game.map;
   if (!map) return null;
+  // Normally map.js already chose the room (generateDungeon opts.merchant): a dedicated kind:'merchant' room with no
+  // spawns inside (or the start room as its fallback). The pick below only runs for maps generated without it.
+  const chosen = !opts.room && map.merchantRoomId != null ? (map.rooms || [])[map.merchantRoomId] : null;
+  if (chosen) opts = { ...opts, room: chosen };
   let pool = (map.rooms || []).filter((r) => r.kind === 'normal');
   const fallback = !pool.length;
   if (fallback) {
     const startRoom = (map.rooms || []).find((r) => r.kind === 'start');
     pool = startRoom ? [startRoom] : [];
   }
-  if (!pool.length) return null;
+  if (!pool.length && !opts.room) return null;
 
   let room = opts.room;
   if (!room) {

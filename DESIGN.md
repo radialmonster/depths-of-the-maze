@@ -107,6 +107,7 @@ projectile's current position (with 0.25-tile substeps an arrow enters a tile 2 
 ## 7. Map (map.js)
 ```js
 export function generateDungeon(depth, rng, opts?) -> map  // opts.prevArchetype: previous depth's map.archetype (§17.13)
+                                                           // opts.merchant: merchant depth -> reserve a merchant room (§17.4)
 export function computeFOV(map, x, y, radius)   // updates map.visible (clears first) and ORs into map.explored
 map = {
   width, height,               // grows with depth, cropped to the used area (§17.13/§17.14 grow this further than
@@ -121,7 +122,10 @@ map = {
              kind:'normal'|'start'|'exit'|'treasure'|'boss'|'merchant',
              treasureTier?:'cache'|'hoard'|'vault' /*treasure rooms only, §17.14*/,
              arena?:bossTypeId /*boss room only — which BOSS_ARENAS entry it used, §17.15*/,
-             hidden?, secretDoor?:{x,y} /*hidden treasure room only, §17.11/§17.14*/ }],
+             hidden?, secretDoor?:{x,y} /*hidden treasure room only, §17.11/§17.14*/,
+             chests?:[{x,y}] /*treasure rooms: chest spots (main.js makes them chest NPCs)*/,
+             antechamber?:true /*a Vault's guard room: kind 'treasure', treasureTier 'vault', no chests*/,
+             antechamberId? /*on a Vault that sits behind an antechamber: that room's id*/ }],
              // shape is the room-shape function's own id (rect/pillars/Lshape/overlap/cave/cross/octagon/gallery/
              // ringHall/splitHall/cavern, §17.13) — carried through so a future visual/texture pass has a real hook,
              // same idea as archetype/treasureTier/arena; none of these fields currently change rendering
@@ -131,7 +135,12 @@ map = {
   secrets: [{x, y, roomId, revealed}],   // hidden treasure-room doorways: WALL tiles until revealed (§17.11/§17.14)
   secretAt(x,y), revealSecret(x,y) -> secret|null,  // reveal = WALL -> DOOR (main.js calls it, then renderer.revealTile)
   idx(x,y), inBounds(x,y), get(x,y), isWalkable(x,y), isOpaque(x,y),
-  spawnCandidates(rng, count, minDistFromEntrance) -> [{x,y,roomId}] // floor tiles for enemies/loot
+  spawnCandidates(rng, count, minDistFromEntrance) -> [{x,y,roomId}] // floor tiles for enemies/loot — never in the
+                               // start room, a treasure wing or the merchant room
+  roomTiles(roomId) -> [{x,y}], roomAt(x,y) -> room|null,  // a room's own FLOOR tiles / which room a floor tile is in
+  merchantRoomId,              // opts.merchant: the merchant's room (kind 'merchant'; the start room if no normal room)
+  baseRoomCount,               // rooms[0..baseRoomCount) are growth rooms; the rest are treasure wings
+  treasureRolled: {tiers, antechamber},  // what the §17.14 roll asked for (placement-failure measurement, §17.17)
   hasLineOfSight(x0,y0,x1,y1)
 }
 ```
@@ -168,6 +177,12 @@ didn't exist until after the old crop step):
 6. apply the hidden-room modifier (§17.11/§17.14) to one eligible Cache/Hoard
 7. crop to the used bounding box, shifting entrance/exits/secrets to match — this step moved to *last*; it used to
    run right after placement
+
+Implementation notes (Phase 2): step 4 also picks the merchant room (opts.merchant) before any wing attaches. Just
+before step 5 the canvas is padded by up to 8 tiles a side (never past 90) so wings on edge rooms have room to
+grow; the final crop trims what stays unused. After the crop, chest spots are chosen and the spawn caches built.
+"Detour" = `dE(room) + dX(room) − dE(exit)` for the exit that minimizes it (0 = on a shortest entrance→exit route);
+the entrance field is recomputed once the exit cubbies exist.
 
 ## 8. Player (character.js)
 ```js
@@ -550,6 +565,14 @@ Decisions made with the user while building. Keep this section current — when 
 
 ### 17.4 Merchant & economy (shop.js)
 - A merchant stands on **every** depth, in a room kept clear of enemies (fallback: start room). No log line announces it.
+  **Merchant room (Phase 2 addition):** map.js reserves the room itself (`generateDungeon` opts.merchant, main.js passes
+  `isMerchantDepth`): `room.kind = 'merchant'`, picked the same way shop.js always did (a random 'normal' room from the
+  half farthest from the entrance, straight-line), *before* treasure wings attach so a wing never hangs off it. The whole
+  room gets no spawn candidates, is excluded from `populatedFloor`, and enemies.js's general placement (bat-swarm spill,
+  boss/exit guards) refuses its tiles too. No normal room -> the start room hosts it (already spawn-free).
+  `placeMerchant` uses `map.merchantRoomId`; its old pick only runs for maps generated without the flag.
+  `MERCHANT_ENEMY_CLEARANCE` (3 tiles) stays as a harmless safety margin just outside the walls; treasure guards are
+  exempt from it (they're in their own walled wing).
 - Stock is fresh each depth and never carries over: health + mana potions (unlimited), 4 magic-or-better items and one
   **Featured** premium item (rare; epic chance rises with depth), all at exact item level depth + 1.
 - Enemies don't respawn, so gold can't be ground on a level. Intended tension: if you can't afford the Featured item,
@@ -813,6 +836,10 @@ No random enemy drops. Three sources, all via the `skillbook` item type (§11):
   intended **35%**; leaving it at 45% after wings guarantee dead ends would have silently pushed book pacing ~29%
   faster than designed (caught during the §17.14 design pass, not by a live bug). Hidden rooms get no spawn
   candidates, and main.js removes any enemy standing in one before applying the modifier.
+- **Built (Phase 2):** `HIDDEN_ROOM_CHANCE = 0.35`, `TREASURE_ROOM_CHANCE` removed. The modifier rolls once per depth
+  from depth 2 and picks one Cache/Hoard wing that is a verified dead end; measured 34.1% of depths over 6000 floors
+  (the ~3% shortfall is depths whose only wing is a Vault). A hidden room gets no guards; its first chest adds the
+  book via items.js `rollChestContents(..., {hidden:true})` (skills.js registers a `randomGeneric` book hook).
 - Reveal: checked in `onPlayerMoved` after FOV — Chebyshev distance ≤ 1 from the player's tile and `map.visible`.
   `renderer.revealTile` works because buildMap gives each unrevealed secret a hidden floor slab up front (an
   InstancedMesh can't grow); reveal drops the wall instance, shows the slab, adds the door frame, gold ring + motes.
@@ -976,6 +1003,30 @@ from Vaults (full audit in §17.11's implementation notes).
 **Implementation split, from `main.js` into pure functions** (needed for §17.17's simulation harness, and generally
 better factoring): chest-content rolling (`seedTreasure`/`openChest` today) moves to something like
 `rollChestContents(tier, depth, rng)` in items.js; tier guard spawning joins `spawnEnemies`.
+
+**Implementation notes (Phase 2 — built):**
+- map.js: `treasureRoomSlots`, `treasureTierWeights`, `rollTreasureTiers` (sorted Vault → Hoards → Caches),
+  `rollChestCount`; items.js: `CHEST_LOOT`, `treasureItemLevel`, `rollChestContents(tier, depth, rng, {first, hidden})`;
+  enemies.js: `treasureGuardPlan`, `enemyPoolForDepth`; guards spawn inside `spawnEnemies`. `seedTreasure` and the
+  floor-scattered loot are gone; all treasure is in chests, rolled when opened.
+- **Interpretations** (the table doesn't pin these): depth 1's single slot fills at 50% (the spec only guarantees the
+  first slot "from depth 2"; 50% is also the old flat treasure-room odds). Gold and the potion roll are per *room*, so
+  they go in the room's first chest; items/chest applies to every chest. Vault guards other than the warden use the
+  default elite rate. The warden is named "Vault Warden (<type>)" and waits nearest a chest; guards never stand on
+  a chest's four sides unless nothing else is free (in play, guards could otherwise box a chest in). Potions are 65%
+  health, like mob drops.
+- **Routes:** each tier tries its pool, then looser ones if nothing there takes a leaf: Vault = top third by detour ∩
+  far half by entrance distance → top third → off-path half → any; Hoard = off-path half → any; Cache = any.
+  Parents are 'normal'/'exit' base rooms (never start/boss/merchant/another wing); unused parents and parents under
+  their link cap are tried first. Measured over 6000 floors: Vaults 83% strict / 93% top third; Hoards 98% off-path half.
+- **Antechamber:** attempted up to 4 times (each rolled back via a full carve snapshot if its Vault then fails), else a
+  plain Vault. Placement: Cache 100%, Hoard 99.5%, Vault 98.3% of rolls; antechamber 89.5% of rolls (3000 floors).
+- **Realized Vault share** is below the nominal weight because of the one-Vault cap (e.g. depth 20: 15.8% of treasure
+  rooms vs the 20% weight) — the cap was written into the spec, so this is expected, not tuned away.
+- **Guards are on top of today's `computeSpawnCount`** for now; §17.16 (Phase 4) replaces that count with
+  `density × populatedFloor`, which already excludes the wings.
+- Generation: p50 ~2.1 ms, p99 ~9.5 ms (was ~1.7 / ~8 before wings). Maps can now reach 90 tiles (was 86) when a wing
+  sits on the edge.
 
 ### 17.15 Boss arenas
 **Confirmed real, not a one-off complaint:** measured over 1000+ generated layouts, depth 5 (Slime King's first

@@ -1,5 +1,6 @@
 // Dungeon generation + FOV. Owned by the Map agent. Public API is fixed by DESIGN.md §7:
 //   generateDungeon(depth, rng, opts?) -> map     opts.prevArchetype: the previous depth's map.archetype
+//                                                  opts.merchant: reserve a spawn-free merchant room (merchant depth)
 //   computeFOV(map, x, y, radius)
 //
 // Generation algorithm ("large rooms linked together", deterministic given rng):
@@ -27,13 +28,15 @@
 //  4. Loops + exit counts: a few extra links between nearby rooms create loops, then rooms
 //     are topped up toward 2-4 links (large/grand) / 1-3 links (medium) with nearby rooms
 //     (caps: 4 large/grand / 3 medium / 2 small). No corridor ever dead-ends.
-//  5. A BFS safety net force-carves a corridor to any stray component (a no-op in practice),
-//     then the map is cropped to the used area plus a 1-tile WALL border.
-//  6. Start room (entrance) is chosen, BFS distances computed, then 1-3 exit rooms are chosen
-//     from the farthest third of rooms. Each stair tile is a one-tile cubby cut into the
-//     room's wall (findNiche), preferring the camera-facing north wall; every 5th depth tags the largest far room 'boss';
-//     a dead-end room (one doorway) may be tagged 'treasure', and from depth 2 hidden behind a
-//     secret doorway (map.secrets / revealSecret, §17.11).
+//  5. A BFS safety net force-carves a corridor to any stray component (a no-op in practice).
+//  6. Start room (entrance), 1-3 exit rooms from the farthest third, every 5th depth the boss room, and (opts.merchant)
+//     a spawn-free 'merchant' room — then a detour ranking of every room (how far off the entrance->exit route it
+//     is), all on the uncropped grid. Each stair tile is a one-tile cubby cut into the room's wall (findNiche),
+//     preferring the camera-facing north wall.
+//  7. Treasure wings (§17.14): rolled tiers (Cache/Hoard/Vault) attached as brand-new single-door LEAF rooms off
+//     suitable parents (Vault first), on a canvas padded for them; a Vault may sit behind an antechamber.
+//  8. Hidden-room modifier (§17.11): one Cache/Hoard's doorway becomes a secret wall (map.secrets / revealSecret).
+//  9. Crop to the used area plus a 1-tile WALL border — last. Then chest spots and spawn caches.
 
 import { TILE } from './core.js';
 
@@ -42,13 +45,66 @@ const LINK_CAP = { small: 2, medium: 3, large: 4, grand: 4 }; // max rooms linke
 const isBig = (r) => r.size === 'large' || r.size === 'grand';
 const DIR8 = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
 
-// Treasure rooms (§17.11): a dead-end room, 50% of depths; from depth 2 on, some depths get a HIDDEN treasure room
-// instead (secret doorway + chest). The hidden roll comes first. ~1 in 4 layouts has no eligible dead-end room at
-// all, so the roll is 45% to land the design target of a hidden room on ~35% of depths (measured: ~34% over 1000
-// layouts at depths 2-26).
-export const TREASURE_ROOM_CHANCE = 0.5;
-export const HIDDEN_ROOM_CHANCE = 0.45;
+// Hidden treasure rooms (§17.11/§17.14): a concealment MODIFIER on one Cache/Hoard wing per depth (never a Vault). Every
+// treasure wing is a purpose-built single-door leaf, so an eligible room exists whenever one was placed — the old 45%
+// workaround for dead-end scarcity is gone and the roll is the designed 35%.
+export const HIDDEN_ROOM_CHANCE = 0.35;
 export const HIDDEN_ROOM_MIN_DEPTH = 2;
+
+// ---------- Treasure tiers (§17.14) ----------
+// Layout side of the tier table (loot lives in items.js rollChestContents, guards in enemies.js treasureGuardPlan).
+export const TREASURE_TIER_IDS = Object.freeze(['cache', 'hoard', 'vault']);
+export const TREASURE_ROOM_SIZE = Object.freeze({ cache: 'small', hoard: 'medium', vault: 'large' });
+export const VAULT_MIN_DEPTH = 3;
+export const MAX_TREASURE_ROOMS = 5;
+export const TREASURE_EXTRA_SLOT_CHANCE = 0.5; // each slot beyond the first (and depth 1's only slot, see below)
+export const ANTECHAMBER_MIN_DEPTH = 6;
+export const ANTECHAMBER_CHANCE = 0.5;
+// Margin added around the growth canvas before wings attach (cropped away again if unused). The pre-crop canvas
+// never exceeds WING_CANVAS_MAX, so the final map can't either (§7: never > 90).
+const WING_CANVAS_PAD = 8;
+const WING_CANVAS_MAX = 90;
+
+// Max treasure rooms that can roll on a depth: min(5, round(5·(1-e^(-depth/4)))) -> 1/2/3 at depths 1-3, 5 by 10.
+export function treasureRoomSlots(depth) {
+  return Math.min(MAX_TREASURE_ROOMS, Math.round(MAX_TREASURE_ROOMS * (1 - Math.exp(-depth / 4))));
+}
+
+// Tier weights at a depth: t = clamp((depth-1)/19, 0, 1); Cache 60->40, Hoard 30->40, Vault 10->20 (0 below
+// VAULT_MIN_DEPTH). Relative weights — a Vault already rolled this depth is removed and the rest renormalize.
+export function treasureTierWeights(depth) {
+  const t = Math.min(1, Math.max(0, (depth - 1) / 19));
+  return {
+    cache: 0.6 - 0.2 * t,
+    hoard: 0.3 + 0.1 * t,
+    vault: depth >= VAULT_MIN_DEPTH ? 0.1 + 0.1 * t : 0,
+  };
+}
+
+// The tiers this depth tries to place, ordered Vault first, then Hoards, then Caches (the pickier/rarer wings get
+// first choice of parent rooms). From depth 2 the first slot always fills; every other slot fills at 50% — including
+// depth 1's single slot (the spec pins "from depth 2", so depth 1 keeps the old flat 50% treasure-room odds).
+// At most one Vault per depth.
+export function rollTreasureTiers(depth, rng) {
+  const slots = treasureRoomSlots(depth);
+  const out = [];
+  for (let s = 0; s < slots; s++) {
+    const guaranteed = s === 0 && depth >= 2;
+    if (!guaranteed && !rng.chance(TREASURE_EXTRA_SLOT_CHANCE)) continue;
+    const w = treasureTierWeights(depth);
+    if (out.includes('vault')) w.vault = 0;
+    out.push(rng.weighted(TREASURE_TIER_IDS, (id) => w[id]));
+  }
+  const order = { vault: 0, hoard: 1, cache: 2 };
+  return out.sort((a, b) => order[a] - order[b]);
+}
+
+// Chests per tier room: Cache 1, Hoard 1-2, Vault 2-3.
+export function rollChestCount(tier, rng) {
+  if (tier === 'vault') return rng.int(2, 3);
+  if (tier === 'hoard') return rng.int(1, 2);
+  return 1;
+}
 
 function computeMapSize(depth) {
   let s = 54 + Math.round((depth - 1) * 2.5);
@@ -361,6 +417,7 @@ export function makeShape(rng, cat, opts = {}) {
 }
 
 // opts.prevArchetype: the previous depth's map.archetype, so this depth never repeats it (§17.13).
+// opts.merchant: this is a merchant depth — reserve the merchant's room (map.merchantRoomId).
 export function generateDungeon(depth, rng, opts = {}) {
   const archetype = pickArchetype(rng, opts.prevArchetype);
   const profile = ARCHETYPES[archetype];
@@ -745,31 +802,6 @@ export function generateDungeon(depth, rng, opts = {}) {
     }
   }
 
-  // ---------- Crop to the used area (keeps a 1-tile WALL border) ----------
-  {
-    let x0 = width, y0 = height, x1 = 0, y1 = 0;
-    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
-      if (tiles[idx(x, y)] === TILE.WALL) continue;
-      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
-    }
-    const ox = x0 - 1, oy = y0 - 1;
-    const nw = x1 - x0 + 3, nh = y1 - y0 + 3;
-    if (ox > 0 || oy > 0 || nw < width || nh < height) {
-      const nt = new Uint8Array(nw * nh).fill(TILE.WALL);
-      const nr = new Int32Array(nw * nh).fill(-1);
-      const nres = new Uint8Array(nw * nh);
-      for (let y = 1; y < nh - 1; y++) for (let x = 1; x < nw - 1; x++) {
-        const oi = (y + oy) * width + (x + ox);
-        nt[y * nw + x] = tiles[oi]; nr[y * nw + x] = roomIdGrid[oi]; nres[y * nw + x] = reserved[oi];
-      }
-      tiles = nt; roomIdGrid = nr; reserved = nres; width = nw; height = nh;
-      for (const r of rooms) {
-        r.x -= ox; r.y -= oy; r.cx -= ox; r.cy -= oy;
-        for (const d of r.doors) { d.x -= ox; d.y -= oy; }
-      }
-    }
-  }
-
   // ---------- Stair cubbies ----------
   // Stairs sit in a one-tile cubby cut into a room's wall, so they read as a doorway
   // instead of a marker in the middle of the floor. Weights prefer the north wall (it
@@ -825,8 +857,8 @@ export function generateDungeon(depth, rng, opts = {}) {
   }
 
   // Every non-WALL tile touching (8-neighbourhood) a room's floor from outside it. A dead end has exactly one: its
-  // single doorway. Uses the post-crop roomIdGrid (room._cells indices are pre-crop), so it also catches any opening
-  // the BFS safety net carved without registering a door.
+  // single doorway. Reads the live roomIdGrid, so it also catches any opening the BFS safety net carved without
+  // registering a door.
   function roomOpenings(room) {
     const out = new Set();
     for (let y = room.y; y < room.y + room.h; y++) {
@@ -848,31 +880,35 @@ export function generateDungeon(depth, rng, opts = {}) {
     return open.size === 1 && open.has(idx(d.x, d.y)) && tiles[idx(d.x, d.y)] === TILE.DOOR;
   }
 
-  // ---------- 6. Start room / entrance ----------
+  // 4-connected BFS distance field over every non-WALL tile, from one tile.
+  function bfsFrom(sx, sy) {
+    const d = new Int32Array(width * height).fill(-1);
+    const s = idx(sx, sy);
+    d[s] = 0;
+    const queue = [s];
+    for (let qi = 0; qi < queue.length; qi++) {
+      const ci = queue[qi], cx = ci % width, cy = (ci / width) | 0;
+      for (const [dx, dy] of DIR4) {
+        const nx = cx + dx, ny = cy + dy;
+        if (!inBounds(nx, ny)) continue;
+        const ni = idx(nx, ny);
+        if (tiles[ni] !== TILE.WALL && d[ni] === -1) { d[ni] = d[ci] + 1; queue.push(ni); }
+      }
+    }
+    return d;
+  }
+
+  // ---------- 4. Start room / entrance, exits, boss — then detour ranking (all on the UNCROPPED grid) ----------
+  const baseRoomCount = rooms.length; // rooms placed by growth; everything after this is a treasure wing
   const startCandidates = rooms.filter(r => !isBig(r));
   const startRoom = rng.pick(startCandidates.length ? startCandidates : rooms);
   startRoom.kind = 'start';
   const entrance = findNiche(startRoom);
   tiles[idx(entrance.x, entrance.y)] = TILE.ENTRANCE;
 
-  // ---------- 7. BFS distances from entrance ----------
-  const bfsDist = new Int32Array(width * height).fill(-1);
-  {
-    const startIdx = idx(entrance.x, entrance.y);
-    bfsDist[startIdx] = 0;
-    const queue = [startIdx]; let qi = 0;
-    while (qi < queue.length) {
-      const ci = queue[qi++]; const cx = ci % width, cy = (ci / width) | 0;
-      for (const [dx, dy] of DIR4) {
-        const nx = cx + dx, ny = cy + dy;
-        if (!inBounds(nx, ny)) continue;
-        const ni = idx(nx, ny);
-        if (tiles[ni] !== TILE.WALL && bfsDist[ni] === -1) { bfsDist[ni] = bfsDist[ci] + 1; queue.push(ni); }
-      }
-    }
-  }
+  const bfsDist = bfsFrom(entrance.x, entrance.y);
 
-  // ---------- 8. Exits ----------
+  // Exits: 1-3 rooms from the farthest third by walking distance.
   const otherRooms = rooms.filter(r => r !== startRoom);
   for (const r of otherRooms) r._dist = bfsDist[idx(r.cx, r.cy)] < 0 ? 0 : bfsDist[idx(r.cx, r.cy)];
   otherRooms.sort((a, b) => b._dist - a._dist);
@@ -898,7 +934,7 @@ export function generateDungeon(depth, rng, opts = {}) {
     exits.push(ex);
   }
 
-  // ---------- 9. Boss / treasure tags ----------
+  // Boss room (unchanged until §17.15's arena): every 5th depth, the largest far-third room still 'normal'.
   if (depth % 5 === 0) {
     let pool = topThird.filter(r => r.kind === 'normal');
     if (!pool.length) pool = otherRooms.filter(r => r.kind === 'normal');
@@ -908,52 +944,271 @@ export function generateDungeon(depth, rng, opts = {}) {
       best.kind = 'boss';
     }
   }
-  // Treasure room (§17.11): always a dead end — a still-'normal' room (so never start/exit/boss; the merchant only
-  // ever picks 'normal' rooms, so never the merchant's either) whose ONLY opening is a single doorway — so hiding
-  // that doorway can never cut off any other floor. From HIDDEN_ROOM_MIN_DEPTH, HIDDEN_ROOM_CHANCE of depths hide it:
-  // its doorway becomes a WALL tile listed in map.secrets until the player finds it (main.js -> revealSecret).
-  const secrets = [];
-  {
-    const deadEnds = rooms.filter(r => r.kind === 'normal' && isDeadEndRoom(r));
-    const hide = depth >= HIDDEN_ROOM_MIN_DEPTH && rng.chance(HIDDEN_ROOM_CHANCE);
-    if (deadEnds.length && (hide || rng.chance(TREASURE_ROOM_CHANCE))) {
-      const small = deadEnds.filter(r => r.size === 'small');
-      const room = rng.pick(small.length ? small : deadEnds);
-      room.kind = 'treasure';
-      if (hide) {
-        const d = room.doors[0];
-        tiles[idx(d.x, d.y)] = TILE.WALL;
-        room.hidden = true;
-        room.secretDoor = { x: d.x, y: d.y };
-        secrets.push({ x: d.x, y: d.y, roomId: room.id, revealed: false });
-      }
+  for (const r of otherRooms) delete r._dist;
+
+  // Merchant room (opts.merchant — main.js passes isMerchantDepth): a dedicated room kind with no enemies inside
+  // (excluded from spawn candidates and populatedFloor below), chosen BEFORE the treasure wings so a wing never
+  // attaches to it. Same pick as shop.js always used: a random 'normal' room from the half farthest (straight-line)
+  // from the entrance; with no normal room at all, the start room hosts it (it's already spawn-free).
+  let merchantRoom = null;
+  if (opts.merchant) {
+    const pool = rooms.filter(r => r.kind === 'normal');
+    if (pool.length) {
+      const ranked = pool.slice().sort((a, b) => Math.hypot(b.cx - entrance.x, b.cy - entrance.y) - Math.hypot(a.cx - entrance.x, a.cy - entrance.y));
+      merchantRoom = rng.pick(ranked.slice(0, Math.max(1, Math.ceil(ranked.length / 2))));
+      merchantRoom.kind = 'merchant';
+    } else {
+      merchantRoom = startRoom;
     }
   }
 
-  for (const r of otherRooms) delete r._dist;
+  // Detour ranking (§17.14): how far off the entrance->exit route a room is. detour = dE(room) + dX(room) - dE(exit)
+  // for the exit that minimizes it — 0 for a room ON a shortest route to some exit, growing with the side trip needed
+  // to visit it. Treasure wings are leaves (one door each), so attaching them can't change any of these numbers.
+  // (Re-run from the entrance now that the exit cubbies exist: the first field was taken while they were still rock.)
+  const entField = bfsFrom(entrance.x, entrance.y);
+  const exitFields = exits.map(ex => ({ d: bfsFrom(ex.x, ex.y), base: entField[idx(ex.x, ex.y)] }));
+  const entranceDist = new Map(), detour = new Map();
+  for (const r of rooms) {
+    const ci = idx(r.cx, r.cy);
+    const dE = Math.max(0, entField[ci]);
+    let best = Infinity;
+    for (const f of exitFields) if (f.d[ci] >= 0 && f.base >= 0) best = Math.min(best, dE + f.d[ci] - f.base);
+    entranceDist.set(r.id, dE);
+    detour.set(r.id, best === Infinity ? 0 : best);
+  }
 
-  // ---------- 10. Spawn candidate caches ----------
-  // Hidden treasure rooms get no enemy/loot spawn candidates: nothing should be sealed in there (§17.11).
-  const hiddenRoomIds = new Set(secrets.map(sc => sc.roomId));
+  // Re-seats the whole map in a new nw x nh grid whose (0,0) is the old (ox,oy) — a crop (ox,oy >= 0) or a pad
+  // (negative) — shifting rooms (box, centre, doors, secret door, cell/core indices), stairs and secrets to match.
+  function reframe(ox, oy, nw, nh) {
+    const nt = new Uint8Array(nw * nh).fill(TILE.WALL);
+    const nr = new Int32Array(nw * nh).fill(-1);
+    const nres = new Uint8Array(nw * nh);
+    for (let y = 0; y < nh; y++) for (let x = 0; x < nw; x++) {
+      const sx = x + ox, sy = y + oy;
+      if (sx < 0 || sy < 0 || sx >= width || sy >= height) continue;
+      const oi = sy * width + sx;
+      nt[y * nw + x] = tiles[oi]; nr[y * nw + x] = roomIdGrid[oi]; nres[y * nw + x] = reserved[oi];
+    }
+    const remap = (i) => ((((i / width) | 0) - oy) * nw + ((i % width) - ox));
+    for (const r of rooms) {
+      r.x -= ox; r.y -= oy; r.cx -= ox; r.cy -= oy;
+      for (const d of r.doors) { d.x -= ox; d.y -= oy; }
+      if (r.secretDoor) { r.secretDoor.x -= ox; r.secretDoor.y -= oy; }
+      r._cells = r._cells.map(remap);
+      r._core = r._core.map(remap);
+    }
+    const shift = (p) => { p.x -= ox; p.y -= oy; if (p.front) { p.front.x -= ox; p.front.y -= oy; } };
+    shift(entrance);
+    for (const ex of exits) shift(ex);
+    for (const sc of secrets) shift(sc);
+    tiles = nt; roomIdGrid = nr; reserved = nres; width = nw; height = nh;
+  }
+  const secrets = []; // filled by step 6; declared here so reframe() can shift them
+
+  // ---------- 5. Treasure wings (§17.14): purpose-built single-door leaves, Vault first, then Hoards, then Caches ----------
+  // Parents: any base room except the start, boss and merchant rooms (exit rooms are fine: a leaf can't block a stair).
+  const parentPool = rooms.filter(r => r.kind === 'normal' || r.kind === 'exit');
+  const byDetour = parentPool.slice().sort((a, b) => detour.get(b.id) - detour.get(a.id));
+  const offHalf = byDetour.slice(0, Math.ceil(byDetour.length / 2));
+  const offThird = byDetour.slice(0, Math.ceil(byDetour.length / 3));
+  const dEs = parentPool.map(r => entranceDist.get(r.id)).sort((a, b) => a - b);
+  const medianDE = dEs.length ? dEs[(dEs.length - 1) >> 1] : 0;
+  const vaultStrict = offThird.filter(r => entranceDist.get(r.id) >= medianDE);
+  // Route rule per tier, then progressively looser pools if nothing in the strict one can take a leaf.
+  const ROUTE_POOLS = {
+    vault: [vaultStrict, offThird, offHalf, parentPool],
+    hoard: [offHalf, parentPool],
+    cache: [parentPool],
+  };
+  const usedParents = new Set();
+  const PER_PARENT_TRIES = 6;
+  const MAX_WING_TRIES = 90;
+
+  // Snapshot / restore of the whole carve state (an antechamber whose Vault then can't be placed is rolled back).
+  function snapshot() {
+    return {
+      tiles: tiles.slice(), rid: roomIdGrid.slice(), res: reserved.slice(), n: rooms.length,
+      doors: rooms.map(r => r.doors.length), links: [...links], lc: [...linkCount],
+    };
+  }
+  function restore(s) {
+    tiles = s.tiles; roomIdGrid = s.rid; reserved = s.res;
+    rooms.length = s.n;
+    rooms.forEach((r, i) => { r.doors.length = s.doors[i]; });
+    links.clear(); for (const k of s.links) links.add(k);
+    linkCount.clear(); for (const [k, v] of s.lc) linkCount.set(k, v);
+  }
+
+  // Parents in the order to try them: unused before already-used, under their link cap before over it; shuffled.
+  function orderParents(pool) {
+    const shuffled = rng.shuffle(pool.slice());
+    const rank = (r) => (usedParents.has(r.id) ? 2 : 0) + (linkCount.get(r.id) < LINK_CAP[r.size] ? 0 : 1);
+    return shuffled.sort((a, b) => rank(a) - rank(b));
+  }
+  // Attach a `cat` leaf to some room of the tier's pools; returns { room, parent } or null.
+  function attachLeaf(tier, cat, budget = MAX_WING_TRIES) {
+    let tries = 0;
+    const seen = new Set();
+    for (const pool of ROUTE_POOLS[tier]) {
+      for (const parent of orderParents(pool)) {
+        if (seen.has(parent.id)) continue;
+        seen.add(parent.id);
+        for (let t = 0; t < PER_PARENT_TRIES; t++) {
+          if (++tries > budget) return null;
+          const room = tryAttach(parent, cat, pickGap());
+          if (room) return { room, parent };
+        }
+      }
+    }
+    return null;
+  }
+  const tagWing = (room, tier, parent) => {
+    room.kind = 'treasure';
+    room.treasureTier = tier;
+    usedParents.add(parent.id);
+  };
+
+  const treasureTiers = rollTreasureTiers(depth, rng);
+  // Wings attach at the edge of the layout, and the growth canvas is nearly full (esp. early depths), so give them
+  // a margin to grow into; the final crop (step 7) trims whatever stays unused. Never past WING_CANVAS_MAX.
+  if (treasureTiers.length) {
+    const pad = Math.max(0, Math.min(WING_CANVAS_PAD, (WING_CANVAS_MAX - Math.max(width, height)) >> 1));
+    if (pad > 0) reframe(-pad, -pad, width + 2 * pad, height + 2 * pad);
+  }
+  let antechamberRolled = false;
+  for (const tier of treasureTiers) {
+    if (tier === 'vault' && depth >= ANTECHAMBER_MIN_DEPTH && rng.chance(ANTECHAMBER_CHANCE)) {
+      antechamberRolled = true;
+      // Vault antechamber: a medium guard room as a leaf of the parent, the Vault a leaf of the antechamber (two doors,
+      // still off every start-to-exit path). A failed Vault rolls the antechamber back; then a plain Vault is tried.
+      let placed = false;
+      for (let a = 0; a < 4 && !placed; a++) {
+        const snap = snapshot();
+        const ante = attachLeaf('vault', 'medium', 40);
+        if (!ante) break;
+        let vault = null;
+        for (let t = 0; t < 24 && !vault; t++) vault = tryAttach(ante.room, 'large', pickGap());
+        if (!vault) { restore(snap); continue; }
+        tagWing(ante.room, 'vault', ante.parent);
+        ante.room.antechamber = true;
+        tagWing(vault, 'vault', ante.room);
+        vault.antechamberId = ante.room.id;
+        placed = true;
+      }
+      if (placed) continue;
+    }
+    const got = attachLeaf(tier, TREASURE_ROOM_SIZE[tier]);
+    if (got) tagWing(got.room, tier, got.parent);
+  }
+
+  // ---------- 6. Hidden-room modifier (§17.11): one Cache or Hoard's doorway becomes a secret wall ----------
+  // Only a genuine dead end (one opening, its door) is sealed, so hiding it can never cut off any other floor.
+  if (depth >= HIDDEN_ROOM_MIN_DEPTH && rng.chance(HIDDEN_ROOM_CHANCE)) {
+    const eligible = rooms.filter(r => r.kind === 'treasure' && (r.treasureTier === 'cache' || r.treasureTier === 'hoard')
+      && isDeadEndRoom(r));
+    if (eligible.length) {
+      const room = rng.pick(eligible);
+      const d = room.doors[0];
+      tiles[idx(d.x, d.y)] = TILE.WALL;
+      room.hidden = true;
+      room.secretDoor = { x: d.x, y: d.y };
+      secrets.push({ x: d.x, y: d.y, roomId: room.id, revealed: false });
+    }
+  }
+
+  // ---------- 7. Crop to the used area (keeps a 1-tile WALL border) — last, so every step above saw real distances ----------
+  {
+    let x0 = width, y0 = height, x1 = 0, y1 = 0;
+    for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) {
+      if (tiles[idx(x, y)] === TILE.WALL) continue;
+      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+    }
+    // a secret doorway is a WALL tile until revealed, but still has to be inside the map
+    for (const sc of secrets) { x0 = Math.min(x0, sc.x); y0 = Math.min(y0, sc.y); x1 = Math.max(x1, sc.x); y1 = Math.max(y1, sc.y); }
+    const ox = x0 - 1, oy = y0 - 1;
+    const nw = x1 - x0 + 3, nh = y1 - y0 + 3;
+    if (ox !== 0 || oy !== 0 || nw !== width || nh !== height) reframe(ox, oy, nw, nh);
+  }
+
+  // ---------- 8. Chest spots in each treasure room (not the antechamber) ----------
+  // Toward the back of the room (far from its doorway), >= 2 tiles apart, never next to the doorway, each with open
+  // floor on >= 3 sides (loot lands there), and never splitting the room: all its other floor stays reachable from
+  // the doorway with every chest in place (a chest is a solid NPC).
+  for (const room of rooms) {
+    if (room.kind !== 'treasure' || room.antechamber) continue;
+    const want = rollChestCount(room.treasureTier, rng);
+    const door = room.doors[0];
+    const cellSet = new Set(room._cells);
+    const blocked = new Set();
+    const isOpen = (i) => cellSet.has(i) && !blocked.has(i);
+    const openAround = (i) => DIR4.filter(([dx, dy]) => isOpen(i + dx + dy * width)).length;
+    // the room tile just inside the doorway
+    let entry = -1;
+    for (const [dx, dy] of DIR4) { const i = idx(door.x + dx, door.y + dy); if (cellSet.has(i)) { entry = i; break; } }
+    const connectedWithout = () => {
+      if (entry < 0 || blocked.has(entry)) return false;
+      const seen = new Set([entry]), q = [entry];
+      for (let qi = 0; qi < q.length; qi++) {
+        for (const [dx, dy] of DIR4) {
+          const ni = q[qi] + dx + dy * width;
+          if (isOpen(ni) && !seen.has(ni)) { seen.add(ni); q.push(ni); }
+        }
+      }
+      return seen.size === room._cells.length - blocked.size;
+    };
+    const ranked = room._cells.map(i => ({ i, d: Math.hypot(i % width - door.x, ((i / width) | 0) - door.y) + rng.next() * 0.5 }))
+      .sort((a, b) => b.d - a.d);
+    room.chests = [];
+    for (const { i } of ranked) {
+      if (room.chests.length >= want) break;
+      const x = i % width, y = (i / width) | 0;
+      if (Math.max(Math.abs(x - door.x), Math.abs(y - door.y)) <= 1) continue;
+      if (room.chests.some(c => Math.max(Math.abs(c.x - x), Math.abs(c.y - y)) < 2)) continue;
+      if (openAround(i) < 3) continue;
+      blocked.add(i);
+      if (!connectedWithout() || [...blocked].some(b => openAround(b) < 1)) { blocked.delete(i); continue; }
+      room.chests.push({ x, y });
+    }
+  }
+
+  // ---------- 9. Spawn candidate caches ----------
+  // Treasure wings (every tier, incl. antechambers) get no general spawn candidates: their guards are placed by
+  // enemies.js from the tier table (§17.14), and a hidden room holds nothing at all (§17.11).
+  const treasureRoomIds = new Set(rooms.filter(r => r.kind === 'treasure').map(r => r.id));
+  const merchantRoomId = merchantRoom ? merchantRoom.id : -2;
   const roomFloors = [];
   const corridorFloors = [];
+  let populatedFloor = 0;
   for (let y = 1; y < height - 1; y++) {
     for (let x = 1; x < width - 1; x++) {
       const i = idx(x, y);
       if (tiles[i] !== TILE.FLOOR) continue;
       const rid = roomIdGrid[i];
+      if (treasureRoomIds.has(rid) || rid === merchantRoomId) continue;
+      populatedFloor++;
       if (rid === -1) corridorFloors.push({ x, y, roomId: null });
-      else if (rid !== startRoom.id && !hiddenRoomIds.has(rid)) roomFloors.push({ x, y, roomId: rid });
+      else if (rid !== startRoom.id) roomFloors.push({ x, y, roomId: rid });
     }
   }
 
-  // ---------- 11. Map object ----------
+  // ---------- 10. Map object ----------
   const visible = new Uint8Array(width * height);
   const explored = new Uint8Array(width * height);
+  const finalRoomIdGrid = roomIdGrid;
 
   const map = {
     width, height, tiles, visible, explored, rooms, entrance, exits,
     archetype, // this depth's generation profile (§17.13); a data hook only — nothing renders differently yet
+    // Floor tiles open to general spawning (§17.16): every FLOOR tile outside the treasure wings and the merchant's
+    // room. (Phase 3 will also exclude the boss arena.)
+    populatedFloor,
+    // The room shop.js puts the merchant in (opts.merchant), or null: kind 'merchant', or the start room as fallback.
+    merchantRoomId: merchantRoom ? merchantRoom.id : null,
+    baseRoomCount, // rooms from the growth pass; rooms[baseRoomCount..] are treasure wings
+    // What the treasure roll asked for (§17.14), so placement failures are measurable (§17.17 Layer 1):
+    // tiers rolled (Vault/Hoards/Caches order) and whether the Vault rolled an antechamber.
+    treasureRolled: { tiers: treasureTiers, antechamber: antechamberRolled },
     // Hidden treasure-room doorways (§17.11): WALL tiles until revealed. [{ x, y, roomId, revealed }]
     secrets,
     idx(x, y) { return y * width + x; },
@@ -961,6 +1216,20 @@ export function generateDungeon(depth, rng, opts = {}) {
     get(x, y) { return this.inBounds(x, y) ? tiles[this.idx(x, y)] : TILE.WALL; },
     isWalkable(x, y) { return this.inBounds(x, y) && tiles[this.idx(x, y)] !== TILE.WALL; },
     isOpaque(x, y) { return !this.inBounds(x, y) || tiles[this.idx(x, y)] === TILE.WALL; },
+    // Floor tiles of one room (its own floor, not its doorways): [{x, y}].
+    roomTiles(roomId) {
+      const out = [];
+      for (let i = 0; i < finalRoomIdGrid.length; i++) {
+        if (finalRoomIdGrid[i] === roomId && tiles[i] === TILE.FLOOR) out.push({ x: i % width, y: (i / width) | 0 });
+      }
+      return out;
+    },
+    // The room whose floor (x,y) is, or null.
+    roomAt(x, y) {
+      if (!this.inBounds(x, y)) return null;
+      const id = finalRoomIdGrid[this.idx(x, y)];
+      return id >= 0 ? rooms[id] : null;
+    },
     spawnCandidates(sRng, count, minDistFromEntrance) {
       const minD2 = minDistFromEntrance * minDistFromEntrance;
       const farRoom = roomFloors.filter(p => (p.x - entrance.x) ** 2 + (p.y - entrance.y) ** 2 >= minD2);

@@ -334,19 +334,21 @@ function reachable(map, sx, sy) {
   }
   return seen;
 }
-test('treasure rooms are dead ends; hidden ones seal exactly their one doorway and cut off nothing else', () => {
+test('treasure rooms are single-door leaves; a hidden one seals exactly its doorway and cuts off nothing else', () => {
   let hiddenCount = 0, treasureCount = 0;
   for (let i = 0; i < 160; i++) {
     const depth = 1 + (i % 22);
     const map = generateDungeon(depth, new RNG(777 + i));
-    const t = map.rooms.find((r) => r.kind === 'treasure');
-    assert.ok(map.rooms.filter((r) => r.kind === 'treasure').length <= 1);
-    if (!t) { assert.equal(map.secrets.length, 0); continue; }
-    treasureCount++;
-    assert.equal(t.doors.length, 1, 'exactly one doorway');
-    if (!t.hidden) { assert.equal(map.secrets.length, 0); continue; }
+    const wings = map.rooms.filter((r) => r.kind === 'treasure');
+    treasureCount += wings.length;
+    for (const r of wings) assert.equal(r.doors.length, r.antechamber ? 2 : 1, 'a wing is a single-door leaf (an antechamber: two)');
+    const hidden = wings.filter((r) => r.hidden);
+    assert.ok(hidden.length <= 1, 'at most one hidden room');
+    if (!hidden.length) { assert.equal(map.secrets.length, 0); continue; }
+    const t = hidden[0];
     hiddenCount++;
     assert.ok(depth >= HIDDEN_ROOM_MIN_DEPTH);
+    assert.ok(t.treasureTier === 'cache' || t.treasureTier === 'hoard', 'never a Vault');
     assert.equal(map.secrets.length, 1);
     const sc = map.secrets[0];
     assert.deepEqual([sc.x, sc.y], [t.doors[0].x, t.doors[0].y]);
@@ -372,16 +374,16 @@ test('treasure rooms are dead ends; hidden ones seal exactly their one doorway a
   assert.ok(hiddenCount >= 20, `saw ${hiddenCount} hidden rooms`);
   assert.ok(treasureCount > hiddenCount);
 });
-test('the treasure room is never the start / exit / boss room (no stairs in it; boss floors keep a boss room)', () => {
+test('treasure rooms are never the start / exit / boss room (no stairs in them; boss floors keep a boss room)', () => {
   for (let i = 0; i < 60; i++) {
     const depth = 5 + 5 * (i % 3);
     const map = generateDungeon(depth, new RNG(31 + i));
     assert.ok(map.rooms.some((r) => r.kind === 'boss'));
-    const t = map.rooms.find((r) => r.kind === 'treasure');
-    if (!t) continue;
-    for (const s of [map.entrance, ...map.exits]) {
-      const f = s.front;
-      assert.ok(!(f.x >= t.x && f.x < t.x + t.w && f.y >= t.y && f.y < t.y + t.h), 'stairs open into the treasure room');
+    for (const t of map.rooms.filter((r) => r.kind === 'treasure')) {
+      for (const s of [map.entrance, ...map.exits]) {
+        const f = s.front;
+        assert.ok(!(f.x >= t.x && f.x < t.x + t.w && f.y >= t.y && f.y < t.y + t.h), 'stairs open into a treasure room');
+      }
     }
   }
 });

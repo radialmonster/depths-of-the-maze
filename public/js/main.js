@@ -4,9 +4,9 @@ import { RNG, EventBus, uid, bumpUid, TILE, dist, clamp, ELEMENTS, RARITY } from
 import { generateDungeon, computeFOV } from './map.js';
 import { Renderer } from './renderer.js';
 import { createPlayer, recalcStats, gainXP, mitigate, updatePlayer, projectileHitDamage } from './character.js';
-import { createSkillState, normalizeSkillState, useSkill, updateSkills, randomGenericBook } from './skills.js';
+import { createSkillState, normalizeSkillState, useSkill, updateSkills } from './skills.js';
 import { spawnEnemies, updateEnemies, createEnemy, getResist, applySlow } from './enemies.js';
-import { rollLoot, startingGear, addToInventory, useItem, generateItem, activePotion, enforceTwoHanded, refreshItemIcon, createSkillBook } from './items.js';
+import { rollLoot, startingGear, addToInventory, useItem, activePotion, enforceTwoHanded, refreshItemIcon, createSkillBook, rollChestContents } from './items.js';
 import { Input } from './input.js';
 import { UI, padLabel } from './ui.js';
 import { sfx, wireAudio } from './audio.js';
@@ -344,6 +344,37 @@ window.__dbg = {
     }
     return null;
   },
+  // Treasure testing (§17.14): stand 2 tiles inside the doorway of this depth's first `tier` treasure room (any tier if
+  // omitted; hidden rooms skipped unless revealed). Returns the room.
+  gotoTreasure(tier) {
+    const map = game.map, p = game.player;
+    const room = map.rooms.find((r) => r.kind === 'treasure' && !r.antechamber && (!tier || r.treasureTier === tier)
+      && (!r.hidden || !map.secretAt(r.secretDoor.x, r.secretDoor.y)));
+    if (!room) return null;
+    const d = room.doors[0];
+    const tiles = map.roomTiles(room.id).filter((t) => game.isFree(t.x, t.y))
+      .sort((a, b) => Math.abs(dist(a.x, a.y, d.x, d.y) - 2) - Math.abs(dist(b.x, b.y, d.x, d.y) - 2));
+    const t = tiles[0];
+    if (!t) return null;
+    p.x = t.x; p.y = t.y; p.fx = t.x; p.fy = t.y;
+    computeFOV(map, t.x, t.y, FOV_RADIUS);
+    return room;
+  },
+  // Regenerates the current depth (fresh seeds) until `pred(map)` holds, e.g. m => m.rooms.some(r => r.treasureTier
+  // === 'vault'). Only the map/enemies/npcs change; the player keeps everything. Returns the seed used, or null.
+  rerollDepth(pred, maxTries = 400) {
+    const prev = game.map?.archetype;
+    for (let i = 0; i < maxTries; i++) {
+      const seed = (Math.random() * 2 ** 32) >>> 0;
+      const m = generateDungeon(game.depth, new RNG(seed), { prevArchetype: prev, merchant: isMerchantDepth(game.depth) });
+      if (!pred(m)) continue;
+      game.map = { archetype: prev }; // loadDepth reads the outgoing archetype
+      game.rng = new RNG(seed);
+      loadDepth(game.depth);
+      return seed;
+    }
+    return null;
+  },
   clearGallery() {
     game.enemies = (game.enemies || []).filter((e) => !e._gallery);
     game.npcs = (game.npcs || []).filter((n) => !n._gallery);
@@ -446,8 +477,9 @@ function continueGame(data) {
 function loadDepth(depth) {
   game.depth = depth;
   game.stats.deepest = Math.max(game.stats.deepest, depth);
-  // The outgoing floor's archetype, so consecutive depths never share one (§17.13).
-  game.map = generateDungeon(depth, game.rng, { prevArchetype: game.map?.archetype });
+  // The outgoing floor's archetype, so consecutive depths never share one (§17.13); on a merchant depth map.js reserves
+  // a spawn-free kind:'merchant' room for the stall.
+  game.map = generateDungeon(depth, game.rng, { prevArchetype: game.map?.archetype, merchant: isMerchantDepth(depth) });
   game.projectiles = [];
   game.groundItems = [];
 
@@ -464,13 +496,13 @@ function loadDepth(depth) {
 
   game.enemies = spawnEnemies(game);
   game.npcs = [];
-  placeHiddenRoomChests(); // before seedTreasure so its loot scatters around the chest, not under it
-  seedTreasure();
+  placeTreasureChests();
 
   if (isMerchantDepth(depth)) {
     const merchant = placeMerchant(game);
-    // Keep the immediate area walkable and safe: no enemies loitering right on top of the stall.
-    if (merchant) game.enemies = game.enemies.filter((e) => dist(e.x, e.y, merchant.x, merchant.y) > MERCHANT_ENEMY_CLEARANCE);
+    // Its whole room is already spawn-free (map.js/enemies.js); this radius is only a safety margin for a general
+    // spawn just outside the room's wall. Treasure guards are exempt: they're behind walls, in their own wing.
+    if (merchant) game.enemies = game.enemies.filter((e) => e.treasureGuard || dist(e.x, e.y, merchant.x, merchant.y) > MERCHANT_ENEMY_CLEARANCE);
   }
 
   computeFOV(game.map, p.x, p.y, FOV_RADIUS);
@@ -486,62 +518,29 @@ function depthFlavor(depth) {
   return depth === 1 ? 'Find the stairs down.' : lines[(depth * 7) % lines.length];
 }
 
-function seedTreasure() {
-  for (const room of game.map.rooms) {
-    if (room.kind !== 'treasure') continue;
-    const count = game.rng.int(2, 3);
-    const loot = [];
-    for (let i = 0; i < count; i++) loot.push(generateItem(game.depth + 1, game.rng));
-    loot.push({ type: 'gold', amount: game.rng.int(20, 40) * game.depth });
-    game.dropLoot(room.cx, room.cy, loot);
-  }
-}
-
 // ---------------------------------------------------------------------------
-// Hidden treasure rooms (§17.11): map.js seals one dead-end room's doorway (map.secrets). Each gets a chest (an NPC,
-// opened like trading: confirm when adjacent) and is kept free of enemies; the doorway reveals when the player is
-// within 1 tile of it and it's in view.
+// Treasure rooms (§17.14): map.js builds each tier's wing and picks its chest spots (room.chests); every chest is an
+// NPC opened like trading (confirm when adjacent), its contents rolled on opening by items.js rollChestContents. A
+// hidden room (§17.11) is sealed behind a secret doorway and kept free of enemies; the doorway reveals when the player
+// is within 1 tile of it and it's in view.
+const TIER_LABEL = { cache: 'Cache', hoard: 'Hoard', vault: 'Vault' };
 
-// Floor tiles of a sealed room: flood fill from its centre (the doorway is a wall, so it can't leak out).
-function sealedRoomTiles(room) {
-  const map = game.map;
-  const seen = new Set([map.idx(room.cx, room.cy)]);
-  const out = [];
-  const queue = [[room.cx, room.cy]];
-  while (queue.length) {
-    const [x, y] = queue.shift();
-    if (!map.isWalkable(x, y)) continue;
-    out.push({ x, y });
-    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-      const nx = x + dx, ny = y + dy;
-      if (!map.inBounds(nx, ny) || seen.has(map.idx(nx, ny))) continue;
-      seen.add(map.idx(nx, ny));
-      if (map.isWalkable(nx, ny)) queue.push([nx, ny]);
-    }
-  }
-  return out;
-}
-
-function placeHiddenRoomChests() {
+function placeTreasureChests() {
   const map = game.map;
   for (const room of map.rooms) {
-    if (!room.hidden || !room.secretDoor) continue;
-    const cells = sealedRoomTiles(room);
-    if (!cells.length) continue;
-    const inRoom = new Set(cells.map((c) => map.idx(c.x, c.y)));
-    // Nothing is sealed in with the treasure (spawn candidates already skip the room; this catches stragglers).
-    game.enemies = game.enemies.filter((e) => !inRoom.has(map.idx(e.x, e.y)));
-    // The back of the room (farthest from the doorway), on a tile with open floor around it for the loot to land.
-    const door = room.secretDoor;
-    const openAround = (c) => [[1, 0], [-1, 0], [0, 1], [0, -1]].filter(([dx, dy]) => inRoom.has(map.idx(c.x + dx, c.y + dy))).length;
-    let best = null, bestScore = -Infinity;
-    for (const c of cells) {
-      const score = dist(c.x, c.y, door.x, door.y) + (openAround(c) >= 3 ? 100 : 0);
-      if (score > bestScore) { bestScore = score; best = c; }
+    if (room.kind !== 'treasure' || !room.chests || !room.chests.length) continue;
+    if (room.hidden) {
+      // Nothing is sealed in with the treasure (no spawn candidates or guards; this catches any straggler).
+      const inRoom = new Set(map.roomTiles(room.id).map((c) => map.idx(c.x, c.y)));
+      game.enemies = game.enemies.filter((e) => !inRoom.has(map.idx(e.x, e.y)));
     }
-    game.npcs.push({
-      id: uid(), type: 'chest', x: best.x, y: best.y, fx: best.x, fy: best.y, opened: false, roomId: room.id,
-      rot: Math.atan2(door.x - best.x, door.y - best.y), // lid/latch faces the doorway
+    const door = room.secretDoor || room.doors[0];
+    room.chests.forEach((c, i) => {
+      game.npcs.push({
+        id: uid(), type: 'chest', x: c.x, y: c.y, fx: c.x, fy: c.y, opened: false,
+        roomId: room.id, tier: room.treasureTier, first: i === 0,
+        rot: Math.atan2(door.x - c.x, door.y - c.y), // lid/latch faces the doorway
+      });
     });
   }
 }
@@ -563,18 +562,24 @@ function checkSecrets() {
   }
 }
 
-// Opens a chest: one random generic-pool skill book, dropped beside it (dropLoot skips the chest's own tile).
+// Opens a chest: its tier's loot (§17.14), dropped around it (dropLoot skips the chest's own tile); a hidden room's
+// first chest adds one random generic-pool skill book (§17.11).
 function openChest(chest) {
   if (!chest || chest.opened) return;
   chest.opened = true;
-  const id = randomGenericBook(game.rng);
-  game.dropLoot(chest.x, chest.y, id ? [createSkillBook(id, game.depth)] : [{ type: 'gold', amount: game.rng.int(20, 40) * game.depth }]);
+  const room = game.map.rooms[chest.roomId];
+  const tier = chest.tier || (room && room.treasureTier) || 'cache';
+  const loot = rollChestContents(tier, game.depth, game.rng, { first: chest.first !== false, hidden: !!(room && room.hidden) });
+  game.dropLoot(chest.x, chest.y, loot);
   game.effect('pickup', chest.x, chest.y, { color: '#ffd34f' });
   game.effect('levelup', chest.x, chest.y);
-  game.log('The chest creaks open.', '#ffd34f');
+  game.log(`The ${TIER_LABEL[tier] || 'treasure'} chest creaks open.`, '#ffd34f');
+  for (const it of loot) {
+    if (it.type === 'skillbook') game.log(`Inside: ${it.name}!`, RARITY[it.rarity]?.color || '#ffd43b');
+  }
   game.bus.emit('chestOpened', { chest });
   const p = game.player;
-  pickupAt(p.x, p.y); // in case the book landed on the player's own tile
+  pickupAt(p.x, p.y); // in case something landed on the player's own tile
 }
 
 function descend() {

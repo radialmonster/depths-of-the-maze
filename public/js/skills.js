@@ -527,7 +527,7 @@ export function validateSkillRegistry() {
 // items.js compareGear's "Switches your attack to {skill}" text (items.js can't import this module: cycle).
 setAttackSkillResolver((player, cls) => attackSkillForClass(player, cls));
 // items.js skill books: tooltip info, reading (learnSkill), and the boss-kill book drops inside rollLoot (§17.11).
-setSkillBookHooks({ info: skillBookInfo, read: readSkillBook, bossDrops: bossBookDrops });
+setSkillBookHooks({ info: skillBookInfo, read: readSkillBook, bossDrops: bossBookDrops, randomGeneric: randomGenericBook });
 
 // ---------------------------------------------------------------------------
 // Skill state (known ranks + loadout)

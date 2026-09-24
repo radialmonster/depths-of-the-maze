@@ -71,8 +71,9 @@ test('room-count curve: min(22, 11 + floor((depth-1)*0.6))', () => {
 });
 
 test('every generated floor places its full room count (all but a rare wide-gap Wings layout)', () => {
-  const short = RUNS.filter(({ depth, map }) => map.rooms.length !== targetRoomCount(depth));
-  for (const { depth, map } of RUNS) assert.ok(map.rooms.length <= targetRoomCount(depth));
+  // (the growth pass's rooms; treasure wings, §17.14, are added on top of this base count)
+  const short = RUNS.filter(({ depth, map }) => map.baseRoomCount !== targetRoomCount(depth));
+  for (const { depth, map } of RUNS) assert.ok(map.baseRoomCount <= targetRoomCount(depth));
   assert.ok(short.length <= RUNS.length * 0.02, `${short.length}/${RUNS.length} floors short of their room count`);
 });
 

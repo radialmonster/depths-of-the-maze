@@ -426,6 +426,7 @@ export function generateItem(depth, rng = new RNG(), opts = {}) {
 //   info(skillId, player) -> { name, icon, category, categoryLabel, requires, description, unique, rank, maxRank } | null
 //   read(player, skillId) -> { ok, isNew, rank, name, reason }       (learnSkill + what happened)
 //   bossDrops(bossType, bossesDefeated, rng) -> [skillId]            (first kill / repeat kill book rolls)
+//   randomGeneric(rng) -> skillId | null                              (a hidden treasure room's bonus book, §17.11)
 // ---------------------------------------------------------------------------
 let skillBookHooks = null;
 export function setSkillBookHooks(hooks) { skillBookHooks = hooks || null; }
@@ -524,6 +525,54 @@ export function rollLoot(enemy, depth, rng, opts = {}) {
   }
 
   return drops;
+}
+
+// ---------------------------------------------------------------------------
+// Treasure chests (§17.14). Pure: callable standalone (tests, the §17.17 simulation harness), like rollLoot.
+//   itemLevel  generateItem's opts.itemLevel — never a shifted `depth`, so the rarity roll (incl. the depth<4
+//              legendary gate) stays the current depth's; the tier only moves how good the gear is.
+//   elite      opts.elite on the rarity roll; rarePerChest = one item per chest at opts.minRarity 'rare'.
+//   gold/potion are per ROOM, so they go in the room's first chest (opts.first).
+// ---------------------------------------------------------------------------
+export const CHEST_LOOT = Object.freeze({
+  cache: Object.freeze({ items: [1, 1], levelOffset: -1, jitter: [-1, 1], elite: false, rarePerChest: false, gold: [10, 20], potion: 0 }),
+  hoard: Object.freeze({ items: [2, 2], levelOffset: 0, jitter: [-1, 1], elite: true, rarePerChest: false, gold: [20, 40], potion: 0.5 }),
+  vault: Object.freeze({ items: [2, 3], levelOffset: 0, jitter: [1, 2], elite: true, rarePerChest: true, gold: [40, 70], potion: 1 }),
+});
+
+// Item level of one treasure item: Cache max(1, depth-1) ±1, Hoard depth ±1, Vault depth +1..2 (never below depth).
+export function treasureItemLevel(tier, depth, rng) {
+  const t = CHEST_LOOT[tier] || CHEST_LOOT.cache;
+  const base = Math.max(1, depth + t.levelOffset);
+  return clamp(base + rng.int(t.jitter[0], t.jitter[1]), 1, 60);
+}
+
+// One chest's contents -> [item | {type:'gold', amount}]. opts.first: this is the room's first chest (gets the room's
+// gold, potion roll and — opts.hidden, §17.11 — one random generic-pool skill book).
+export function rollChestContents(tier, depth, rng, opts = {}) {
+  depth = Math.max(1, Math.floor(depth) || 1);
+  const t = CHEST_LOOT[tier] || CHEST_LOOT.cache;
+  const first = opts.first !== false;
+  const out = [];
+  const n = rng.int(t.items[0], t.items[1]);
+  for (let i = 0; i < n; i++) {
+    out.push(generateItem(depth, rng, {
+      itemLevel: treasureItemLevel(tier, depth, rng),
+      elite: t.elite,
+      minRarity: t.rarePerChest && i === 0 ? 'rare' : null,
+    }));
+  }
+  if (first) {
+    out.push({ type: 'gold', amount: rng.int(t.gold[0], t.gold[1]) * depth });
+    if (t.potion > 0 && rng.chance(t.potion)) {
+      out.push(generateItem(depth, rng, { type: 'potion', potionKind: rng.chance(0.65) ? 'health' : 'mana' }));
+    }
+    if (opts.hidden && skillBookHooks && typeof skillBookHooks.randomGeneric === 'function') {
+      const id = skillBookHooks.randomGeneric(rng);
+      if (id) out.push(createSkillBook(id, depth));
+    }
+  }
+  return out;
 }
 
 // Two-handed equip rules (§17.9), without changing anything -> { ok, reason?, evicts? }.

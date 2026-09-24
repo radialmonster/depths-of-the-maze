@@ -259,26 +259,98 @@ function computeSpawnCount(depth) {
   return Math.round(base + Math.max(0, depth - 15) * 1.2);
 }
 
-function tileFree(map, enemies, x, y) {
+// `keepOut(x, y)` (optional): true for tiles general spawns must never use (treasure wings, the merchant's room).
+function tileFree(map, enemies, x, y, keepOut = null) {
   if (!map.inBounds(x, y) || !map.isWalkable(x, y)) return false;
+  if (keepOut && keepOut(x, y)) return false;
   for (let i = 0; i < enemies.length; i++) {
     if (enemies[i].x === x && enemies[i].y === y) return false;
   }
   return true;
 }
 
-function findNearbyFree(map, enemies, x, y, maxR = 4) {
-  if (tileFree(map, enemies, x, y)) return { x, y };
+function findNearbyFree(map, enemies, x, y, maxR = 4, keepOut = null) {
+  if (tileFree(map, enemies, x, y, keepOut)) return { x, y };
   for (let r = 1; r <= maxR; r++) {
     for (let dx = -r; dx <= r; dx++) {
       for (let dy = -r; dy <= r; dy++) {
         if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
         const nx = x + dx, ny = y + dy;
-        if (tileFree(map, enemies, nx, ny)) return { x: nx, y: ny };
+        if (tileFree(map, enemies, nx, ny, keepOut)) return { x: nx, y: ny };
       }
     }
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Treasure guards (§17.14). Pure: what one treasure room's guard roll is, from the current depth's own enemy pool
+// (never a next-depth preview). -> { count, level, eliteChance (null = createEnemy's default ~10%), warden }
+//   Cache int(0,2) at depth level; Hoard int(2,3), 25% elite; Vault min(6, 3 + floor(depth/8)) at depth+1 plus one
+//   guaranteed elite "Vault Warden".
+// ---------------------------------------------------------------------------
+export const VAULT_GUARD_CAP = 6;
+export const ANTECHAMBER_GUARD_SHARE = 0.6;
+export function treasureGuardPlan(tier, depth, rng) {
+  if (tier === 'vault') return { count: Math.min(VAULT_GUARD_CAP, 3 + Math.floor(depth / 8)), level: depth + 1, eliteChance: null, warden: true };
+  if (tier === 'hoard') return { count: rng.int(2, 3), level: depth, eliteChance: 0.25, warden: false };
+  return { count: rng.int(0, 2), level: depth, eliteChance: null, warden: false };
+}
+
+// Non-boss enemy types a depth can spawn (minDepth/maxDepth-gated).
+export function enemyPoolForDepth(depth) {
+  const pool = Object.keys(ENEMY_TYPES).filter((id) => {
+    const t = ENEMY_TYPES[id];
+    return !t.boss && depth >= t.minDepth && depth <= t.maxDepth;
+  });
+  if (pool.length === 0) pool.push('slime');
+  return pool;
+}
+
+// Guards for every (non-hidden) treasure room, pushed onto `enemies`. A hidden room holds nothing (§17.11). A Vault
+// with an antechamber puts ANTECHAMBER_GUARD_SHARE of its guards there; the warden and the rest wait by the chests.
+function spawnTreasureGuards(map, depth, rng, pool, enemies) {
+  const chestTiles = new Set(), chestSides = new Set();
+  for (const r of map.rooms) {
+    for (const c of r.chests || []) {
+      chestTiles.add(c.x + ',' + c.y);
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) chestSides.add((c.x + dx) + ',' + (c.y + dy));
+    }
+  }
+  for (const room of map.rooms) {
+    if (room.kind !== 'treasure' || room.antechamber || room.hidden || !map.roomTiles) continue;
+    const plan = treasureGuardPlan(room.treasureTier, depth, rng);
+    const ante = room.antechamberId != null ? map.rooms[room.antechamberId] : null;
+    const nAnte = ante ? Math.round(plan.count * ANTECHAMBER_GUARD_SHARE) : 0;
+    const chests = room.chests && room.chests.length ? room.chests : [{ x: room.cx, y: room.cy }];
+    const free = (t) => !chestTiles.has(t.x + ',' + t.y) && !enemies.some((e) => e.x === t.x && e.y === t.y);
+    // A room's free tiles, nearest-first to `near` (null = shuffled). Guards stand BY a chest, never on the tiles
+    // beside it (the ones it's opened from) unless nothing else is left.
+    const spots = (rid, near) => {
+      const all = map.roomTiles(rid).filter(free);
+      const clear = all.filter((t) => !chestSides.has(t.x + ',' + t.y));
+      const tiles = clear.length ? clear : all;
+      if (!near) return rng.shuffle(tiles);
+      return tiles.map((t) => ({ t, d: dist(t.x, t.y, near.x, near.y) + rng.next() * 1.5 })).sort((a, b) => a.d - b.d).map((e) => e.t);
+    };
+    const place = (rid, near, opts) => {
+      const t = spots(rid, near)[0];
+      if (!t) return null;
+      const e = createEnemy(rng.pick(pool), t.x, t.y, plan.level, rng, opts);
+      e.treasureGuard = room.treasureTier;
+      enemies.push(e);
+      return e;
+    };
+    const eliteOpt = () => (plan.eliteChance == null ? {} : { elite: rng.chance(plan.eliteChance) });
+    for (let i = 0; i < plan.count; i++) {
+      if (i < nAnte) place(ante.id, null, eliteOpt());
+      else place(room.id, rng.pick(chests), eliteOpt());
+    }
+    if (plan.warden) {
+      const w = place(room.id, rng.pick(chests), { elite: true });
+      if (w) { w.name = `Vault Warden (${ENEMY_TYPES[w.type].name})`; w.warden = true; }
+    }
+  }
 }
 
 export function spawnEnemies(game) {
@@ -291,22 +363,24 @@ export function spawnEnemies(game) {
   const startRoom = map.rooms?.find(r => r.kind === 'start');
   const bossRoom = isBossFloor ? map.rooms?.find(r => r.kind === 'boss') : null;
 
-  const pool = Object.keys(ENEMY_TYPES).filter((id) => {
-    const t = ENEMY_TYPES[id];
-    return !t.boss && depth >= t.minDepth && depth <= t.maxDepth;
-  });
-  if (pool.length === 0) pool.push('slime');
+  const pool = enemyPoolForDepth(depth);
+
+  // General spawns stay out of treasure wings (they get tier guards instead) and the merchant's room (§17.14).
+  const keepOutIds = new Set((map.rooms || []).filter(r => r.kind === 'treasure' || r.kind === 'merchant').map(r => r.id));
+  const keepOut = map.roomAt && keepOutIds.size
+    ? (x, y) => { const r = map.roomAt(x, y); return !!r && keepOutIds.has(r.id); }
+    : null;
 
   const minDistFromEntrance = 8;
   const raw = map.spawnCandidates(rng, count + 16, minDistFromEntrance) || [];
-  const candidates = raw.filter(c => !startRoom || c.roomId !== startRoom.id);
+  const candidates = raw.filter(c => (!startRoom || c.roomId !== startRoom.id) && !keepOutIds.has(c.roomId));
   let ci = 0;
   const nextCandidate = () => candidates[ci++] || null;
 
   // --- Boss + guards ---
   if (bossRoom) {
     const bossId = pickBossId(depth);
-    const spot = findNearbyFree(map, enemies, bossRoom.cx, bossRoom.cy) || { x: bossRoom.cx, y: bossRoom.cy };
+    const spot = findNearbyFree(map, enemies, bossRoom.cx, bossRoom.cy, 4, keepOut) || { x: bossRoom.cx, y: bossRoom.cy };
     const boss = createEnemy(bossId, spot.x, spot.y, depth, rng, { elite: false });
     enemies.push(boss);
 
@@ -314,7 +388,7 @@ export function spawnEnemies(game) {
     for (let i = 0; i < guardCount; i++) {
       const gx = bossRoom.cx + rng.int(-3, 3);
       const gy = bossRoom.cy + rng.int(-3, 3);
-      const gspot = findNearbyFree(map, enemies, gx, gy);
+      const gspot = findNearbyFree(map, enemies, gx, gy, 4, keepOut);
       if (!gspot) continue;
       enemies.push(createEnemy(rng.pick(pool), gspot.x, gspot.y, depth, rng));
     }
@@ -326,7 +400,7 @@ export function spawnEnemies(game) {
     guard++;
     const c = nextCandidate();
     if (!c) break;
-    if (!tileFree(map, enemies, c.x, c.y)) continue;
+    if (!tileFree(map, enemies, c.x, c.y, keepOut)) continue;
     const tid = rng.pick(pool);
     const type = ENEMY_TYPES[tid];
     enemies.push(createEnemy(tid, c.x, c.y, depth, rng));
@@ -336,7 +410,7 @@ export function spawnEnemies(game) {
       for (let g = 0; g < groupSize && enemies.length < count; g++) {
         const gx = c.x + rng.int(-2, 2);
         const gy = c.y + rng.int(-2, 2);
-        const gspot = findNearbyFree(map, enemies, gx, gy, 2);
+        const gspot = findNearbyFree(map, enemies, gx, gy, 2, keepOut);
         if (!gspot) continue;
         enemies.push(createEnemy(tid, gspot.x, gspot.y, depth, rng));
       }
@@ -347,10 +421,13 @@ export function spawnEnemies(game) {
   const exitRooms = map.rooms?.filter(r => r.kind === 'exit') || [];
   for (const r of exitRooms) {
     if (!rng.chance(0.5)) continue;
-    const spot = findNearbyFree(map, enemies, r.cx, r.cy);
+    const spot = findNearbyFree(map, enemies, r.cx, r.cy, 4, keepOut);
     if (!spot) continue;
     enemies.push(createEnemy(rng.pick(pool), spot.x, spot.y, depth, rng, { elite: rng.chance(0.5) }));
   }
+
+  // --- Treasure guards (§17.14): on top of the general count, which Phase 4 (§17.16) rescales by populatedFloor ---
+  spawnTreasureGuards(map, depth, rng, pool, enemies);
 
   return enemies;
 }
