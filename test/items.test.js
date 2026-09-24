@@ -204,7 +204,7 @@ test('bag full: the bow is refused and nothing changes', () => {
   assert.equal(p.equipment.weapon, sword);
   assert.equal(p.equipment.offhand, sh);
   assert.equal(p.inventory.length, INVENTORY_SIZE);
-  assert.deepEqual(logs, ['Bag full: need 1 more free slot']);
+  assert.deepEqual(logs, ['Bag full: 1 free inventory slot needed']);
 });
 test('bag full but unarmed: bow fits (the bow\'s own cell holds the shield)', () => {
   const sh = shield(), bow = weapon('bow', 5, 9);

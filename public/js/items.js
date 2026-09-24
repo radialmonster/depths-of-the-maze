@@ -586,14 +586,11 @@ export function equipCheck(player, item) {
   }
   const off = player.equipment.offhand;
   if (item.slot === 'weapon' && isTwoHanded(item) && off) {
-    // Bag after the swap: -1 (this item leaves it) +1 (the old weapon, if any) +1 (the evicted off-hand).
-    const inBag = (player.inventory || []).some((i) => i && i.id === item.id) ? 1 : 0;
-    const after = (player.inventory || []).length - inBag + (weapon ? 1 : 0) + 1;
-    if (after > INVENTORY_SIZE) {
-      // Both the old weapon and the off-hand may need a slot, so name a count rather than just one item.
-      const short = after - INVENTORY_SIZE;
-      return { ok: false, reason: `Bag full: need ${short} more free slot${short === 1 ? '' : 's'}` };
-    }
+    // The weapon side is a straight swap (this item leaves the bag, the old weapon takes its place — net zero), so
+    // the only slot that can ever be short is the one the evicted off-hand needs. `equipItem` only ever calls this
+    // with `item` already in the bag, so that swap is always available; a full bag is short by exactly 1, never more.
+    const after = (player.inventory || []).length + (weapon ? 0 : -1) + 1;
+    if (after > INVENTORY_SIZE) return { ok: false, reason: 'Bag full: 1 free inventory slot needed' };
     return { ok: true, evicts: off };
   }
   return { ok: true };
