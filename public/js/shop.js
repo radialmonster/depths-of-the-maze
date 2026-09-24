@@ -204,6 +204,14 @@ export function npcAt(game, x, y) {
   return null;
 }
 
+// This depth's merchant regardless of the player's distance from them — unlike nearbyMerchant, not range-gated.
+// Used so Bag salvage (which can happen anywhere on the floor, §17.8) can still land in a Buyback safety net.
+export function currentMerchant(game) {
+  const npcs = game.npcs;
+  if (!npcs || !npcs.length) return null;
+  return npcs.find((n) => n.type === 'merchant') || null;
+}
+
 // The merchant the player is currently close enough to trade with, or null.
 export function nearbyMerchant(game) {
   const p = game.player;

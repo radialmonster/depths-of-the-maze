@@ -631,10 +631,12 @@ Decisions made with the user while building. Keep this section current — when 
     magnitudes here are fixed by item level, so a reroll mostly reshuffles which stats — a good *complement* for later
     (it would soak the remaining ~1-2 Featured prices of savings), not the fix for "the merchant sells nothing I
     want". **More markup** — the first attempt; price doesn't create demand.
-- **Buyback** tab (Buy / Sell / Buyback; LB/RB or Tab cycle all three): everything sold on the Sell tab lands there,
-  newest first, at exactly what it sold for (no markup — a misclick safety net). Potion stacks come back whole.
-  Capped at the last 12 sales (`MERCHANT_BUYBACK_CAP`, FIFO). Lives on the merchant (`merchant.buyback`), so it resets
-  with the stock every depth (and on Continue). Bag shift+click salvage bypasses it.
+- **Buyback** tab (Buy / Sell / Buyback; LB/RB or Tab cycle all three): everything sold on the Sell tab **or
+  salvaged from the Bag** (§17.8 — both go through `sellToMerchant`) lands there, newest first, at exactly what it
+  sold for (no markup — a misclick safety net). Potion stacks come back whole. Capped at the last 12 sales
+  (`MERCHANT_BUYBACK_CAP`, FIFO). Lives on the merchant (`merchant.buyback`), so it resets with the stock every
+  depth (and on Continue). Salvage uses `currentMerchant(game)` — this depth's merchant regardless of the player's
+  distance from them, since salvage can happen anywhere on the floor, not just standing at the shop.
 
 ### 17.4b Look & atmosphere
 - The background/fog behind the map is each depth theme's sky colour blended (in sRGB) toward a deep dusk tone

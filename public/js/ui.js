@@ -11,7 +11,7 @@ import { upgradeSkill, skillDescription, activeSkill, skillRank, skillCooldown, 
   SLOT_CATEGORIES } from './skills.js';
 import { equipItem, unequipItem, useItem, dropItem, sellValue, itemTooltip, compareGear, equipUpgrades, SLOTS, INVENTORY_SIZE, isTwoHanded,
   activePotion, pinnedPotion, potionHotbarKind, togglePotionPin } from './items.js';
-import { buyFromMerchant, sellToMerchant, buybackFromMerchant, nearbyMerchant, nearbyChest, shopPrice } from './shop.js';
+import { buyFromMerchant, sellToMerchant, buybackFromMerchant, nearbyMerchant, currentMerchant, nearbyChest, shopPrice } from './shop.js';
 import { RARITY, clamp, TILE, ELEMENTS, ELEMENT_ORDER } from './core.js';
 import { ENEMY_TYPES } from './enemies.js';
 import { sfx } from './audio.js';
@@ -2038,14 +2038,15 @@ export class UI {
 
   // Sell one bag item straight to gold with no merchant trip. Reachable by Shift+Click (mouse) and by the
   // dedicated 'salvage' action (G / gamepad L3) for keyboard/gamepad play, which have no shift-click equivalent.
+  // Routed through sellToMerchant (same as the Shop's Sell tab) so an accidental salvage isn't unrecoverable: it
+  // lands on this depth's merchant Buyback tab (§17.4) at the exact price it sold for, same as a misclicked Sell.
   _salvageInvCell(index) {
     const p = this.game && this.game.player;
-    const item = p && p.inventory[index];
-    if (!item) return;
-    const value = sellValue(item);
-    p.gold = (p.gold || 0) + value;
-    p.inventory.splice(index, 1);
-    this.log(`Salvaged ${item.name} for ${value}g.`, '#f08c00');
+    if (!p || !p.inventory[index]) return;
+    const res = sellToMerchant(this.game, index, currentMerchant(this.game));
+    if (!res.ok) return;
+    this.log(`Salvaged ${res.item.name} for ${res.price}g.`, '#f08c00');
+    this.game.bus.emit('itemSold', { item: res.item, price: res.price });
     this._hideTooltip();
     this._previewItem = null;
     this._refreshInventoryPanel();
