@@ -1,25 +1,32 @@
 // Dungeon generation + FOV. Owned by the Map agent. Public API is fixed by DESIGN.md §7:
-//   generateDungeon(depth, rng) -> map
+//   generateDungeon(depth, rng, opts?) -> map     opts.prevArchetype: the previous depth's map.archetype
 //   computeFOV(map, x, y, radius)
 //
 // Generation algorithm ("large rooms linked together", deterministic given rng):
+//  0. Archetype (§17.13): each depth picks a profile (halls/catacombs/caverns/keep/wings, never the previous
+//     depth's) that sets the size mix, shape weights, corridor gaps, loop fraction, cluster chance and
+//     parent weighting below. The algorithm itself is the same for all of them.
 //  1. Room shapes. Each room is a floor mask inside its bounding box: plain rectangles,
 //     pillared halls (isolated single WALL tiles >= 2 tiles from the edge, never blocking),
-//     L-shapes (rectangle minus a corner), two overlapping rectangles, and rounded caves.
-//     Size mix leans medium/large (8x8 .. 18x14) with a few small rooms (5x5 .. 7x7).
-//  2. Growth placement = spanning tree. The first room goes near the map centre; each new
-//     room is attached to a random existing room on one side, either sharing a wall
-//     (gap 1 -> a single doorway in the common wall) or 3-7 tiles away (short straight
-//     corridor). A room is kept only if every floor tile has a full wall ring (no two
+//     L-shapes (rectangle minus a corner), two overlapping rectangles, rounded caves, cross/T,
+//     octagons, long galleries, ring halls (walkway round a solid core), split halls (a divider
+//     with 1-2 gaps) and cellular-automata caverns. Walls inside a room (core, divider, pillars,
+//     rock islands) are 'core' tiles: never a doorway, corridor or stair cubby.
+//     Sizes: small 5-7, medium 8-11 x 8-10, large 12-18 x 10-14 (galleries 3-5 x 14-22).
+//  2. Growth placement = spanning tree. The first room goes near the map centre (on non-boss depths it
+//     may be a 'grand' 20-26 x 14-20 landmark); each new room is attached to an existing room on one
+//     side, either sharing a wall (gap 1 -> a single doorway in the common wall) or a few tiles away
+//     (short straight corridor). A room is kept only if every floor tile has a full wall ring (no two
 //     spaces ever merge) and the link to its parent can be carved. The attachment links
-//     form the spanning tree, so every room is reachable by construction.
+//     form the spanning tree, so every room is reachable by construction. Cluster mode (Catacombs)
+//     chains a few more small rooms straight off a new small room through shared walls.
 //  3. Corridors are validated before carving: straight or L-shaped, 1 wide (some straight
 //     ones widen to 2 between 1-wide doorways), and they may touch nothing but the two
 //     rooms they join (and never run parallel to another corridor one wall apart).
 //     Both ends are TILE.DOOR tiles in the room walls.
 //  4. Loops + exit counts: a few extra links between nearby rooms create loops, then rooms
-//     are topped up toward 2-4 links (large) / 1-3 links (medium) with nearby rooms
-//     (caps: 4 large / 3 medium / 2 small). No corridor ever dead-ends.
+//     are topped up toward 2-4 links (large/grand) / 1-3 links (medium) with nearby rooms
+//     (caps: 4 large/grand / 3 medium / 2 small). No corridor ever dead-ends.
 //  5. A BFS safety net force-carves a corridor to any stray component (a no-op in practice),
 //     then the map is cropped to the used area plus a 1-tile WALL border.
 //  6. Start room (entrance) is chosen, BFS distances computed, then 1-3 exit rooms are chosen
@@ -31,7 +38,8 @@
 import { TILE } from './core.js';
 
 const DIR4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
-const LINK_CAP = { small: 2, medium: 3, large: 4 }; // max rooms linked to one room
+const LINK_CAP = { small: 2, medium: 3, large: 4, grand: 4 }; // max rooms linked to one room
+const isBig = (r) => r.size === 'large' || r.size === 'grand';
 const DIR8 = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
 
 // Treasure rooms (§17.11): a dead-end room, 50% of depths; from depth 2 on, some depths get a HIDDEN treasure room
@@ -48,13 +56,73 @@ function computeMapSize(depth) {
   return s;
 }
 
-function targetRoomCount(depth) {
-  return Math.min(16, 10 + Math.floor((depth - 1) * 0.6));
+export function targetRoomCount(depth) {
+  return Math.min(22, 11 + Math.floor((depth - 1) * 0.6));
+}
+
+// ---------- Floor archetypes (§17.13) ----------
+// Each depth draws one profile; the growth algorithm below is the same for all of them, an archetype only swaps the
+// constants it runs with. sizeMix = small/medium/large weights; favored/favoredShare = which shapes (relative weights)
+// get what share of each size category's shape roll (null = every eligible shape evenly); sharedWall = chance a new room shares a wall
+// with its parent (gap 1), otherwise gap = int(gap[0], gap[1]); loops = extra-link fraction; widen = chance a straight
+// corridor gets a 2-wide body; cluster = chance a newly placed small room grows a cluster of 2-4 more small rooms;
+// parent = parent-weighting ('spread': 1/(1+links), 'deep': toward the deepest spanning-tree nodes); grand = chance
+// the seed room rolls the 'grand' landmark size (never on boss depths).
+export const ARCHETYPES = Object.freeze({
+  halls: {
+    sizeMix: { small: 18, medium: 44, large: 38 }, favored: null, favoredShare: 0,
+    sharedWall: 0.3, gap: [3, 7], loops: 0.25, widen: 0.3, cluster: 0, parent: 'spread', grand: 0.2,
+  },
+  catacombs: {
+    sizeMix: { small: 45, medium: 45, large: 10 }, favored: { rect: 1, cross: 1 }, favoredShare: 0.75,
+    sharedWall: 0.5, gap: [3, 7], loops: 0.35, widen: 0.3, cluster: 0.4, parent: 'spread', grand: 0.2,
+  },
+  caverns: {
+    sizeMix: { small: 10, medium: 40, large: 50 }, favored: { cave: 1, cavern: 1 }, favoredShare: 0.72,
+    sharedWall: 0.45, gap: [3, 7], loops: 0.25, widen: 0.6, cluster: 0, parent: 'spread', grand: 0.2,
+  },
+  keep: {
+    sizeMix: { small: 18, medium: 44, large: 38 }, favored: { rect: 2, pillars: 2, ringHall: 2, gallery: 1 }, favoredShare: 0.75,
+    sharedWall: 0.3, gap: [3, 7], loops: 0.15, widen: 0.3, cluster: 0, parent: 'spread', grand: 1,
+  },
+  wings: {
+    sizeMix: { small: 18, medium: 44, large: 38 }, favored: null, favoredShare: 0,
+    sharedWall: 0.2, gap: [5, 12], loops: 0.15, widen: 0.3, cluster: 0, parent: 'deep', grand: 0.2,
+  },
+});
+export const ARCHETYPE_IDS = Object.freeze(Object.keys(ARCHETYPES));
+
+// Uniform over the archetypes, excluding the previous depth's (so two consecutive floors never share a profile).
+export function pickArchetype(rng, prevArchetype) {
+  const pool = ARCHETYPE_IDS.filter(a => a !== prevArchetype);
+  return rng.pick(pool);
+}
+
+// Shapes each size category may roll. Grand (the landmark seed room) is ring hall or pillared hall only.
+export const SHAPES_BY_SIZE = Object.freeze({
+  small: ['rect', 'cross'],
+  medium: ['rect', 'Lshape', 'overlap', 'cave', 'cross', 'octagon', 'gallery', 'splitHall', 'cavern'],
+  large: ['rect', 'pillars', 'Lshape', 'overlap', 'cave', 'cross', 'octagon', 'gallery', 'ringHall', 'splitHall', 'cavern'],
+  grand: ['ringHall', 'pillars'],
+});
+
+// Within one size category: the favored shapes that category can roll split favoredShare (by their relative
+// weights), every other eligible shape splits the rest evenly; no favored shape eligible -> all even.
+function shapeWeight(profile, eligible, type) {
+  const favored = (profile && profile.favored) || {};
+  const fav = eligible.filter(t => favored[t]);
+  if (!fav.length || fav.length === eligible.length) return 1;
+  if (!favored[type]) return (1 - profile.favoredShare) / (eligible.length - fav.length);
+  const total = fav.reduce((sum, t) => sum + favored[t], 0);
+  return profile.favoredShare * favored[type] / total;
 }
 
 // ---------- Room shapes ----------
-// A shape is { w, h, mask: Uint8Array(w*h) (1 = floor), pillars: [[lx,ly]], type }.
-function normalizeShape(w, h, mask, pillars, type) {
+// A shape is { w, h, mask: Uint8Array(w*h) (1 = floor), pillars: [[lx,ly]], core: [[lx,ly]], type }.
+// core = WALL tiles inside the room that must never become a doorway, stair cubby or corridor: a ring hall's solid
+// centre, a split hall's divider, and any enclosed rock (pillars, cavern islands) — found automatically here, since
+// anything not 4-connected to the outside of the bounding box is enclosed by the room's own floor.
+function normalizeShape(w, h, mask, pillars, type, core = []) {
   let x0 = w, y0 = h, x1 = -1, y1 = -1;
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
     if (!mask[y * w + x]) continue;
@@ -63,26 +131,152 @@ function normalizeShape(w, h, mask, pillars, type) {
   const nw = x1 - x0 + 1, nh = y1 - y0 + 1;
   const nm = new Uint8Array(nw * nh);
   for (let y = 0; y < nh; y++) for (let x = 0; x < nw; x++) nm[y * nw + x] = mask[(y + y0) * w + (x + x0)];
-  return { w: nw, h: nh, mask: nm, pillars: pillars.map(([px, py]) => [px - x0, py - y0]), type };
+  // enclosed non-floor: flood the outside in from the bbox border
+  const outside = new Uint8Array(nw * nh);
+  const q = [];
+  for (let y = 0; y < nh; y++) for (let x = 0; x < nw; x++) {
+    if ((x === 0 || y === 0 || x === nw - 1 || y === nh - 1) && !nm[y * nw + x]) { outside[y * nw + x] = 1; q.push(y * nw + x); }
+  }
+  for (let qi = 0; qi < q.length; qi++) {
+    const x = q[qi] % nw, y = (q[qi] / nw) | 0;
+    for (const [dx, dy] of DIR4) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= nw || ny >= nh) continue;
+      const ni = ny * nw + nx;
+      if (!nm[ni] && !outside[ni]) { outside[ni] = 1; q.push(ni); }
+    }
+  }
+  const coreSet = new Set();
+  for (const [cx, cy] of core) {
+    const x = cx - x0, y = cy - y0;
+    if (x >= 0 && y >= 0 && x < nw && y < nh && !nm[y * nw + x]) coreSet.add(y * nw + x);
+  }
+  for (let i = 0; i < nw * nh; i++) if (!nm[i] && !outside[i]) coreSet.add(i);
+  return {
+    w: nw, h: nh, mask: nm, type,
+    pillars: pillars.map(([px, py]) => [px - x0, py - y0]),
+    core: [...coreSet].sort((a, b) => a - b).map(i => [i % nw, (i / nw) | 0]),
+  };
 }
 
-function makeShape(rng, cat) {
+// Door slots of a lone shape (local coords), by the same rule generateDungeon's doorSlots applies on the grid: a
+// non-floor, non-core tile just outside a floor tile, on a straight 3-tile stretch of edge. Used to reject cavern
+// blobs too ragged to take a door on every side, and by tests.
+export function shapeDoorSlots(shape) {
+  const { w, h, mask } = shape;
+  const core = new Set(shape.core.map(([x, y]) => y * w + x));
+  const floor = (x, y) => x >= 0 && y >= 0 && x < w && y < h && mask[y * w + x] === 1;
+  const out = [];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    if (!floor(x, y)) continue;
+    for (const [dx, dy] of DIR4) {
+      const sx = x + dx, sy = y + dy;
+      if (floor(sx, sy)) continue;
+      if (sx >= 0 && sy >= 0 && sx < w && sy < h && core.has(sy * w + sx)) continue;
+      const px = dy, py = dx;
+      if (floor(sx + px, sy + py) || floor(sx - px, sy - py)) continue;
+      if (!floor(x + px, y + py) || !floor(x - px, y - py)) continue;
+      out.push({ x: sx, y: sy, dx, dy });
+    }
+  }
+  return out;
+}
+
+// Cellular-automata blob: ellipse-biased noise, 4 smoothing passes, spikes trimmed, largest 4-connected component
+// kept. Rejected (null) unless it fills >= 45% of its box and has a door slot facing every direction.
+function cavernShape(rng, w, h) {
+  for (let attempt = 0; attempt < 12; attempt++) {
+    let m = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const nx = (x + 0.5 - w / 2) / (w / 2), ny = (y + 0.5 - h / 2) / (h / 2);
+      const d = nx * nx + ny * ny;
+      m[y * w + x] = rng.next() < (d < 0.3 ? 0.75 : d < 1 ? 0.58 : 0.3) ? 1 : 0;
+    }
+    const at = (g, x, y) => (x >= 0 && y >= 0 && x < w && y < h ? g[y * w + x] : 0);
+    for (let it = 0; it < 4; it++) {
+      const n = new Uint8Array(w * h);
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        let c = 0;
+        for (const [dx, dy] of DIR8) c += at(m, x + dx, y + dy);
+        n[y * w + x] = c >= 5 || (m[y * w + x] && c >= 4) ? 1 : 0;
+      }
+      m = n;
+    }
+    for (let it = 0; it < 2; it++) {
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        if (!m[y * w + x]) continue;
+        let c = 0;
+        for (const [dx, dy] of DIR4) c += at(m, x + dx, y + dy);
+        if (c <= 1) m[y * w + x] = 0;
+      }
+    }
+    // largest 4-connected component
+    const comp = new Int32Array(w * h).fill(-1);
+    let best = -1, bestSize = 0;
+    for (let s = 0; s < w * h; s++) {
+      if (!m[s] || comp[s] !== -1) continue;
+      const q = [s]; comp[s] = s;
+      for (let qi = 0; qi < q.length; qi++) {
+        const x = q[qi] % w, y = (q[qi] / w) | 0;
+        for (const [dx, dy] of DIR4) {
+          const nx = x + dx, ny = y + dy;
+          if (!at(m, nx, ny) || comp[ny * w + nx] !== -1) continue;
+          comp[ny * w + nx] = s; q.push(ny * w + nx);
+        }
+      }
+      if (q.length > bestSize) { bestSize = q.length; best = s; }
+    }
+    if (bestSize < w * h * 0.45) continue;
+    for (let i = 0; i < w * h; i++) m[i] = comp[i] === best ? 1 : 0;
+    // a few rock islands (1x1..2x2) standing in open floor — cover, and never a chokepoint since each keeps a full
+    // floor ring (so they're enclosed -> core, never a door slot)
+    const islands = w * h >= 100 ? rng.int(0, 2) : rng.int(0, 1);
+    for (let k = 0, tries = 0; k < islands && tries < 30; tries++) {
+      const iw = rng.int(1, 2), ih = rng.int(1, 2);
+      const ix = rng.int(2, w - 2 - iw), iy = rng.int(2, h - 2 - ih);
+      let clear = true;
+      for (let y = iy - 2; y < iy + ih + 2 && clear; y++) for (let x = ix - 2; x < ix + iw + 2; x++) if (!at(m, x, y)) { clear = false; break; }
+      if (!clear) continue;
+      for (let y = iy; y < iy + ih; y++) for (let x = ix; x < ix + iw; x++) m[y * w + x] = 0;
+      k++;
+    }
+    const shape = normalizeShape(w, h, m, [], 'cavern');
+    const slots = shapeDoorSlots(shape);
+    if (DIR4.every(([dx, dy]) => slots.some(s => s.dx === dx && s.dy === dy))) return shape;
+  }
+  return null;
+}
+
+// opts: { profile (archetype, for shape weights), type (force a shape — tests) }. cat 'grand' is the landmark size.
+export function makeShape(rng, cat, opts = {}) {
   let w, h;
   if (cat === 'small') { w = rng.int(5, 7); h = rng.int(5, 7); }
   else if (cat === 'medium') { w = rng.int(8, 11); h = rng.int(8, 10); }
-  else { w = rng.int(12, 18); h = rng.int(10, 14); }
+  else if (cat === 'large') { w = rng.int(12, 18); h = rng.int(10, 14); }
+  else { w = rng.int(20, 26); h = rng.int(14, 20); } // grand
 
-  let type = 'rect';
-  if (cat === 'medium') type = rng.weighted(['rect', 'L', 'overlap', 'cave'], t => ({ rect: 50, L: 20, overlap: 18, cave: 12 }[t]));
-  else if (cat === 'large') type = rng.weighted(['rect', 'pillars', 'L', 'overlap', 'cave'], t => ({ rect: 22, pillars: 28, L: 16, overlap: 18, cave: 16 }[t]));
+  const eligible = SHAPES_BY_SIZE[cat];
+  let type = opts.type || rng.weighted(eligible, t => shapeWeight(opts.profile, eligible, t));
+
+  if (type === 'gallery') {
+    // a long thin hall, either orientation
+    const long = rng.int(14, 22), short = rng.int(3, 5);
+    if (rng.chance(0.5)) { w = long; h = short; } else { w = short; h = long; }
+  }
+  if (type === 'cavern') {
+    const cav = cavernShape(rng, w, h);
+    if (cav) return cav;
+    type = 'cave'; // too ragged every try: fall back to the smooth cave
+  }
 
   const mask = new Uint8Array(w * h);
   const pillars = [];
+  const core = [];
   const fillRect = (rx, ry, rw, rh) => {
     for (let y = ry; y < ry + rh; y++) for (let x = rx; x < rx + rw; x++) mask[y * w + x] = 1;
   };
 
-  if (type === 'L') {
+  if (type === 'Lshape') {
     fillRect(0, 0, w, h);
     const cw = rng.int(3, Math.max(3, w - 5)), ch = rng.int(3, Math.max(3, h - 5));
     const cx = rng.chance(0.5) ? 0 : w - cw, cy = rng.chance(0.5) ? 0 : h - ch;
@@ -105,6 +299,50 @@ function makeShape(rng, cat) {
       if (b - a + 1 < 3) { const m = Math.floor(rx); a = Math.min(a, m - 1); b = Math.max(b, m + 1); }
       for (let x = Math.max(0, a); x <= Math.min(w - 1, b); x++) mask[y * w + x] = 1;
     }
+  } else if (type === 'cross') {
+    // centred overlapping bars: a plus, or a T (one bar pushed to an edge, the other centred through it)
+    const vb = rng.int(3, Math.max(3, w - 2)), hb = rng.int(3, Math.max(3, h - 2));
+    const vx = (w - vb) >> 1, hy = (h - hb) >> 1;
+    const t = rng.chance(0.5) ? rng.int(0, 3) : -1; // -1 = plus, else which edge the T's bar sits on
+    if (t === 0) { fillRect(0, 0, w, hb); fillRect(vx, 0, vb, h); }
+    else if (t === 1) { fillRect(0, h - hb, w, hb); fillRect(vx, 0, vb, h); }
+    else if (t === 2) { fillRect(0, 0, vb, h); fillRect(0, hy, w, hb); }
+    else if (t === 3) { fillRect(w - vb, 0, vb, h); fillRect(0, hy, w, hb); }
+    else { fillRect(0, hy, w, hb); fillRect(vx, 0, vb, h); }
+  } else if (type === 'octagon') {
+    fillRect(0, 0, w, h);
+    const c = Math.min(rng.int(2, 3), Math.max(1, (Math.min(w, h) - 3) >> 1));
+    for (let y = 0; y < c; y++) for (let x = 0; x < c - y; x++) {
+      mask[y * w + x] = 0; mask[y * w + (w - 1 - x)] = 0;
+      mask[(h - 1 - y) * w + x] = 0; mask[(h - 1 - y) * w + (w - 1 - x)] = 0;
+    }
+  } else if (type === 'ringHall') {
+    // a walkway around a solid core (>= 3x3)
+    fillRect(0, 0, w, h);
+    const lo = cat === 'grand' ? 4 : 3, hi = cat === 'grand' ? 6 : 4;
+    const rx = Math.max(2, Math.min(rng.int(lo, hi), (w - 3) >> 1));
+    const ry = Math.max(2, Math.min(rng.int(lo, hi), (h - 3) >> 1));
+    for (let y = ry; y < h - ry; y++) for (let x = rx; x < w - rx; x++) { mask[y * w + x] = 0; core.push([x, y]); }
+  } else if (type === 'splitHall') {
+    // a one-tile dividing wall across the middle of the long axis, broken by 1-2 gaps (2-3 wide)
+    fillRect(0, 0, w, h);
+    const vertical = w >= h; // divider runs along y (splitting left/right halves) when the room is wide
+    const span = vertical ? w : h, len = vertical ? h : w;
+    const at = Math.max(3, Math.min(span - 4, (span >> 1) + rng.int(-1, 1)));
+    const wall = new Array(len).fill(1);
+    const nGaps = len >= 9 && rng.chance(0.5) ? 2 : 1;
+    if (nGaps === 1) { const gw = rng.int(2, 3), g = rng.int(0, len - gw); for (let k = g; k < g + gw; k++) wall[k] = 0; }
+    else {
+      const g1w = rng.int(2, 3), g2w = rng.int(2, 3);
+      const g1 = rng.int(0, 2), g2 = len - g2w - rng.int(0, 2);
+      for (let k = g1; k < g1 + g1w; k++) wall[k] = 0;
+      for (let k = g2; k < g2 + g2w; k++) wall[k] = 0;
+    }
+    for (let k = 0; k < len; k++) {
+      if (!wall[k]) continue;
+      const x = vertical ? at : k, y = vertical ? k : at;
+      mask[y * w + x] = 0; core.push([x, y]);
+    }
   } else {
     fillRect(0, 0, w, h);
     if (type === 'pillars') {
@@ -119,10 +357,13 @@ function makeShape(rng, cat) {
       for (const py of ys) for (const px of xs) { mask[py * w + px] = 0; pillars.push([px, py]); }
     }
   }
-  return normalizeShape(w, h, mask, pillars, type);
+  return normalizeShape(w, h, mask, pillars, type, core);
 }
 
-export function generateDungeon(depth, rng) {
+// opts.prevArchetype: the previous depth's map.archetype, so this depth never repeats it (§17.13).
+export function generateDungeon(depth, rng, opts = {}) {
+  const archetype = pickArchetype(rng, opts.prevArchetype);
+  const profile = ARCHETYPES[archetype];
   let width = computeMapSize(depth);
   let height = width;
   const idx = (x, y) => y * width + x;
@@ -131,6 +372,7 @@ export function generateDungeon(depth, rng) {
 
   let tiles = new Uint8Array(width * height).fill(TILE.WALL);
   let roomIdGrid = new Int32Array(width * height).fill(-1); // per-cell room id (room floor only)
+  let reserved = new Uint8Array(width * height); // 1 = a room's core WALL tile (never a doorway/corridor/cubby)
   const rooms = [];
   const links = new Set(); // "a|b" with a<b
   const linkKey = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
@@ -140,10 +382,14 @@ export function generateDungeon(depth, rng) {
   function canPlace(shape, ox, oy) {
     if (ox < 1 || oy < 1 || ox + shape.w > width - 1 || oy + shape.h > height - 1) return false;
     const { w, h, mask } = shape;
+    for (const [lx, ly] of shape.core) {
+      const i = idx(ox + lx, oy + ly);
+      if (tiles[i] !== TILE.WALL || reserved[i]) return false;
+    }
     for (let ly = 0; ly < h; ly++) for (let lx = 0; lx < w; lx++) {
       if (!mask[ly * w + lx]) continue;
       const x = ox + lx, y = oy + ly;
-      if (tiles[idx(x, y)] !== TILE.WALL) return false;
+      if (tiles[idx(x, y)] !== TILE.WALL || reserved[idx(x, y)]) return false;
       for (const [dx, dy] of DIR8) {
         const nx = x + dx, ny = y + dy;
         if (!interior(nx, ny) && !inBounds(nx, ny)) return false;
@@ -162,6 +408,8 @@ export function generateDungeon(depth, rng) {
       const i = idx(ox + lx, oy + ly);
       tiles[i] = TILE.FLOOR; roomIdGrid[i] = id; cells.push(i);
     }
+    const core = shape.core.map(([lx, ly]) => idx(ox + lx, oy + ly));
+    for (const i of core) reserved[i] = 1;
     // cx,cy: bbox centre if it is floor, otherwise the nearest floor tile of the room
     let cx = ox + ((w - 1) >> 1), cy = oy + ((h - 1) >> 1);
     if (roomIdGrid[idx(cx, cy)] !== id) {
@@ -173,8 +421,9 @@ export function generateDungeon(depth, rng) {
       }
       cx = best % width; cy = (best / width) | 0;
     }
-    const room = { id, x: ox, y: oy, w, h, cx, cy, size: cat, doors: [], kind: 'normal' };
+    const room = { id, x: ox, y: oy, w, h, cx, cy, size: cat, shape: shape.type, doors: [], kind: 'normal' };
     Object.defineProperty(room, '_cells', { value: cells, enumerable: false, writable: true });
+    Object.defineProperty(room, '_core', { value: core, enumerable: false, writable: true });
     rooms.push(room);
     linkCount.set(id, 0);
     return room;
@@ -182,6 +431,7 @@ export function generateDungeon(depth, rng) {
 
   function unplaceRoom(room) {
     for (const i of room._cells) { tiles[i] = TILE.WALL; roomIdGrid[i] = -1; }
+    for (const i of room._core) reserved[i] = 0;
     rooms.pop();
     linkCount.delete(room.id);
   }
@@ -194,7 +444,7 @@ export function generateDungeon(depth, rng) {
       const x = i % width, y = (i / width) | 0;
       for (const [dx, dy] of DIR4) {
         const sx = x + dx, sy = y + dy;
-        if (!interior(sx, sy) || roomIdGrid[idx(sx, sy)] === id) continue;
+        if (!interior(sx, sy) || roomIdGrid[idx(sx, sy)] === id || reserved[idx(sx, sy)]) continue;
         const px = dy, py = dx; // perpendicular
         if (!inBounds(sx + px, sy + py) || !inBounds(sx - px, sy - py)) continue;
         if (roomIdGrid[idx(sx + px, sy + py)] === id || roomIdGrid[idx(sx - px, sy - py)] === id) continue;
@@ -213,7 +463,7 @@ export function generateDungeon(depth, rng) {
     for (let k = 0; k <= last; k++) {
       const i = cells[k];
       const x = i % width, y = (i / width) | 0;
-      if (!interior(x, y) || tiles[i] !== TILE.WALL) return false;
+      if (!interior(x, y) || tiles[i] !== TILE.WALL || reserved[i]) return false;
       for (const [dx, dy] of DIR8) {
         const ni = idx(x + dx, y + dy);
         if (set.has(ni) || tiles[ni] === TILE.WALL) continue;
@@ -299,7 +549,7 @@ export function generateDungeon(depth, rng) {
     linkCount.set(B.id, linkCount.get(B.id) + 1);
 
     // occasionally widen a straight corridor body to 2 tiles (doorways stay 1 wide)
-    if (straightPerp && cells.length >= 4 && rng.chance(0.3)) {
+    if (straightPerp && cells.length >= 4 && rng.chance(profile.widen)) {
       const body = cells.slice(1, -1);
       const sides = rng.chance(0.5) ? [1, -1] : [-1, 1];
       for (const s of sides) {
@@ -309,7 +559,7 @@ export function generateDungeon(depth, rng) {
         let ok = true;
         for (const i of lane) {
           const x = i % width, y = (i / width) | 0;
-          if (!interior(x, y) || tiles[i] !== TILE.WALL) { ok = false; break; }
+          if (!interior(x, y) || tiles[i] !== TILE.WALL || reserved[i]) { ok = false; break; }
           for (const [dx, dy] of DIR8) {
             const ni = idx(x + dx, y + dy);
             if (!set.has(ni) && tiles[ni] !== TILE.WALL) { ok = false; break; }
@@ -322,41 +572,69 @@ export function generateDungeon(depth, rng) {
   }
 
   function pickCategory() {
-    return rng.weighted(['small', 'medium', 'large'], c => ({ small: 18, medium: 44, large: 38 }[c]));
+    return rng.weighted(['small', 'medium', 'large'], c => profile.sizeMix[c]);
+  }
+  const pickGap = () => (rng.chance(profile.sharedWall) ? 1 : rng.int(profile.gap[0], profile.gap[1]));
+
+  // Attach a new room of size `cat` to `parent` on a random side, `gap` tiles out; kept only if its link carves.
+  const treeDepth = new Map(); // spanning-tree depth per room id ('deep' parent weighting)
+  function tryAttach(parent, cat, gap) {
+    const shape = makeShape(rng, cat, { profile });
+    const [dx, dy] = rng.pick(DIR4);
+    let ox, oy;
+    if (dx !== 0) {
+      ox = dx > 0 ? parent.x + parent.w + gap : parent.x - gap - shape.w;
+      oy = rng.int(parent.y - shape.h + 3, parent.y + parent.h - 3);
+    } else {
+      oy = dy > 0 ? parent.y + parent.h + gap : parent.y - gap - shape.h;
+      ox = rng.int(parent.x - shape.w + 3, parent.x + parent.w - 3);
+    }
+    if (!canPlace(shape, ox, oy)) return null;
+    const room = placeRoom(shape, ox, oy, cat);
+    if (!connect(parent, room, gap + 6, false) && !connect(parent, room, gap + 8, true)) { unplaceRoom(room); return null; }
+    treeDepth.set(room.id, treeDepth.get(parent.id) + 1);
+    return room;
   }
 
   const target = targetRoomCount(depth);
   {
-    // first room near the centre
+    // Seed room near the centre. On non-boss depths it may roll the 'grand' landmark size (§17.13); boss depths are
+    // left alone until the boss-arena seed room (§17.15) takes this slot.
+    const bossDepth = depth % 5 === 0;
+    const firstCat = !bossDepth && rng.chance(profile.grand) ? 'grand' : 'large';
     for (let t = 0; t < 40 && rooms.length === 0; t++) {
-      const shape = makeShape(rng, t < 20 ? 'large' : 'medium');
+      const cat = t < 20 ? firstCat : 'medium';
+      const shape = makeShape(rng, cat, { profile });
       const ox = Math.floor(width / 2 - shape.w / 2) + rng.int(-6, 6);
       const oy = Math.floor(height / 2 - shape.h / 2) + rng.int(-6, 6);
-      if (canPlace(shape, ox, oy)) placeRoom(shape, ox, oy, t < 20 ? 'large' : 'medium');
+      if (canPlace(shape, ox, oy)) { placeRoom(shape, ox, oy, cat); treeDepth.set(0, 0); }
     }
     let attempts = 0;
     const maxAttempts = target * 50;
     while (rooms.length < target && attempts < maxAttempts) {
       attempts++;
-      // prefer parents with few links so the tree spreads out rather than forming one chain
       const open = rooms.filter(r => linkCount.get(r.id) < LINK_CAP[r.size]);
       if (!open.length) break;
-      const parent = rng.weighted(open, r => 1 / (1 + linkCount.get(r.id)));
+      // 'spread': prefer parents with few links so the tree spreads out rather than forming one chain (a compact
+      // blob). 'deep': prefer the deepest spanning-tree nodes, growing a few long branches instead.
+      const parent = profile.parent === 'deep'
+        ? rng.weighted(open, r => (1 + treeDepth.get(r.id)) ** 2)
+        : rng.weighted(open, r => 1 / (1 + linkCount.get(r.id)));
       const cat = pickCategory();
-      const shape = makeShape(rng, cat);
-      const [dx, dy] = rng.pick(DIR4);
-      const gap = rng.chance(0.3) ? 1 : rng.int(3, 7);
-      let ox, oy;
-      if (dx !== 0) {
-        ox = dx > 0 ? parent.x + parent.w + gap : parent.x - gap - shape.w;
-        oy = rng.int(parent.y - shape.h + 3, parent.y + parent.h - 3);
-      } else {
-        oy = dy > 0 ? parent.y + parent.h + gap : parent.y - gap - shape.h;
-        ox = rng.int(parent.x - shape.w + 3, parent.x + parent.w - 3);
+      const room = tryAttach(parent, cat, pickGap());
+      if (!room || cat !== 'small' || !rng.chance(profile.cluster)) continue;
+      // Cluster mode: grow 2-4 more small rooms straight off this one (shared walls, gap 1), each attached to a
+      // cluster member that still has link room — cell blocks, crypt rows, barracks suites.
+      const members = [room];
+      let want = rng.int(2, 4);
+      for (let tries = 0; want > 0 && tries < 24 && rooms.length < target; tries++) {
+        const openM = members.filter(r => linkCount.get(r.id) < LINK_CAP.small);
+        if (!openM.length) break;
+        // mostly the newest member (rows), sometimes any open one (branching blocks)
+        const anchor = rng.chance(0.7) ? openM[openM.length - 1] : rng.pick(openM);
+        const next = tryAttach(anchor, 'small', 1);
+        if (next) { members.push(next); want--; }
       }
-      if (!canPlace(shape, ox, oy)) continue;
-      const room = placeRoom(shape, ox, oy, cat);
-      if (!connect(parent, room, gap + 6, false) && !connect(parent, room, gap + 8, true)) unplaceRoom(room);
     }
   }
 
@@ -374,7 +652,7 @@ export function generateDungeon(depth, rng) {
     }
     pairs.sort((p, q) => p.g - q.g);
 
-    let loops = Math.max(2, Math.round(rooms.length * 0.25));
+    let loops = Math.max(2, Math.round(rooms.length * profile.loops));
     for (const p of pairs) {
       if (loops <= 0) break;
       if (links.has(linkKey(p.a.id, p.b.id))) continue;
@@ -385,7 +663,7 @@ export function generateDungeon(depth, rng) {
     const want = new Map();
     for (const r of rooms) {
       let t;
-      if (r.size === 'large') t = rng.int(2, 4);
+      if (isBig(r)) t = rng.int(2, 4);
       else if (r.size === 'medium') t = rng.int(1, 3);
       else t = rng.chance(0.2) ? 2 : 1;
       want.set(r.id, t);
@@ -401,7 +679,7 @@ export function generateDungeon(depth, rng) {
     }
     // large rooms still stuck at one link: allow a somewhat longer connector
     for (const r of rooms) {
-      if (r.size !== 'large' || linkCount.get(r.id) >= 2) continue;
+      if (!isBig(r) || linkCount.get(r.id) >= 2) continue;
       const others = rooms.filter(o => o !== r && !links.has(linkKey(r.id, o.id)) && linkCount.get(o.id) < LINK_CAP[o.size])
         .map(o => ({ o, g: bboxGap(r, o) })).filter(e => e.g <= 16).sort((p, q) => p.g - q.g);
       for (const e of others) if (connect(r, e.o, 20, true)) break;
@@ -479,11 +757,12 @@ export function generateDungeon(depth, rng) {
     if (ox > 0 || oy > 0 || nw < width || nh < height) {
       const nt = new Uint8Array(nw * nh).fill(TILE.WALL);
       const nr = new Int32Array(nw * nh).fill(-1);
+      const nres = new Uint8Array(nw * nh);
       for (let y = 1; y < nh - 1; y++) for (let x = 1; x < nw - 1; x++) {
         const oi = (y + oy) * width + (x + ox);
-        nt[y * nw + x] = tiles[oi]; nr[y * nw + x] = roomIdGrid[oi];
+        nt[y * nw + x] = tiles[oi]; nr[y * nw + x] = roomIdGrid[oi]; nres[y * nw + x] = reserved[oi];
       }
-      tiles = nt; roomIdGrid = nr; width = nw; height = nh;
+      tiles = nt; roomIdGrid = nr; reserved = nres; width = nw; height = nh;
       for (const r of rooms) {
         r.x -= ox; r.y -= oy; r.cx -= ox; r.cy -= oy;
         for (const d of r.doors) { d.x -= ox; d.y -= oy; }
@@ -517,7 +796,7 @@ export function generateDungeon(depth, rng) {
         if (tiles[i] !== TILE.FLOOR || roomIdGrid[i] !== room.id) continue;
         for (const [dx, dy, weight] of NICHE_DIRS) {
           const nx = x + dx, ny = y + dy;
-          if (!interior(nx, ny) || tiles[idx(nx, ny)] !== TILE.WALL) continue;
+          if (!interior(nx, ny) || tiles[idx(nx, ny)] !== TILE.WALL || reserved[idx(nx, ny)]) continue;
           const px = dy, py = dx; // perpendicular to the cubby's axis
           // Solid rock on both sides of the cubby and behind it.
           const rock = [[px, py], [-px, -py], [dx, dy], [dx + px, dy + py], [dx - px, dy - py]];
@@ -570,7 +849,7 @@ export function generateDungeon(depth, rng) {
   }
 
   // ---------- 6. Start room / entrance ----------
-  const startCandidates = rooms.filter(r => r.size !== 'large');
+  const startCandidates = rooms.filter(r => !isBig(r));
   const startRoom = rng.pick(startCandidates.length ? startCandidates : rooms);
   startRoom.kind = 'start';
   const entrance = findNiche(startRoom);
@@ -674,6 +953,7 @@ export function generateDungeon(depth, rng) {
 
   const map = {
     width, height, tiles, visible, explored, rooms, entrance, exits,
+    archetype, // this depth's generation profile (§17.13); a data hook only — nothing renders differently yet
     // Hidden treasure-room doorways (§17.11): WALL tiles until revealed. [{ x, y, roomId, revealed }]
     secrets,
     idx(x, y) { return y * width + x; },

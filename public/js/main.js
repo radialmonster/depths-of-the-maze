@@ -446,7 +446,8 @@ function continueGame(data) {
 function loadDepth(depth) {
   game.depth = depth;
   game.stats.deepest = Math.max(game.stats.deepest, depth);
-  game.map = generateDungeon(depth, game.rng);
+  // The outgoing floor's archetype, so consecutive depths never share one (§17.13).
+  game.map = generateDungeon(depth, game.rng, { prevArchetype: game.map?.archetype });
   game.projectiles = [];
   game.groundItems = [];
 

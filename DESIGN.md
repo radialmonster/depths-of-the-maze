@@ -106,7 +106,7 @@ projectile's current position (with 0.25-tile substeps an arrow enters a tile 2 
 
 ## 7. Map (map.js)
 ```js
-export function generateDungeon(depth, rng) -> map
+export function generateDungeon(depth, rng, opts?) -> map  // opts.prevArchetype: previous depth's map.archetype (§17.13)
 export function computeFOV(map, x, y, radius)   // updates map.visible (clears first) and ORs into map.explored
 map = {
   width, height,               // grows with depth, cropped to the used area (§17.13/§17.14 grow this further than
@@ -890,6 +890,39 @@ changed room *count*, not *feel*. Fixed by making those constants per-depth inst
   boss depths the seed room is the boss arena instead (§17.15) — the two are mutually exclusive per depth.
 - **Room count**: base curve raised to `min(22, 11 + floor((depth-1)*0.6))` (§7) — confirmed headroom: 24-28 rooms
   place at 100% success within the existing 86-tile generation cap, cropping to ~81-82 tiles, ~2ms per map.
+
+**Implementation notes (built — archetypes, shapes, cluster mode, grand seed, room count; §17.14/§17.15 not yet):**
+- **No-repeat mechanism:** `generateDungeon` stays pure, so it can't remember the last floor itself — it takes
+  `opts.prevArchetype` (main.js passes the outgoing `game.map.archetype`) and `pickArchetype(rng, prev)` draws
+  uniformly from the other four. After a save/continue the restored depth has no "previous" in memory, so a repeat
+  across that one boundary is possible (the archetype isn't saved; not worth a save-format change).
+- **Table interpretations** (the table doesn't pin these, so they're choices, recorded here): "Halls/Wings — today's
+  catalog, evenly" is read as the *full* post-§17.13 catalog at even weights (otherwise octagon and split hall would
+  never appear anywhere). "Favored" shapes take a share of each size category's roll: Catacombs rect+cross 75%,
+  Keep rect/pillars/ringHall 2 : gallery 1 at 75% (gallery at equal weight made 1 in 4 Keep medium rooms a gallery),
+  Caverns cave+cavern 72% of the medium/large roll, which lands ~57-60% of all Caverns rooms since small rooms can't be
+  caves. Unstated values: Wings shared-wall chance 20%; Caverns 2-wide corridor chance 60% (vs 30%); grand seed chance
+  20% on non-Keep archetypes, 100% on Keep (always off on boss depths).
+- **Shapes & size classes:** small = rect/cross; medium adds Lshape/overlap/cave/octagon/gallery/splitHall/cavern;
+  large adds pillars/ringHall; grand = ringHall/pillars. "cross / T" is one shape id, `cross` (a T is its variant),
+  matching §7's id list; the old internal `'L'` id became `Lshape` to match too. Galleries keep the rolled size label
+  (medium/large) for link caps. `'grand'` rooms use the large link cap/targets and are excluded from start rooms.
+- **Core tiles** (the ring-hall guard): every shape carries `core` — its ring-hall centre, split-hall divider, and any
+  enclosed rock found automatically (pillars, cavern islands). A `reserved` grid marks them on placement; doorSlots,
+  corridor validation, corridor widening, stair cubbies and other rooms' placement all refuse reserved tiles.
+- **Cavern:** ellipse-biased noise, 4 CA passes, spike trim, largest 4-connected component, 0-2 small rock islands;
+  rejected unless it fills ≥45% of its box and has a door slot facing all four ways (12 tries, then falls back to
+  `cave` — ~0-6% of rolls, medium boxes being the tighter case).
+- **Cluster mode:** on trigger, 2-4 more small rooms at gap 1, each attached to the newest cluster member (70%) or a
+  random one that still has link room — the small-room link cap of 2 means "all attached to the first room" could
+  only ever add one, so the cluster grows as rows/branches instead.
+- **Wings parent weight:** `(1 + treeDepth)²`. Measured effect is modest (~+10% entrance-to-exit walk vs Halls at
+  equal canvas size) because the unchanged link top-up pass re-joins neighbouring branches; revisit if Wings doesn't
+  read as "long branches" in play.
+- **Measured** (1200 floors, depths 1-30): 99.8-99.9% of floors place the full room count (the rare miss is a
+  wide-gap Wings layout); generation p50 ~1.7 ms, p99 ~8 ms. Side effect on §17.11's hidden room: more rooms mean more
+  dead ends, so hidden rooms now land on ~38% of depths (was ~33%) and any treasure room on ~62% (was ~54%) — left
+  alone since §17.14 replaces this selection anyway.
 
 ### 17.14 Treasure tiers: Cache / Hoard / Vault
 Replaces the single flat "one treasure room" concept (the original, pre-tier Phase 6 version, §17.11) with three
