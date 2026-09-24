@@ -127,7 +127,7 @@ map = {
              antechamber?:true /*a Vault's guard room: kind 'treasure', treasureTier 'vault', no chests*/,
              antechamberId? /*on a Vault that sits behind an antechamber: that room's id*/ }],
              // shape is the room-shape function's own id (rect/pillars/Lshape/overlap/cave/cross/octagon/gallery/
-             // ringHall/splitHall/cavern, §17.13) — carried through so a future visual/texture pass has a real hook,
+             // ringHall/splitHall/cavern, §17.13; boss arenas: sump/ossuaryHall/arena, §17.15) — carried through so a future visual/texture pass has a real hook,
              // same idea as archetype/treasureTier/arena; none of these fields currently change rendering
   entrance: {x, y, dir, front, freestanding?}, // ENTRANCE tile: a cubby in the start room's wall (up-stairs);
                                // dir = unit step from the cubby into the room, front = floor tile in front (player spawn)
@@ -136,7 +136,7 @@ map = {
   secretAt(x,y), revealSecret(x,y) -> secret|null,  // reveal = WALL -> DOOR (main.js calls it, then renderer.revealTile)
   idx(x,y), inBounds(x,y), get(x,y), isWalkable(x,y), isOpaque(x,y),
   spawnCandidates(rng, count, minDistFromEntrance) -> [{x,y,roomId}] // floor tiles for enemies/loot — never in the
-                               // start room, a treasure wing or the merchant room
+                               // start room, a treasure wing, the merchant room or the boss arena
   roomTiles(roomId) -> [{x,y}], roomAt(x,y) -> room|null,  // a room's own FLOOR tiles / which room a floor tile is in
   merchantRoomId,              // opts.merchant: the merchant's room (kind 'merchant'; the start room if no normal room)
   baseRoomCount,               // rooms[0..baseRoomCount) are growth rooms; the rest are treasure wings
@@ -1072,6 +1072,41 @@ since map.js may only import from core.js, and both enemies.js and map.js need t
   for a future visual/theming pass — deliberately not built this pass (no textures/graphics work, per the original
   brief). `room.size` stays `'large'` so existing size-based logic elsewhere keeps working.
 - **Reaching the arena stays optional** — descending was never gated on the boss (`descend()`), and stays that way.
+
+**Implementation notes (Phase 3 — built):**
+- core.js: `BOSS_DEPTH_INTERVAL`, `isBossDepth(depth)`, `bossForDepth(depth)` (was enemies.js `pickBossId`; same
+  mapping on boss depths, and it now returns `null` on non-boss depths). map.js: `BOSS_ARENAS`, `GENERIC_ARENA`,
+  `ARENA_MIN`, `ARENA_LINK_CAP`, `ARENA_SHAPES`, `arenaSpec`, `makeArenaShape(rng, bossId)`, `arenaStats(shape)`,
+  `arenaMeetsMinimum(shape)`, `arenaDoorSides(shape)`.
+- **Shape ids:** `room.shape` is `'sump'` / `'ossuaryHall'` / `'arena'` (generic). `room.arena` is always the boss type
+  id, including on the generic fallback (the shape id tells you whether a custom entry was used).
+- **Ossuary Hall colonnade breaks at the centre (deviation):** a 13-15 wide hall with pillar rows 3 tiles in from each
+  long wall puts every pillar 3-4 tiles from the centre row, which is inside the required clear 9x9 core. The core
+  requirement is the hard minimum, so the colonnade leaves a 9+ tile open crossing at the centre. Pillars (a pillar
+  every other tile) stand only in the two end bays, at least 5 tiles from the boss's spawn point. The central aisle
+  between the rows and the 3-wide side aisles are kept as specified.
+- **Sump:** a smooth threshold ellipse (17-19 x 15-17), plus 3-4 single or 1x2 rock islands 6-6.8 tiles out on the four
+  diagonals, so none stands in front of an end doorway. Each island has a full ring of open floor. Measured floor is
+  201-252 tiles (p50 ~220); the clear core is always radius 4.
+- **Every arena shape is validated:** it is rebuilt until `arenaMeetsMinimum` holds (box, floor, clear-core radius >= 4
+  around room.cx/cy, and a door slot on each short end). The generic rectangle is the last resort (0 fallbacks in 10k
+  rolls).
+- **Doorways:** the arena carries a link cap of 2 and its door slots are limited to the two long-axis ends, one
+  doorway per end. Right after placement, one room is grown off each end before normal growth starts. Measured over
+  2400 boss floors: every arena got 2 links, always on opposite ends. Loops and link top-ups can't add more.
+- **Room count:** the arena is one room *on top of* the base count (`targetRoomCount(depth) + 1` on boss depths), as
+  §7 says, so a boss floor keeps the same number of populated rooms as a non-boss floor.
+- **Start room:** the old code did *not* pick the start room "from the third farthest from the boss". It picked a random
+  non-large room, and the boss room was chosen later from the far third of the exits' distance ranking. So on boss depths
+  the start room is now a random small/medium room from the third of rooms farthest (BFS walking distance) from the
+  arena, falling back to the farthest small/medium room (2399/2400 floors used the far third). Non-boss depths are unchanged.
+- **Population:** the arena is excluded from `populatedFloor` and `spawnCandidates`, and general spawns (incl. bat
+  swarms, exit sentries) keep out of it. The boss spawns on the arena centre; its 2-4 guards are placed only on arena
+  tiles and carry `enemy.bossGuard = true`. They're still on top of `computeSpawnCount` until §17.16 rescales it.
+- **Measured** (12,000 floors, depths 1-30, 400 seeded runs): 0 failures on minimum size / clear core / shape-per-boss /
+  doors / wings / stairs / merchant / spawn / reachability. Grand seed rooms unaffected (36% of non-boss depths, 100% of
+  non-boss Keep depths). Generation p50 2.2 ms / p99 ~10.7 ms overall; boss depths p50 2.5 ms / p99 ~13 ms (+0.4 ms
+  p50 vs before: one extra room plus the arena).
 
 ### 17.16 Enemy density scales with floor size, not just depth
 `computeSpawnCount(depth)` (enemies.js) used to depend only on depth, which made sense while every floor was

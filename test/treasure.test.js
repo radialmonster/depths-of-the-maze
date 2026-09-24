@@ -307,9 +307,9 @@ test('merchant depth: a dedicated kind:"merchant" room, never a wing parent, wit
   assert.equal(generateDungeon(4, new RNG(1)).merchantRoomId, null, 'no merchant room unless asked for');
 });
 
-test('populatedFloor = floor tiles outside the treasure wings and the merchant room', () => {
+test('populatedFloor = floor tiles outside the treasure wings, the merchant room and the boss arena', () => {
   for (const { map } of MAPS) {
-    const skip = new Set(map.rooms.filter((r) => r.kind === 'treasure').map((r) => r.id));
+    const skip = new Set(map.rooms.filter((r) => r.kind === 'treasure' || r.kind === 'boss').map((r) => r.id));
     if (map.merchantRoomId != null) skip.add(map.merchantRoomId);
     let n = 0;
     for (let y = 0; y < map.height; y++) for (let x = 0; x < map.width; x++) {

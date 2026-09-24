@@ -14,8 +14,9 @@
 //     with 1-2 gaps) and cellular-automata caverns. Walls inside a room (core, divider, pillars,
 //     rock islands) are 'core' tiles: never a doorway, corridor or stair cubby.
 //     Sizes: small 5-7, medium 8-11 x 8-10, large 12-18 x 10-14 (galleries 3-5 x 14-22).
-//  2. Growth placement = spanning tree. The first room goes near the map centre (on non-boss depths it
-//     may be a 'grand' 20-26 x 14-20 landmark); each new room is attached to an existing room on one
+//  2. Growth placement = spanning tree. The first room goes near the map centre: on a boss depth it is the boss
+//     arena (§17.15, BOSS_ARENAS: link cap 2, doorways only on its two short ends, one room grown off each), otherwise
+//     it may be a 'grand' 20-26 x 14-20 landmark; each new room is attached to an existing room on one
 //     side, either sharing a wall (gap 1 -> a single doorway in the common wall) or a few tiles away
 //     (short straight corridor). A room is kept only if every floor tile has a full wall ring (no two
 //     spaces ever merge) and the link to its parent can be carved. The attachment links
@@ -29,7 +30,8 @@
 //     are topped up toward 2-4 links (large/grand) / 1-3 links (medium) with nearby rooms
 //     (caps: 4 large/grand / 3 medium / 2 small). No corridor ever dead-ends.
 //  5. A BFS safety net force-carves a corridor to any stray component (a no-op in practice).
-//  6. Start room (entrance), 1-3 exit rooms from the farthest third, every 5th depth the boss room, and (opts.merchant)
+//  6. Start room (entrance; on a boss depth from the third of rooms farthest from the arena), 1-3 exit rooms from the
+//     farthest third (never the arena), and (opts.merchant)
 //     a spawn-free 'merchant' room — then a detour ranking of every room (how far off the entrance->exit route it
 //     is), all on the uncropped grid. Each stair tile is a one-tile cubby cut into the room's wall (findNiche),
 //     preferring the camera-facing north wall.
@@ -38,7 +40,7 @@
 //  8. Hidden-room modifier (§17.11): one Cache/Hoard's doorway becomes a secret wall (map.secrets / revealSecret).
 //  9. Crop to the used area plus a 1-tile WALL border — last. Then chest spots and spawn caches.
 
-import { TILE } from './core.js';
+import { TILE, bossForDepth } from './core.js';
 
 const DIR4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
 const LINK_CAP = { small: 2, medium: 3, large: 4, grand: 4 }; // max rooms linked to one room
@@ -416,6 +418,130 @@ export function makeShape(rng, cat, opts = {}) {
   return normalizeShape(w, h, mask, pillars, type, core);
 }
 
+// ---------- Boss arenas (§17.15) ----------
+// On a boss depth the seed room is a purpose-built arena shaped for that boss (BOSS_ARENAS), not whichever room the
+// boss happened to land in. Minimum, derived from the bosses' own attack numbers (§17.15): a 16x13 box, >= 180 floor
+// tiles, and a clear 9x9 core (Chebyshev radius 4, no pillar/rock) around the boss's spawn point — the room centre,
+// the same tile placeRoom makes room.cx/cy. Every arena is room.size 'large' with a link cap of 2 and doorways only on
+// its two short ends (the ends of its long axis), so the level grows outward from both sides.
+export const ARENA_MIN = Object.freeze({ long: 16, short: 13, floor: 180, clearRadius: 4 });
+export const ARENA_LINK_CAP = 2;
+// shape: the room.shape id it builds; w/h: size ranges (long x short, before a random 90° turn).
+export const BOSS_ARENAS = Object.freeze({
+  // Slime King — "Sump": a smooth, open ellipse whose ~8-tile radius matches Glob Spray's range (8, enemies.js), with
+  // 3-4 lone rock islands >= 6 tiles out on the diagonals as cover, each with open floor all round it.
+  slime_king: Object.freeze({ name: 'Sump', shape: 'sump', w: [17, 19], h: [15, 17] }),
+  // Bone Tyrant — "Ossuary Hall": a long hall with a two-row colonnade 3 tiles in from each long wall. The colonnade
+  // breaks for the clear 9x9 crossing at the centre (a 13-15 wide hall can't fit both the rows and the core), so the
+  // pillars stand in the two end bays — where spear lanes stop on them and a Bone Charge baited into one ends early.
+  bone_tyrant: Object.freeze({ name: 'Ossuary Hall', shape: 'ossuaryHall', w: [20, 24], h: [13, 15] }),
+});
+// Any boss without its own entry yet: a plain 17x15 rectangle (clear core by construction).
+export const GENERIC_ARENA = Object.freeze({ name: 'Arena', shape: 'arena', w: [17, 17], h: [15, 15] });
+export const ARENA_SHAPES = Object.freeze(['sump', 'ossuaryHall', 'arena']);
+export const arenaSpec = (bossId) => BOSS_ARENAS[bossId] || GENERIC_ARENA;
+
+// Measurements of an arena shape against ARENA_MIN: box (long/short side), floor tiles, and the clear-core radius —
+// the largest Chebyshev radius around the spawn tile ((w-1)>>1, (h-1)>>1) that is all floor. endSlots: door slots on
+// each short end (the two ends of the long axis).
+export function arenaStats(shape) {
+  const { w, h, mask } = shape;
+  let floor = 0;
+  for (let i = 0; i < w * h; i++) floor += mask[i];
+  const sx = (w - 1) >> 1, sy = (h - 1) >> 1;
+  const isFloor = (x, y) => x >= 0 && y >= 0 && x < w && y < h && mask[y * w + x] === 1;
+  let clearRadius = -1;
+  for (let r = 0; r <= Math.max(w, h); r++) {
+    let ok = true;
+    for (let y = sy - r; y <= sy + r && ok; y++) for (let x = sx - r; x <= sx + r; x++) if (!isFloor(x, y)) { ok = false; break; }
+    if (!ok) break;
+    clearRadius = r;
+  }
+  const horiz = w >= h;
+  const slots = shapeDoorSlots(shape);
+  const endSlots = horiz
+    ? [slots.filter(s => s.dx === -1).length, slots.filter(s => s.dx === 1).length]
+    : [slots.filter(s => s.dy === -1).length, slots.filter(s => s.dy === 1).length];
+  return { long: Math.max(w, h), short: Math.min(w, h), floor, clearRadius, spawn: { x: sx, y: sy }, endSlots };
+}
+export function arenaMeetsMinimum(shape) {
+  const s = arenaStats(shape);
+  return s.long >= ARENA_MIN.long && s.short >= ARENA_MIN.short && s.floor >= ARENA_MIN.floor
+    && s.clearRadius >= ARENA_MIN.clearRadius && s.endSlots.every(n => n > 0);
+}
+// The two sides an arena's doorways may use: the ends of its long axis.
+export function arenaDoorSides(shape) {
+  return shape.w >= shape.h ? [[-1, 0], [1, 0]] : [[0, -1], [0, 1]];
+}
+
+// The arena for `bossId` (opts.type forces a shape id — tests). Built long-axis horizontal, then turned 90° half the
+// time. Rebuilt until it passes arenaMeetsMinimum; the generic rectangle (which always does) is the last resort.
+export function makeArenaShape(rng, bossId, opts = {}) {
+  const spec = opts.type ? (Object.values(BOSS_ARENAS).find(a => a.shape === opts.type) || GENERIC_ARENA) : arenaSpec(bossId);
+  for (let attempt = 0; attempt < 30; attempt++) {
+    let w = rng.int(spec.w[0], spec.w[1]), h = rng.int(spec.h[0], spec.h[1]);
+    if (h > w) [w, h] = [h, w];
+    const mask = new Uint8Array(w * h);
+    const pillars = [];
+    const cx = (w - 1) >> 1, cy = (h - 1) >> 1;
+    if (spec.shape === 'sump') {
+      const a = w / 2, b = h / 2;
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const nx = (x + 0.5 - a) / a, ny = (y + 0.5 - b) / b;
+        if (nx * nx + ny * ny <= 1) mask[y * w + x] = 1;
+      }
+      // islands on the four diagonals (so none stands in front of an end doorway), 3 or 4 of them
+      const want = rng.int(3, 4);
+      const quads = rng.shuffle([0, 1, 2, 3]).slice(0, want);
+      const taken = [];
+      for (const q of quads) {
+        for (let t = 0; t < 16; t++) {
+          const ang = Math.PI / 4 + q * Math.PI / 2 + rng.range(-0.3, 0.3);
+          const r = rng.range(6, 6.8);
+          const iw = rng.chance(0.35) ? 2 : 1, ih = iw === 1 && rng.chance(0.35) ? 2 : 1;
+          const ix = Math.round(cx + Math.cos(ang) * r), iy = Math.round(cy + Math.sin(ang) * r);
+          const cells = [];
+          for (let y = iy; y < iy + ih; y++) for (let x = ix; x < ix + iw; x++) cells.push([x, y]);
+          // >= 6 tiles from the centre, and a full ring of open floor round it (cover you can always walk around)
+          if (cells.some(([x, y]) => Math.hypot(x - cx, y - cy) < 6)) continue;
+          let ok = true;
+          for (let y = iy - 1; y <= iy + ih && ok; y++) for (let x = ix - 1; x <= ix + iw; x++) {
+            if (!isMaskFloor(mask, w, h, x, y)) { ok = false; break; }
+          }
+          if (!ok || taken.some(([x, y]) => x >= ix - 3 && x <= ix + iw + 2 && y >= iy - 3 && y <= iy + ih + 2)) continue;
+          for (const [x, y] of cells) { mask[y * w + x] = 0; taken.push([x, y]); }
+          pillars.push(...cells);
+          break;
+        }
+      }
+    } else {
+      mask.fill(1);
+      if (spec.shape === 'ossuaryHall') {
+        // two colonnade rows 3 tiles in from each long wall, a pillar every other tile, broken for the clear core
+        const rows = [3, h - 4];
+        for (let x = 2; x <= cx - (ARENA_MIN.clearRadius + 1); x += 2) {
+          for (const px of [x, w - 1 - x]) for (const py of rows) { mask[py * w + px] = 0; pillars.push([px, py]); }
+        }
+      }
+    }
+    let shape = normalizeShape(w, h, mask, pillars, spec.shape);
+    if (rng.chance(0.5)) shape = transposeShape(shape);
+    if (arenaMeetsMinimum(shape)) return shape;
+  }
+  return opts.type || spec === GENERIC_ARENA ? null : makeArenaShape(rng, null);
+}
+function isMaskFloor(mask, w, h, x, y) { return x >= 0 && y >= 0 && x < w && y < h && mask[y * w + x] === 1; }
+// A shape turned 90° (mirrored across its diagonal): w/h, mask, pillars and core swap axes.
+function transposeShape(s) {
+  const mask = new Uint8Array(s.w * s.h);
+  for (let y = 0; y < s.h; y++) for (let x = 0; x < s.w; x++) mask[x * s.h + y] = s.mask[y * s.w + x];
+  return {
+    w: s.h, h: s.w, mask, type: s.type,
+    pillars: s.pillars.map(([x, y]) => [y, x]),
+    core: s.core.map(([x, y]) => [y, x]).sort((a, b) => (a[1] * s.h + a[0]) - (b[1] * s.h + b[0])),
+  };
+}
+
 // opts.prevArchetype: the previous depth's map.archetype, so this depth never repeats it (§17.13).
 // opts.merchant: this is a merchant depth — reserve the merchant's room (map.merchantRoomId).
 export function generateDungeon(depth, rng, opts = {}) {
@@ -434,6 +560,8 @@ export function generateDungeon(depth, rng, opts = {}) {
   const links = new Set(); // "a|b" with a<b
   const linkKey = (a, b) => (a < b ? `${a}|${b}` : `${b}|${a}`);
   const linkCount = new Map();
+  // A room's link cap: its size's, unless it carries its own (the boss arena's is ARENA_LINK_CAP).
+  const linkCap = (r) => r._linkCap ?? LINK_CAP[r.size];
 
   // ---------- 1+2. Room placement ----------
   function canPlace(shape, ox, oy) {
@@ -493,13 +621,27 @@ export function generateDungeon(depth, rng, opts = {}) {
     linkCount.delete(room.id);
   }
 
+  // The sides (unit [dx,dy]) a room with restricted doorways (_doorSides: the boss arena's two short ends) may still
+  // open a doorway on: one doorway per side, so its two links always leave from opposite ends.
+  function openDoorSides(room) {
+    const used = new Set();
+    for (const d of room.doors) {
+      for (const [dx, dy] of DIR4) {
+        const ix = d.x - dx, iy = d.y - dy;
+        if (inBounds(ix, iy) && roomIdGrid[idx(ix, iy)] === room.id) used.add(dx + ',' + dy);
+      }
+    }
+    return room._doorSides.filter(([dx, dy]) => !used.has(dx + ',' + dy));
+  }
+
   // Door slots: wall tiles directly outside a straight stretch of the room's edge.
   function doorSlots(room) {
     const out = [];
     const id = room.id;
+    const sides = room._doorSides ? openDoorSides(room) : DIR4;
     for (const i of room._cells) {
       const x = i % width, y = (i / width) | 0;
-      for (const [dx, dy] of DIR4) {
+      for (const [dx, dy] of sides) {
         const sx = x + dx, sy = y + dy;
         if (!interior(sx, sy) || roomIdGrid[idx(sx, sy)] === id || reserved[idx(sx, sy)]) continue;
         const px = dy, py = dx; // perpendicular
@@ -633,11 +775,14 @@ export function generateDungeon(depth, rng, opts = {}) {
   }
   const pickGap = () => (rng.chance(profile.sharedWall) ? 1 : rng.int(profile.gap[0], profile.gap[1]));
 
-  // Attach a new room of size `cat` to `parent` on a random side, `gap` tiles out; kept only if its link carves.
+  // Attach a new room of size `cat` to `parent` on a random side (or `side`), `gap` tiles out; kept only if its link
+  // carves. A parent with restricted doorways (the boss arena) only grows rooms off its still-open ends.
   const treeDepth = new Map(); // spanning-tree depth per room id ('deep' parent weighting)
-  function tryAttach(parent, cat, gap) {
+  function tryAttach(parent, cat, gap, side = null) {
+    const sides = parent._doorSides ? openDoorSides(parent) : DIR4;
+    if (!sides.length) return null;
     const shape = makeShape(rng, cat, { profile });
-    const [dx, dy] = rng.pick(DIR4);
+    const [dx, dy] = side || rng.pick(sides);
     let ox, oy;
     if (dx !== 0) {
       ox = dx > 0 ? parent.x + parent.w + gap : parent.x - gap - shape.w;
@@ -653,24 +798,51 @@ export function generateDungeon(depth, rng, opts = {}) {
     return room;
   }
 
-  const target = targetRoomCount(depth);
+  // Boss depths (§17.15): the seed room is the boss arena, and it's one room on top of the base count (§7), so the
+  // rest of the floor keeps the same number of rooms as a non-boss depth.
+  const bossId = bossForDepth(depth);
+  let arena = null;
+  const target = targetRoomCount(depth) + (bossId ? 1 : 0);
   {
-    // Seed room near the centre. On non-boss depths it may roll the 'grand' landmark size (§17.13); boss depths are
-    // left alone until the boss-arena seed room (§17.15) takes this slot.
-    const bossDepth = depth % 5 === 0;
-    const firstCat = !bossDepth && rng.chance(profile.grand) ? 'grand' : 'large';
-    for (let t = 0; t < 40 && rooms.length === 0; t++) {
-      const cat = t < 20 ? firstCat : 'medium';
-      const shape = makeShape(rng, cat, { profile });
-      const ox = Math.floor(width / 2 - shape.w / 2) + rng.int(-6, 6);
-      const oy = Math.floor(height / 2 - shape.h / 2) + rng.int(-6, 6);
-      if (canPlace(shape, ox, oy)) { placeRoom(shape, ox, oy, cat); treeDepth.set(0, 0); }
+    if (bossId) {
+      // The boss arena takes the seed slot: placed first, near the centre of an empty canvas, so it always fits (the
+      // canvas is >= 64 tiles by depth 5; an arena is at most 24 long). Then one room is grown off each short end.
+      const shape = makeArenaShape(rng, bossId);
+      for (let t = 0; t < 40 && !arena; t++) {
+        const j = t < 30 ? 6 : 0;
+        const ox = Math.floor(width / 2 - shape.w / 2) + rng.int(-j, j);
+        const oy = Math.floor(height / 2 - shape.h / 2) + rng.int(-j, j);
+        if (canPlace(shape, ox, oy)) arena = placeRoom(shape, ox, oy, 'large');
+      }
+      if (!arena) throw new Error(`map.js: boss arena did not fit a ${width}x${height} canvas`);
+      treeDepth.set(arena.id, 0);
+      arena.kind = 'boss';
+      arena.arena = bossId;
+      Object.defineProperty(arena, '_linkCap', { value: ARENA_LINK_CAP, enumerable: false, writable: true });
+      Object.defineProperty(arena, '_doorSides', { value: arenaDoorSides(shape), enumerable: false, writable: true });
+      for (const side of arena._doorSides) {
+        for (let t = 0; t < 60 && rooms.length < target; t++) {
+          if (!openDoorSides(arena).some(([dx, dy]) => dx === side[0] && dy === side[1])) break;
+          if (tryAttach(arena, pickCategory(), pickGap(), side)) break;
+        }
+      }
+    } else {
+      // Seed room near the centre; it may roll the 'grand' landmark size (§17.13) — never on a boss depth, whose seed
+      // slot is the arena above.
+      const firstCat = rng.chance(profile.grand) ? 'grand' : 'large';
+      for (let t = 0; t < 40 && rooms.length === 0; t++) {
+        const cat = t < 20 ? firstCat : 'medium';
+        const shape = makeShape(rng, cat, { profile });
+        const ox = Math.floor(width / 2 - shape.w / 2) + rng.int(-6, 6);
+        const oy = Math.floor(height / 2 - shape.h / 2) + rng.int(-6, 6);
+        if (canPlace(shape, ox, oy)) { placeRoom(shape, ox, oy, cat); treeDepth.set(0, 0); }
+      }
     }
     let attempts = 0;
     const maxAttempts = target * 50;
     while (rooms.length < target && attempts < maxAttempts) {
       attempts++;
-      const open = rooms.filter(r => linkCount.get(r.id) < LINK_CAP[r.size]);
+      const open = rooms.filter(r => linkCount.get(r.id) < linkCap(r));
       if (!open.length) break;
       // 'spread': prefer parents with few links so the tree spreads out rather than forming one chain (a compact
       // blob). 'deep': prefer the deepest spanning-tree nodes, growing a few long branches instead.
@@ -713,7 +885,7 @@ export function generateDungeon(depth, rng, opts = {}) {
     for (const p of pairs) {
       if (loops <= 0) break;
       if (links.has(linkKey(p.a.id, p.b.id))) continue;
-      if (linkCount.get(p.a.id) >= LINK_CAP[p.a.size] || linkCount.get(p.b.id) >= LINK_CAP[p.b.size]) continue;
+      if (linkCount.get(p.a.id) >= linkCap(p.a) || linkCount.get(p.b.id) >= linkCap(p.b)) continue;
       if (connect(p.a, p.b, 12, true)) loops--;
     }
 
@@ -729,15 +901,15 @@ export function generateDungeon(depth, rng, opts = {}) {
       const need = (r) => linkCount.get(r.id) < want.get(r.id);
       if (!need(p.a) && !need(p.b)) continue;
       // do not push the other room far beyond its own cap (large rooms cap at 4)
-      const cap = (r) => linkCount.get(r.id) < LINK_CAP[r.size];
+      const cap = (r) => linkCount.get(r.id) < linkCap(r);
       if (!cap(p.a) || !cap(p.b)) continue;
       if (links.has(linkKey(p.a.id, p.b.id))) continue;
       connect(p.a, p.b, 12, true);
     }
     // large rooms still stuck at one link: allow a somewhat longer connector
     for (const r of rooms) {
-      if (!isBig(r) || linkCount.get(r.id) >= 2) continue;
-      const others = rooms.filter(o => o !== r && !links.has(linkKey(r.id, o.id)) && linkCount.get(o.id) < LINK_CAP[o.size])
+      if (!isBig(r) || linkCount.get(r.id) >= Math.min(2, linkCap(r))) continue;
+      const others = rooms.filter(o => o !== r && !links.has(linkKey(r.id, o.id)) && linkCount.get(o.id) < linkCap(o))
         .map(o => ({ o, g: bboxGap(r, o) })).filter(e => e.g <= 16).sort((p, q) => p.g - q.g);
       for (const e of others) if (connect(r, e.o, 20, true)) break;
     }
@@ -898,9 +1070,20 @@ export function generateDungeon(depth, rng, opts = {}) {
     return d;
   }
 
-  // ---------- 4. Start room / entrance, exits, boss — then detour ranking (all on the UNCROPPED grid) ----------
+  // ---------- 4. Start room / entrance, exits (the boss arena is already room 0) — then detour ranking (all on the UNCROPPED grid) ----------
   const baseRoomCount = rooms.length; // rooms placed by growth; everything after this is a treasure wing
-  const startCandidates = rooms.filter(r => !isBig(r));
+  let startCandidates = rooms.filter(r => !isBig(r));
+  if (arena) {
+    // Boss depth (§17.15): the start room comes from the third of rooms farthest (walking) from the arena, so the
+    // arena still ends up far from where the player enters. If that third has no small room: the farthest small one.
+    const fromArena = bfsFrom(arena.cx, arena.cy);
+    const dA = (r) => Math.max(0, fromArena[idx(r.cx, r.cy)]);
+    const ranked = rooms.filter(r => r !== arena).sort((a, b) => dA(b) - dA(a));
+    const farThird = ranked.slice(0, Math.max(1, Math.ceil(ranked.length / 3)));
+    const farSmall = farThird.filter(r => !isBig(r));
+    const anySmall = ranked.filter(r => !isBig(r));
+    startCandidates = farSmall.length ? farSmall : anySmall.length ? [anySmall[0]] : ranked.slice(0, 1);
+  }
   const startRoom = rng.pick(startCandidates.length ? startCandidates : rooms);
   startRoom.kind = 'start';
   const entrance = findNiche(startRoom);
@@ -908,8 +1091,8 @@ export function generateDungeon(depth, rng, opts = {}) {
 
   const bfsDist = bfsFrom(entrance.x, entrance.y);
 
-  // Exits: 1-3 rooms from the farthest third by walking distance.
-  const otherRooms = rooms.filter(r => r !== startRoom);
+  // Exits: 1-3 rooms from the farthest third by walking distance — never the boss arena (§17.15).
+  const otherRooms = rooms.filter(r => r !== startRoom && r.kind !== 'boss');
   for (const r of otherRooms) r._dist = bfsDist[idx(r.cx, r.cy)] < 0 ? 0 : bfsDist[idx(r.cx, r.cy)];
   otherRooms.sort((a, b) => b._dist - a._dist);
   const topThirdCount = Math.max(1, Math.ceil(otherRooms.length / 3));
@@ -934,16 +1117,7 @@ export function generateDungeon(depth, rng, opts = {}) {
     exits.push(ex);
   }
 
-  // Boss room (unchanged until §17.15's arena): every 5th depth, the largest far-third room still 'normal'.
-  if (depth % 5 === 0) {
-    let pool = topThird.filter(r => r.kind === 'normal');
-    if (!pool.length) pool = otherRooms.filter(r => r.kind === 'normal');
-    if (pool.length) {
-      let best = pool[0];
-      for (const r of pool) if (r.w * r.h > best.w * best.h) best = r;
-      best.kind = 'boss';
-    }
-  }
+  // (The boss room is the arena seed room, room 0, tagged 'boss' when it was placed — §17.15.)
   for (const r of otherRooms) delete r._dist;
 
   // Merchant room (opts.merchant — main.js passes isMerchantDepth): a dedicated room kind with no enemies inside
@@ -1043,7 +1217,7 @@ export function generateDungeon(depth, rng, opts = {}) {
   // Parents in the order to try them: unused before already-used, under their link cap before over it; shuffled.
   function orderParents(pool) {
     const shuffled = rng.shuffle(pool.slice());
-    const rank = (r) => (usedParents.has(r.id) ? 2 : 0) + (linkCount.get(r.id) < LINK_CAP[r.size] ? 0 : 1);
+    const rank = (r) => (usedParents.has(r.id) ? 2 : 0) + (linkCount.get(r.id) < linkCap(r) ? 0 : 1);
     return shuffled.sort((a, b) => rank(a) - rank(b));
   }
   // Attach a `cat` leaf to some room of the tier's pools; returns { room, parent } or null.
@@ -1174,8 +1348,9 @@ export function generateDungeon(depth, rng, opts = {}) {
 
   // ---------- 9. Spawn candidate caches ----------
   // Treasure wings (every tier, incl. antechambers) get no general spawn candidates: their guards are placed by
-  // enemies.js from the tier table (§17.14), and a hidden room holds nothing at all (§17.11).
-  const treasureRoomIds = new Set(rooms.filter(r => r.kind === 'treasure').map(r => r.id));
+  // enemies.js from the tier table (§17.14), and a hidden room holds nothing at all (§17.11). Nor does the boss arena:
+  // only the boss and its guards wait there (§17.15).
+  const treasureRoomIds = new Set(rooms.filter(r => r.kind === 'treasure' || r.kind === 'boss').map(r => r.id));
   const merchantRoomId = merchantRoom ? merchantRoom.id : -2;
   const roomFloors = [];
   const corridorFloors = [];
@@ -1200,8 +1375,8 @@ export function generateDungeon(depth, rng, opts = {}) {
   const map = {
     width, height, tiles, visible, explored, rooms, entrance, exits,
     archetype, // this depth's generation profile (§17.13); a data hook only — nothing renders differently yet
-    // Floor tiles open to general spawning (§17.16): every FLOOR tile outside the treasure wings and the merchant's
-    // room. (Phase 3 will also exclude the boss arena.)
+    // Floor tiles open to general spawning (§17.16): every FLOOR tile outside the treasure wings, the merchant's room
+    // and the boss arena.
     populatedFloor,
     // The room shop.js puts the merchant in (opts.merchant), or null: kind 'merchant', or the start room as fallback.
     merchantRoomId: merchantRoom ? merchantRoom.id : null,

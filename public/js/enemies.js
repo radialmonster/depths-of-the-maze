@@ -2,7 +2,7 @@
 // Only imports from core.js (per contract); everything else comes through the `game` API (§6)
 // and the map API (§7) passed in at call time.
 
-import { DIR_LIST, uid, clamp, lerp, manhattan, dist } from './core.js';
+import { DIR_LIST, uid, clamp, lerp, manhattan, dist, bossForDepth } from './core.js';
 
 // ---------------------------------------------------------------------------
 // Tuning constants
@@ -97,7 +97,7 @@ export const ENEMY_TYPES = {
     visual: { shape: 'ogre', color: '#8a4a2a', scale: 1.5 },
   },
 
-  // --- Bosses (spawned explicitly by spawnEnemies on depth % 5 === 0) ---
+  // --- Bosses (spawned explicitly by spawnEnemies in the depth's arena; core.js bossForDepth picks which) ---
   slime_king: {
     id: 'slime_king', name: 'Slime King', minDepth: 5, maxDepth: 60, boss: true,
     baseHp: 260, baseAtk: 10, baseDef: 3, baseXp: 130, gold: [40, 70],
@@ -126,10 +126,7 @@ function depthMult(depth) {
   return 1 + 0.12 * (depth - 1);
 }
 
-function pickBossId(depth) {
-  const idx = Math.max(1, Math.round(depth / 5));
-  return (idx % 2 === 1) ? 'slime_king' : 'bone_tyrant';
-}
+// Which boss a depth has: core.js bossForDepth (moved there so map.js can shape the arena for it, §17.15).
 
 // ---------------------------------------------------------------------------
 // Resistances — ENEMY_TYPES[id].resist maps an element (core.js ELEMENTS: physical, arcane,
@@ -259,7 +256,8 @@ function computeSpawnCount(depth) {
   return Math.round(base + Math.max(0, depth - 15) * 1.2);
 }
 
-// `keepOut(x, y)` (optional): true for tiles general spawns must never use (treasure wings, the merchant's room).
+// `keepOut(x, y)` (optional): true for tiles a spawn must never use (general spawns: treasure wings, the merchant's
+// room, the boss arena; boss + guards: anything outside the arena).
 function tileFree(map, enemies, x, y, keepOut = null) {
   if (!map.inBounds(x, y) || !map.isWalkable(x, y)) return false;
   if (keepOut && keepOut(x, y)) return false;
@@ -359,14 +357,15 @@ export function spawnEnemies(game) {
   if (!map) return enemies;
 
   const count = computeSpawnCount(depth);
-  const isBossFloor = depth % 5 === 0;
+  const bossId = bossForDepth(depth);
   const startRoom = map.rooms?.find(r => r.kind === 'start');
-  const bossRoom = isBossFloor ? map.rooms?.find(r => r.kind === 'boss') : null;
+  const bossRoom = bossId ? map.rooms?.find(r => r.kind === 'boss') : null;
 
   const pool = enemyPoolForDepth(depth);
 
-  // General spawns stay out of treasure wings (they get tier guards instead) and the merchant's room (§17.14).
-  const keepOutIds = new Set((map.rooms || []).filter(r => r.kind === 'treasure' || r.kind === 'merchant').map(r => r.id));
+  // General spawns stay out of treasure wings (they get tier guards instead), the merchant's room (§17.14) and the boss
+  // arena (only the boss and its guards wait there, §17.15).
+  const keepOutIds = new Set((map.rooms || []).filter(r => r.kind === 'treasure' || r.kind === 'merchant' || r.kind === 'boss').map(r => r.id));
   const keepOut = map.roomAt && keepOutIds.size
     ? (x, y) => { const r = map.roomAt(x, y); return !!r && keepOutIds.has(r.id); }
     : null;
@@ -379,8 +378,10 @@ export function spawnEnemies(game) {
 
   // --- Boss + guards ---
   if (bossRoom) {
-    const bossId = pickBossId(depth);
-    const spot = findNearbyFree(map, enemies, bossRoom.cx, bossRoom.cy, 4, keepOut) || { x: bossRoom.cx, y: bossRoom.cy };
+    // The boss and its guards stand inside the arena (never spill into its doorways/corridors). The boss takes the
+    // arena's centre, which map.js guarantees sits in a clear 9x9 core.
+    const outsideArena = map.roomAt ? (x, y) => { const r = map.roomAt(x, y); return !r || r.id !== bossRoom.id; } : null;
+    const spot = findNearbyFree(map, enemies, bossRoom.cx, bossRoom.cy, 4, outsideArena) || { x: bossRoom.cx, y: bossRoom.cy };
     const boss = createEnemy(bossId, spot.x, spot.y, depth, rng, { elite: false });
     enemies.push(boss);
 
@@ -388,9 +389,11 @@ export function spawnEnemies(game) {
     for (let i = 0; i < guardCount; i++) {
       const gx = bossRoom.cx + rng.int(-3, 3);
       const gy = bossRoom.cy + rng.int(-3, 3);
-      const gspot = findNearbyFree(map, enemies, gx, gy, 4, keepOut);
+      const gspot = findNearbyFree(map, enemies, gx, gy, 4, outsideArena);
       if (!gspot) continue;
-      enemies.push(createEnemy(rng.pick(pool), gspot.x, gspot.y, depth, rng));
+      const g = createEnemy(rng.pick(pool), gspot.x, gspot.y, depth, rng);
+      g.bossGuard = true;
+      enemies.push(g);
     }
   }
 

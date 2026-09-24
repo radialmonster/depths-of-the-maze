@@ -1,19 +1,23 @@
 // Plain-Node unit tests for map generation variety (DESIGN §17.13): floor archetypes (never repeating back-to-back),
 // the new room shapes, the ring hall's core never offered as a doorway, cluster mode, the grand seed room, the raised
-// room-count curve, and room.shape.
+// room-count curve, and room.shape. Boss arenas (§17.15): bossForDepth, per-boss arena shapes, minimum size + clear
+// core, the arena as the seed room, its doorways, and population.
 //   node test/map.test.js      (or: npm test)
 import assert from 'node:assert/strict';
-import { RNG, TILE } from '../public/js/core.js';
+import { RNG, TILE, bossForDepth, isBossDepth } from '../public/js/core.js';
 import {
   generateDungeon, makeShape, shapeDoorSlots, pickArchetype, targetRoomCount, ARCHETYPES, ARCHETYPE_IDS, SHAPES_BY_SIZE,
+  BOSS_ARENAS, GENERIC_ARENA, ARENA_MIN, ARENA_SHAPES, makeArenaShape, arenaStats, arenaMeetsMinimum,
 } from '../public/js/map.js';
+import { spawnEnemies } from '../public/js/enemies.js';
 
 let failed = 0, passed = 0;
 function test(name, fn) {
   try { fn(); passed++; console.log(`  ok   ${name}`); } catch (e) { failed++; console.error(`  FAIL ${name}\n       ${e.stack}`); }
 }
 
-const ALL_SHAPES = [...new Set(Object.values(SHAPES_BY_SIZE).flat())];
+const GROWTH_SHAPES = [...new Set(Object.values(SHAPES_BY_SIZE).flat())];
+const ALL_SHAPES = [...GROWTH_SHAPES, ...ARENA_SHAPES];
 const DIR4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
 
 // Floor tiles of a lone shape, 4-connected from the first one.
@@ -71,9 +75,10 @@ test('room-count curve: min(22, 11 + floor((depth-1)*0.6))', () => {
 });
 
 test('every generated floor places its full room count (all but a rare wide-gap Wings layout)', () => {
-  // (the growth pass's rooms; treasure wings, §17.14, are added on top of this base count)
-  const short = RUNS.filter(({ depth, map }) => map.baseRoomCount !== targetRoomCount(depth));
-  for (const { depth, map } of RUNS) assert.ok(map.baseRoomCount <= targetRoomCount(depth));
+  // (the growth pass's rooms; treasure wings, §17.14, and the boss arena, §17.15, are added on top of this base count)
+  const want = (depth) => targetRoomCount(depth) + (isBossDepth(depth) ? 1 : 0);
+  const short = RUNS.filter(({ depth, map }) => map.baseRoomCount !== want(depth));
+  for (const { depth, map } of RUNS) assert.ok(map.baseRoomCount <= want(depth));
   assert.ok(short.length <= RUNS.length * 0.02, `${short.length}/${RUNS.length} floors short of their room count`);
 });
 
@@ -217,7 +222,9 @@ test('every room carries its shape id and a walkable centre; every floor tile is
       shapes.add(r.shape);
     }
   }
-  assert.deepEqual([...shapes].sort(), [...ALL_SHAPES].sort(), 'every shape gets picked somewhere');
+  // (every growth shape, and both bosses' arenas; the generic arena only serves bosses that don't exist yet)
+  const expected = [...GROWTH_SHAPES, ...Object.values(BOSS_ARENAS).map((a) => a.shape)];
+  assert.deepEqual([...shapes].sort(), expected.sort(), 'every shape gets picked somewhere');
 });
 
 test('grand landmark seed room: only ever room 0, never on a boss depth, always on a Keep non-boss depth', () => {
@@ -254,6 +261,143 @@ test('Catacombs cluster mode: small rooms chain off each other through shared wa
   }
   const cat = perFloor.catacombs[0] / perFloor.catacombs[1], halls = perFloor.halls[0] / perFloor.halls[1];
   assert.ok(cat > 1.5 && cat > halls * 3, `small-small shared walls per floor: catacombs ${cat.toFixed(2)}, halls ${halls.toFixed(2)}`);
+});
+
+console.log('Boss arenas (§17.15)');
+
+test('bossForDepth (core.js): Slime King on 5, 15, 25...; Bone Tyrant on 10, 20, 30...; null elsewhere', () => {
+  assert.deepEqual([5, 10, 15, 20, 25, 30, 35, 40].map(bossForDepth),
+    ['slime_king', 'bone_tyrant', 'slime_king', 'bone_tyrant', 'slime_king', 'bone_tyrant', 'slime_king', 'bone_tyrant']);
+  for (const d of [0, 1, 2, 3, 4, 6, 9, 11, 14, 16, 21, 29]) assert.equal(bossForDepth(d), null, `depth ${d}`);
+  assert.ok(isBossDepth(5) && !isBossDepth(6));
+});
+
+test('arena shapes: every roll meets the minimum (16x13, >= 180 floor, clear 9x9 core, a door slot on each end)', () => {
+  const rng = new RNG(21);
+  for (const [bossId, spec] of [...Object.entries(BOSS_ARENAS), ['someFutureBoss', GENERIC_ARENA]]) {
+    for (let i = 0; i < 300; i++) {
+      const s = makeArenaShape(rng, bossId);
+      assert.equal(s.type, spec.shape, `${bossId} -> ${s.type}`);
+      const st = arenaStats(s);
+      assert.ok(arenaMeetsMinimum(s), `${s.type} ${JSON.stringify(st)}`);
+      assert.ok(st.long >= ARENA_MIN.long && st.short >= ARENA_MIN.short && st.floor >= ARENA_MIN.floor);
+      assert.ok(st.clearRadius >= ARENA_MIN.clearRadius);
+      assert.ok(shapeConnected(s), `${s.type} floor split`);
+      // every pillar / rock island is enclosed core (never a doorway) and outside the clear core
+      for (const [x, y] of s.core) {
+        assert.equal(s.mask[y * s.w + x], 0);
+        assert.ok(Math.max(Math.abs(x - st.spawn.x), Math.abs(y - st.spawn.y)) > ARENA_MIN.clearRadius, 'pillar in the clear core');
+      }
+    }
+  }
+});
+
+test('arenaMeetsMinimum rejects undersized / obstructed rooms', () => {
+  const rect = (w, h, holes = []) => {
+    const mask = new Uint8Array(w * h).fill(1);
+    for (const [x, y] of holes) mask[y * w + x] = 0;
+    return { w, h, mask, type: 'rect', pillars: holes, core: holes };
+  };
+  assert.ok(arenaMeetsMinimum(rect(17, 15)));
+  assert.ok(!arenaMeetsMinimum(rect(15, 13)), 'too short');
+  assert.ok(!arenaMeetsMinimum(rect(18, 12)), 'too narrow');
+  assert.ok(!arenaMeetsMinimum(rect(16, 11)), 'under 180 floor');
+  assert.ok(!arenaMeetsMinimum(rect(17, 15, [[8 + 4, 7]])), 'pillar 4 tiles from the spawn point');
+  assert.ok(arenaMeetsMinimum(rect(17, 15, [[8 + 5, 7]])), 'pillar 5 tiles out is fine');
+  assert.equal(arenaStats(rect(17, 15, [[8 + 3, 7 - 3]])).clearRadius, 2);
+});
+
+test('arena specifics: Sump is a ~17-19 x 15-17 ellipse with islands >= 6 out; Ossuary Hall 20-24 x 13-15 with colonnades 3 in', () => {
+  const rng = new RNG(3);
+  let islands = 0;
+  for (let i = 0; i < 300; i++) {
+    const s = makeArenaShape(rng, 'slime_king');
+    const [L, S] = [Math.max(s.w, s.h), Math.min(s.w, s.h)];
+    assert.ok(L >= 17 && L <= 19 && S >= 15 && S <= 17, `sump ${s.w}x${s.h}`);
+    const { spawn } = arenaStats(s);
+    for (const [x, y] of s.core) assert.ok(Math.hypot(x - spawn.x, y - spawn.y) >= 6, 'sump island too close to the centre');
+    // corners are rock (an ellipse, not a rectangle)
+    for (const [x, y] of [[0, 0], [s.w - 1, 0], [0, s.h - 1], [s.w - 1, s.h - 1]]) assert.equal(s.mask[y * s.w + x], 0);
+    islands += s.core.length > 0 ? 1 : 0;
+
+    const o = makeArenaShape(rng, 'bone_tyrant');
+    const horiz = o.w >= o.h;
+    const [OL, OS] = [Math.max(o.w, o.h), Math.min(o.w, o.h)];
+    assert.ok(OL >= 20 && OL <= 24 && OS >= 13 && OS <= 15, `ossuary ${o.w}x${o.h}`);
+    assert.ok(o.pillars.length >= 8, 'two colonnade rows at each end');
+    for (const [x, y] of o.pillars) {
+      const across = horiz ? y : x;
+      assert.ok(across === 3 || across === OS - 4, `pillar ${across} tiles in from a long wall`);
+    }
+  }
+  assert.ok(islands > 290, 'the Sump nearly always has cover islands');
+});
+
+const BOSS_FLOORS = [];
+for (let i = 0; i < 80; i++) {
+  const depth = 5 * (1 + (i % 6));
+  BOSS_FLOORS.push({ depth, seed: 900 + i, map: generateDungeon(depth, new RNG(900 + i), { merchant: true }) });
+}
+
+test('boss depths: the arena is the seed room (room 0), per-boss shape, tagged kind/arena/size, minimum size on the real map', () => {
+  for (const { depth, map } of BOSS_FLOORS) {
+    const arenas = map.rooms.filter((r) => r.kind === 'boss');
+    assert.equal(arenas.length, 1);
+    const a = arenas[0];
+    assert.equal(a.id, 0);
+    assert.equal(a.arena, bossForDepth(depth));
+    assert.equal(a.shape, BOSS_ARENAS[bossForDepth(depth)].shape);
+    assert.equal(a.size, 'large');
+    assert.ok(map.roomTiles(a.id).length >= ARENA_MIN.floor);
+    for (let y = a.cy - 4; y <= a.cy + 4; y++) for (let x = a.cx - 4; x <= a.cx + 4; x++) {
+      assert.equal(map.get(x, y), TILE.FLOOR, `clear core ${x},${y}`);
+      assert.equal(map.roomAt(x, y).id, a.id);
+    }
+  }
+  // non-boss depths never get one
+  for (const { depth, map } of RUNS) if (!isBossDepth(depth)) assert.ok(!map.rooms.some((r) => r.kind === 'boss' || r.arena));
+});
+
+test('arena doorways: 1-2, on opposite short ends; linked only to growth rooms (never a treasure wing)', () => {
+  for (const { map } of BOSS_FLOORS) {
+    const a = map.rooms[0];
+    assert.ok(a.doors.length >= 1 && a.doors.length <= 2, `${a.doors.length} doors`);
+    const horiz = a.w >= a.h;
+    const side = (d) => Math.sign(horiz ? d.x - a.cx : d.y - a.cy);
+    for (const d of a.doors) assert.notEqual(side(d), 0);
+    if (a.doors.length === 2) assert.equal(side(a.doors[0]) * side(a.doors[1]), -1, 'both doors on one end');
+    // whatever room each doorway leads to (through its corridor) is a growth room
+    for (const d of a.doors) {
+      const seen = new Set([map.idx(d.x, d.y)]); const q = [[d.x, d.y]];
+      for (let qi = 0; qi < q.length; qi++) {
+        const [x, y] = q[qi];
+        for (const [dx, dy] of DIR4) {
+          const nx = x + dx, ny = y + dy;
+          if (!map.isWalkable(nx, ny)) continue;
+          const r = map.roomAt(nx, ny);
+          if (r) { if (r.id !== a.id) assert.ok(r.id < map.baseRoomCount && r.kind !== 'treasure', 'arena linked to a wing'); continue; }
+          const k = map.idx(nx, ny); if (!seen.has(k)) { seen.add(k); q.push([nx, ny]); }
+        }
+      }
+    }
+  }
+});
+
+test('arena: no stairs, merchant, spawn candidates or general spawns inside; boss at its centre with 2-4 guards', () => {
+  for (const { depth, seed, map } of BOSS_FLOORS) {
+    const a = map.rooms[0];
+    const inA = (x, y) => { const r = map.roomAt(x, y); return !!r && r.id === a.id; };
+    for (const s of [map.entrance, ...map.exits]) assert.ok(!inA(s.front.x, s.front.y), 'stairs in the arena');
+    assert.notEqual(map.merchantRoomId, a.id);
+    for (const c of map.spawnCandidates(new RNG(1), 5000, 0)) assert.notEqual(c.roomId, a.id);
+    const enemies = spawnEnemies({ map, depth, rng: new RNG(seed) });
+    const boss = enemies.find((e) => e.type === bossForDepth(depth));
+    assert.ok(boss && boss.x === a.cx && boss.y === a.cy, 'boss at the arena centre');
+    const guards = enemies.filter((e) => e.bossGuard);
+    assert.ok(guards.length >= 2 && guards.length <= 4, `${guards.length} guards`);
+    for (const e of enemies) if (inA(e.x, e.y)) assert.ok(e === boss || e.bossGuard, 'general spawn inside the arena');
+    for (const g of guards) assert.ok(inA(g.x, g.y), 'boss guard outside the arena');
+  }
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -94,6 +94,17 @@ export const uid = () => _uid++;
 // never collide with ids already saved on the player's equipment/inventory.
 export const bumpUid = (min) => { if (min >= _uid) _uid = min + 1; };
 
+// Bosses (DESIGN §17.7/§17.15): one every BOSS_DEPTH_INTERVAL depths, alternating Slime King (5, 15, 25...) and Bone
+// Tyrant (10, 20, 30...). Lives here, not in enemies.js, because map.js (which may only import core.js) needs it too:
+// the boss arena's shape depends on which boss the depth has, and both modules must agree.
+export const BOSS_DEPTH_INTERVAL = 5;
+export const isBossDepth = (depth) => depth > 0 && depth % BOSS_DEPTH_INTERVAL === 0;
+// The boss type id for a depth, or null on a non-boss depth. (Was enemies.js pickBossId, which had no null case.)
+export function bossForDepth(depth) {
+  if (!isBossDepth(depth)) return null;
+  return (depth / BOSS_DEPTH_INTERVAL) % 2 === 1 ? 'slime_king' : 'bone_tyrant';
+}
+
 export const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
 export const lerp = (a, b, t) => a + (b - a) * t;
 export const manhattan = (ax, ay, bx, by) => Math.abs(ax - bx) + Math.abs(ay - by);
