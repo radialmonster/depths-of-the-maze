@@ -589,7 +589,11 @@ export function equipCheck(player, item) {
     // Bag after the swap: -1 (this item leaves it) +1 (the old weapon, if any) +1 (the evicted off-hand).
     const inBag = (player.inventory || []).some((i) => i && i.id === item.id) ? 1 : 0;
     const after = (player.inventory || []).length - inBag + (weapon ? 1 : 0) + 1;
-    if (after > INVENTORY_SIZE) return { ok: false, reason: `Bag full: no room for your ${off.name}` };
+    if (after > INVENTORY_SIZE) {
+      // Both the old weapon and the off-hand may need a slot, so name a count rather than just one item.
+      const short = after - INVENTORY_SIZE;
+      return { ok: false, reason: `Bag full: need ${short} more free slot${short === 1 ? '' : 's'}` };
+    }
     return { ok: true, evicts: off };
   }
   return { ok: true };
