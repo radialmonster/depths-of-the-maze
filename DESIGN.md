@@ -136,7 +136,8 @@ map = {
   secretAt(x,y), revealSecret(x,y) -> secret|null,  // reveal = WALL -> DOOR (main.js calls it, then renderer.revealTile)
   idx(x,y), inBounds(x,y), get(x,y), isWalkable(x,y), isOpaque(x,y),
   spawnCandidates(rng, count, minDistFromEntrance) -> [{x,y,roomId}] // floor tiles for enemies/loot — never in the
-                               // start room, a treasure wing, the merchant room or the boss arena
+                               // start room, a treasure wing, the merchant room or the boss arena; ordered so any
+                               // prefix spreads over rooms in proportion to their area (§17.16)
   roomTiles(roomId) -> [{x,y}], roomAt(x,y) -> room|null,  // a room's own FLOOR tiles / which room a floor tile is in
   merchantRoomId,              // opts.merchant: the merchant's room (kind 'merchant'; the start room if no normal room)
   baseRoomCount,               // rooms[0..baseRoomCount) are growth rooms; the rest are treasure wings
@@ -312,13 +313,15 @@ See §17.10 for the loadout/unlock system these plug into.
 ```js
 export const ENEMY_TYPES = {...}
 export function spawnEnemies(game) -> enemies[]   // uses game.map, game.depth, game.rng; boss on every 5th depth
+export function spawnDensity(depth), computeSpawnCount(depth, populatedFloor)  // general-population count (§17.16)
 export function updateEnemies(game, dt)
 enemy = { id, type, name, x, y, facing, hp, maxHp, attack, defense, xp, gold:[min,max], level,
           moveCooldown, moveTimer, attackCooldown, attackTimer, aggroRange, behavior:'melee'|'ranged'|'coward'|'swarm'|'boss',
           state:'idle'|'wander'|'chase'|'flee'|'attack'|'return', home:{x,y},
           visual:{ shape:'slime'|'skeleton'|'bat'|'goblin'|'spider'|'mage'|'ogre'|'boss', color:'#hex', scale },
           slow:0 /*timer*/, slowPct:0 /*0..0.75, current slow strength — see applySlow() in §17.12*/,
-          frozen:0, hitFlash:0, dead:false, deathTimer:0, elite:bool }
+          frozen:0, hitFlash:0, dead:false, deathTimer:0, elite:bool,
+          bossGuard?, treasureGuard?:tier, warden?, exitSentry? /*spawn-role tags; untagged non-boss = general population*/ }
 ```
 Behaviors: idle/wander near home; chase when player within aggroRange + line of sight; give up after losing player; cowards flee
 at low HP (or always keep distance); ranged keep 3–5 tiles away and shoot `enemyBolt` projectiles; bosses have patterns.
@@ -1023,8 +1026,8 @@ better factoring): chest-content rolling (`seedTreasure`/`openChest` today) move
   plain Vault. Placement: Cache 100%, Hoard 99.5%, Vault 98.3% of rolls; antechamber 89.5% of rolls (3000 floors).
 - **Realized Vault share** is below the nominal weight because of the one-Vault cap (e.g. depth 20: 15.8% of treasure
   rooms vs the 20% weight) — the cap was written into the spec, so this is expected, not tuned away.
-- **Guards are on top of today's `computeSpawnCount`** for now; §17.16 (Phase 4) replaces that count with
-  `density × populatedFloor`, which already excludes the wings.
+- **Guards are on top of the general count**, which §17.16 (Phase 4, built) now sets as `density × populatedFloor`
+  (already excluding the wings).
 - Generation: p50 ~2.1 ms, p99 ~9.5 ms (was ~1.7 / ~8 before wings). Maps can now reach 90 tiles (was 86) when a wing
   sits on the edge.
 
@@ -1102,7 +1105,8 @@ since map.js may only import from core.js, and both enemies.js and map.js need t
   arena, falling back to the farthest small/medium room (2399/2400 floors used the far third). Non-boss depths are unchanged.
 - **Population:** the arena is excluded from `populatedFloor` and `spawnCandidates`, and general spawns (incl. bat
   swarms, exit sentries) keep out of it. The boss spawns on the arena centre; its 2-4 guards are placed only on arena
-  tiles and carry `enemy.bossGuard = true`. They're still on top of `computeSpawnCount` until §17.16 rescales it.
+  tiles and carry `enemy.bossGuard = true`. Since §17.16 (Phase 4) they are on top of the general count (before, the
+  general fill loop counted them against its total).
 - **Measured** (12,000 floors, depths 1-30, 400 seeded runs): 0 failures on minimum size / clear core / shape-per-boss /
   doors / wings / stairs / merchant / spawn / reachability. Grand seed rooms unaffected (36% of non-boss depths, 100% of
   non-boss Keep depths). Generation p50 2.2 ms / p99 ~10.7 ms overall; boss depths p50 2.5 ms / p99 ~13 ms (+0.4 ms
@@ -1124,6 +1128,27 @@ guards on top), depth 20 → 54 (+7) — both confirmed as the intended late-gam
 
 Distribution keeps the existing `spawnCandidates` system (75% rooms / 25% corridors, plus bat swarms) unchanged,
 with candidates spread per room proportional to room area so a large map fills evenly instead of clumping.
+
+**Implementation notes (Phase 4 — built):**
+- enemies.js: `DENSITY_BASE` 1.36, `DENSITY_PER_DEPTH` 0.065, `spawnDensity(depth)`, `computeSpawnCount(depth,
+  populatedFloor)`. A map with no `populatedFloor` (hand-built test maps only) falls back to the old depth curve.
+- **What the count covers:** the regular fill loop (incl. bat-swarm members) now counts only the enemies *it* places.
+  Before, it filled until `enemies.length` hit the count, so the boss + boss guards were counted inside it. Boss +
+  guards, treasure guards and the exit sentries (0-3, 50% per exit room, as before) are all on top. Sentries are now
+  tagged `exitSentry` so tools can separate them; "general" = every enemy with none of the role tags.
+- **Per-room spread:** `spawnCandidates` shuffles each room's tiles and keys the k-th of n at `(k+u)/n` (u random per
+  room), then sorts. Every prefix of the list (spawnEnemies consumes it front to back) holds about the same share of
+  each room's floor. Room and corridor picks are interleaved the same way. Measured: the larger half of the rooms
+  holds the same share of general room spawns as of floor (within 1-2 points).
+- **Measured** (500 floors/depth, main.js-equivalent setup incl. the merchant clearance): density lands within ±1% of
+  `density(depth)` at every depth 1-30. General enemies (mean): d1 11.2, d5 14.3, d10 22.8, d15 32.7, d20 42.8,
+  d25 48.1, d30 53.6; plus ~1 exit sentry and 1-7 treasure guards.
+- **OPEN — the formula and the confirmed targets disagree.** The targets above (d10 → 30, d20 → 54) are what the
+  formula gives on the *total* floor of today's maps (d10 ~1717 tiles → 33, d20 ~2171 → 56). `populatedFloor` is much
+  smaller (d10 ~1170, d20 ~1650): the wings, the arena and the merchant room are excluded, and a boss depth's arena
+  alone is ~220-300 tiles. With the formula as written the counts are ~22.8 / ~42.8. Built as written (formula + the
+  ±10% test). Hitting 30/54 needs a decision: scale the density coefficients by ~1.3, or count against total floor.
+  Not tuned.
 
 ### 17.17 Balance simulation harness
 A `npm test`-style check can catch a formula regressing, but can't answer "does depth-10 loot actually feel
@@ -1153,3 +1178,38 @@ one piece that still needs to move out of main.js for this to cover treasure too
   most one Vault/depth, hidden-book rate lands between 30-40%, item-level offsets are exact per tier, enemy density
   is within ±10% of `density(depth)`, treasure items/depth are within ±25% of the §17.14 design table, and mean
   generation time stays under 10ms.
+
+**Implementation notes (Phase 4 — built):**
+- **Prerequisite held:** the whole chain (`generateDungeon` → `spawnEnemies` → `placeMerchant`/`generateMerchantStock`
+  → `rollLoot`/`rollChestContents` → `createPlayer`/`gainXP`/`equipUpgrades`/`sellValue`) already ran in plain Node
+  after Phase 2. Nothing had to be extracted. Importing skills.js registers the skill-book hooks (books).
+- Files: `tools/simlib.js` (shared pure core: `floorSample`, `simulateRun`, `buildFloor`, `designTreasureItems`,
+  `tierLevelRange`, `placedArenaStats`; `buildFloor` mirrors main.js loadDepth incl. the merchant clearance filter),
+  `tools/sim.js` (CLI), `test/balance.test.js` (in `npm test`, ~4 s: 50 floors × depths 1-20 + a 3-run Layer-2 smoke
+  test), `test/sim/baseline.json` (500 runs, seed 1). `npm run sim` compares against the baseline;
+  `npm run sim:baseline` rewrites it. Extra flags: `--floor-depths` (Layer 1 range, default 1-30), `--seed`,
+  `--no-buy`, `--no-treasure` (Layer 2 counterfactual: never opens a chest), `--threshold` (drift flag, default 10%),
+  `--quiet`. The runs are deterministic, so an unchanged codebase compares at exactly 0 drift. Timing metrics are
+  never flagged.
+- **Layer 2 policy** (simple on purpose): rooms visited in random order (start first; the boss arena always) until
+  `explore` of room floor is covered. A Vault behind an antechamber is one unit with it. A hidden room is found with
+  p = explore × 0.5, and corridor enemies are met with p = explore. Everything met is killed (xp) and looted; books
+  are read on the spot. Bag full → quick-equip, then keep the more valuable item (counted as overflow). At each
+  merchant: `equipUpgrades` → sell all unequipped gear + surplus potions (> 10 per kind at the current size, and older
+  sizes) → record gold and how many of the 4 regular + featured items are affordable → buy stock items that
+  `compareGear` calls an upgrade, best first, while gold lasts (selling what they replace). No potion buying or use,
+  no attribute spending.
+- **Interpretation:** "no room qualifies as a boss room under §17.15's minimum size" is tested as "every boss room
+  meets the minimum (measured on the placed room), exactly one on boss depths, none elsewhere".
+- **First baseline findings (500 runs, explore 0.7):**
+  - *Early merchant affordability* (the §17.4 complaint): can afford at least one stock item d1 30% / d2 80% / d3 94%
+    / d4 99%; the featured item d3 46% / d4 68% / d5 98%. The `--no-treasure` counterfactual: d1 11% / d2 48% / d3 74%,
+    featured 0% until d4. The treasure tiers roughly triple gold on hand by d3 (224 vs 76).
+  - *From depth 5 gold piles up:* income d5 776 / d10 1790 / d20 4230 (the §17.4 estimate was 120 / 260 at d5/d10).
+    Mob gold alone (~100 at d9) still matches that estimate; chest gold and selling loot make up the rest. All 4
+    regular items are affordable from d5 on, and gold on hand reaches ~4k at d10 / ~22k at d20, with only ~1 upgrade
+    per shop to buy.
+  - *Levels lag the "~1 level per floor" target:* level 2.8 at d3 (on target), 7.1 at d10, 12.9 at d20.
+  - *Bag pressure is low:* the bag overflows on <5% of depths up to d14, and 12-20% on the deep boss depths (15, 20).
+  - Treasure items/depth run 0-10% under the design table (the one-Vault cap). Antechamber placement fails 10-19% of
+    rolls at depths 18-30 (Phase 2 measured 10.5% overall); wings fail < 2%. Generation p50 2.1 ms / p99 10.1 ms.

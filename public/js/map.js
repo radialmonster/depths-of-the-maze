@@ -1405,19 +1405,39 @@ export function generateDungeon(depth, rng, opts = {}) {
       const id = finalRoomIdGrid[this.idx(x, y)];
       return id >= 0 ? rooms[id] : null;
     },
+    // 75% room tiles / 25% corridor tiles, spread per room in proportion to room area (§17.16): each room's tiles are
+    // shuffled and its k-th of n tiles keyed (k+u)/n (u random per room), so sorting by key interleaves the rooms —
+    // ANY prefix of the result (spawnEnemies consumes it front to back) takes ~the same share of every room's floor,
+    // instead of a plain shuffle's chance clumps. Room and corridor picks are interleaved the same way.
     spawnCandidates(sRng, count, minDistFromEntrance) {
       const minD2 = minDistFromEntrance * minDistFromEntrance;
-      const farRoom = roomFloors.filter(p => (p.x - entrance.x) ** 2 + (p.y - entrance.y) ** 2 >= minD2);
-      const farCorr = corridorFloors.filter(p => (p.x - entrance.x) ** 2 + (p.y - entrance.y) ** 2 >= minD2);
-      sRng.shuffle(farRoom); sRng.shuffle(farCorr);
+      const far = (p) => (p.x - entrance.x) ** 2 + (p.y - entrance.y) ** 2 >= minD2;
+      const farCorr = corridorFloors.filter(far);
+      const byRoom = new Map();
+      for (const p of roomFloors) {
+        if (!far(p)) continue;
+        let a = byRoom.get(p.roomId);
+        if (!a) byRoom.set(p.roomId, (a = []));
+        a.push(p);
+      }
+      const spread = (groups) => {
+        const keyed = [];
+        for (const g of groups) {
+          const u = sRng.next();
+          for (let k = 0; k < g.length; k++) keyed.push({ p: g[k], key: (k + u) / g.length });
+        }
+        return keyed.sort((a, b) => a.key - b.key).map(e => e.p);
+      };
+      const farRoom = spread([...byRoom.values()].map(a => sRng.shuffle(a)));
+      sRng.shuffle(farCorr);
       const wantRoom = Math.round(count * 0.75);
-      const chosen = farRoom.slice(0, wantRoom).concat(farCorr.slice(0, count - wantRoom));
+      const roomPick = farRoom.slice(0, wantRoom), corrPick = farCorr.slice(0, count - wantRoom);
+      const chosen = spread([roomPick, corrPick].filter(a => a.length));
       if (chosen.length < count) {
         const extra = farRoom.slice(wantRoom).concat(farCorr.slice(count - wantRoom));
         sRng.shuffle(extra);
         for (const p of extra) { if (chosen.length >= count) break; chosen.push(p); }
       }
-      sRng.shuffle(chosen);
       return chosen.slice(0, count).map(p => ({ x: p.x, y: p.y, roomId: p.roomId }));
     },
     hasLineOfSight(x0, y0, x1, y1) { return computeLineOfSight(this, x0, y0, x1, y1); },

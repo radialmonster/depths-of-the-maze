@@ -250,10 +250,21 @@ export function createEnemy(typeId, x, y, depth, rng, opts = {}) {
 // ---------------------------------------------------------------------------
 // Spawning
 // ---------------------------------------------------------------------------
-function computeSpawnCount(depth) {
-  const t = clamp((depth - 1) / 14, 0, 1);
-  const base = lerp(12, 35, t);
-  return Math.round(base + Math.max(0, depth - 15) * 1.2);
+// General population scales with floor size, not just depth (§16/§17.16): density(depth) enemies per 100 populated
+// floor tiles (map.populatedFloor — already excludes treasure wings, the merchant's room and the boss arena, which
+// get their own guard budgets). Boss + boss guards, treasure guards and exit sentries are NOT part of this count.
+export const DENSITY_BASE = 1.36;
+export const DENSITY_PER_DEPTH = 0.065;
+export function spawnDensity(depth) {
+  return DENSITY_BASE + DENSITY_PER_DEPTH * (Math.max(1, depth) - 1);
+}
+export function computeSpawnCount(depth, populatedFloor) {
+  if (!Number.isFinite(populatedFloor)) {
+    // A map without populatedFloor (hand-built test maps): the old depth-only curve.
+    const t = clamp((depth - 1) / 14, 0, 1);
+    return Math.round(lerp(12, 35, t) + Math.max(0, depth - 15) * 1.2);
+  }
+  return Math.round(spawnDensity(depth) * populatedFloor / 100);
 }
 
 // `keepOut(x, y)` (optional): true for tiles a spawn must never use (general spawns: treasure wings, the merchant's
@@ -356,7 +367,7 @@ export function spawnEnemies(game) {
   const enemies = [];
   if (!map) return enemies;
 
-  const count = computeSpawnCount(depth);
+  const count = computeSpawnCount(depth, map.populatedFloor);
   const bossId = bossForDepth(depth);
   const startRoom = map.rooms?.find(r => r.kind === 'start');
   const bossRoom = bossId ? map.rooms?.find(r => r.kind === 'boss') : null;
@@ -371,7 +382,7 @@ export function spawnEnemies(game) {
     : null;
 
   const minDistFromEntrance = 8;
-  const raw = map.spawnCandidates(rng, count + 16, minDistFromEntrance) || [];
+  const raw = map.spawnCandidates(rng, count + Math.max(16, Math.ceil(count * 0.3)), minDistFromEntrance) || [];
   const candidates = raw.filter(c => (!startRoom || c.roomId !== startRoom.id) && !keepOutIds.has(c.roomId));
   let ci = 0;
   const nextCandidate = () => candidates[ci++] || null;
@@ -397,9 +408,11 @@ export function spawnEnemies(game) {
     }
   }
 
-  // --- Regular population, with swarm grouping for bats ---
+  // --- Regular population (§17.16's `count`; the boss and its guards above are not part of it), with swarm grouping
+  // for bats. spawnCandidates orders tiles so any prefix spreads over the rooms in proportion to their area. ---
+  let placed = 0;
   let guard = 0;
-  while (enemies.length < count && guard < count * 6) {
+  while (placed < count && guard < count * 6) {
     guard++;
     const c = nextCandidate();
     if (!c) break;
@@ -407,29 +420,33 @@ export function spawnEnemies(game) {
     const tid = rng.pick(pool);
     const type = ENEMY_TYPES[tid];
     enemies.push(createEnemy(tid, c.x, c.y, depth, rng));
+    placed++;
 
-    if (type.behavior === 'swarm' && enemies.length < count) {
+    if (type.behavior === 'swarm' && placed < count) {
       const groupSize = rng.int(1, 3);
-      for (let g = 0; g < groupSize && enemies.length < count; g++) {
+      for (let g = 0; g < groupSize && placed < count; g++) {
         const gx = c.x + rng.int(-2, 2);
         const gy = c.y + rng.int(-2, 2);
         const gspot = findNearbyFree(map, enemies, gx, gy, 2, keepOut);
         if (!gspot) continue;
         enemies.push(createEnemy(tid, gspot.x, gspot.y, depth, rng));
+        placed++;
       }
     }
   }
 
-  // --- Exit guards: occasionally a stronger sentry near exit rooms ---
+  // --- Exit guards: occasionally a stronger sentry near exit rooms (on top of `count`, as before) ---
   const exitRooms = map.rooms?.filter(r => r.kind === 'exit') || [];
   for (const r of exitRooms) {
     if (!rng.chance(0.5)) continue;
     const spot = findNearbyFree(map, enemies, r.cx, r.cy, 4, keepOut);
     if (!spot) continue;
-    enemies.push(createEnemy(rng.pick(pool), spot.x, spot.y, depth, rng, { elite: rng.chance(0.5) }));
+    const s = createEnemy(rng.pick(pool), spot.x, spot.y, depth, rng, { elite: rng.chance(0.5) });
+    s.exitSentry = true;
+    enemies.push(s);
   }
 
-  // --- Treasure guards (§17.14): on top of the general count, which Phase 4 (§17.16) rescales by populatedFloor ---
+  // --- Treasure guards (§17.14): their own per-tier budget, on top of the general count ---
   spawnTreasureGuards(map, depth, rng, pool, enemies);
 
   return enemies;

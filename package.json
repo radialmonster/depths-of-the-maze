@@ -6,7 +6,9 @@
     "dev": "astro dev",
     "build": "astro build",
     "preview": "astro preview",
-    "test": "node test/skills.test.js && node test/combat.test.js && node test/items.test.js && node test/unlock.test.js && node test/map.test.js && node test/treasure.test.js"
+    "test": "node test/skills.test.js && node test/combat.test.js && node test/items.test.js && node test/unlock.test.js && node test/map.test.js && node test/treasure.test.js && node test/balance.test.js",
+    "sim": "node tools/sim.js --depths 1-20 --runs 500 --explore 0.7 --compare test/sim/baseline.json",
+    "sim:baseline": "node tools/sim.js --depths 1-20 --runs 500 --explore 0.7 --json test/sim/baseline.json"
   },
   "dependencies": {
     "astro": "^4.16.0"
