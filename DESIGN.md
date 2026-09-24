@@ -580,8 +580,13 @@ Decisions made with the user while building. Keep this section current — when 
   **Featured** premium item (rare; epic chance rises with depth), all at exact item level depth + 1.
 - Enemies don't respawn, so gold can't be ground on a level. Intended tension: if you can't afford the Featured item,
   skip shopping and save for the next depth's merchant.
-- Pricing: buy = value × 1.3, sell = value × 0.35. Featured markup rises with item level so it costs ~2.5-3.5 depths of
-  typical income at every depth; regular gear ~1-1.5 depths; potions cheap. Estimated income ≈ 35g (d1), 120g (d5), 260g (d10).
+- Pricing: sell = value × 0.35 always. Buy: potions stay flat at value × 1.3 (`BUY_MULT`, §16 — never a per-level
+  curve). Regular gear and the Featured item each get their own markup on top of that base, both rising with item
+  level but at different rates — `regularGearPriceMult`/`featuredPriceMult` in shop.js — so Featured stays the
+  pricier "splurge" pick (~2.5-3.5 depths of typical income) while gear is a milder, broader sink (~1.3× at low
+  levels rising to ~2× by depth 20). The gear markup (added later, §17.16/§17.17) exists because the simulation
+  harness found gold income far outpacing what there was to spend it on once treasure tiers landed — it measurably
+  helps (13-22% less unspent gold at depths 5+) but doesn't fully close the gap; still a known open balance item.
 - **Buyback** tab (Buy / Sell / Buyback; LB/RB or Tab cycle all three): everything sold on the Sell tab lands there,
   newest first, at exactly what it sold for (no markup — a misclick safety net). Potion stacks come back whole.
   Capped at the last 12 sales (`MERCHANT_BUYBACK_CAP`, FIFO). Lives on the merchant (`merchant.buyback`), so it resets

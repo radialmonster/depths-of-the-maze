@@ -52,12 +52,26 @@ export function featuredPriceMult(itemLevel) {
   return FEATURED_MULT_BASE + FEATURED_MULT_PER_LEVEL * Math.max(0, (itemLevel || 1) - 1);
 }
 
-// The price to buy a given stock entry. Regular gear/potions use buyPrice() as-is; the featured
-// slot gets featuredPriceMult() on top. UI and buyFromMerchant both go through this so the
-// displayed price and the charged price can never drift apart.
+// Same idea, gentler, on the 4 regular gear slots (§17.14/§17.17's simulation found gold income
+// far outpacing merchant spend from depth 5+ once treasure tiers landed — e.g. ~1790g by depth 10
+// vs a ~260g estimate — with players sitting on far more gold than there's anything left to buy).
+// Stays well under featuredPriceMult at every level so Featured keeps its "the splurge item"
+// identity; this is a broader, milder sink across the whole stock instead.
+const REGULAR_MULT_BASE = 1.3; // matches today's flat BUY_MULT at item level 1 — no early-game change
+const REGULAR_MULT_PER_LEVEL = 0.05;
+export function regularGearPriceMult(itemLevel) {
+  return REGULAR_MULT_BASE + REGULAR_MULT_PER_LEVEL * Math.max(0, (itemLevel || 1) - 1);
+}
+
+// The price to buy a given stock entry. Potions use buyPrice() as-is (§16: potions stay in flat
+// tiers, never a per-level curve); regular gear and the featured slot each get their own markup
+// on top, gear's the milder one. UI and buyFromMerchant both go through this so the displayed
+// price and the charged price can never drift apart.
 export function shopPrice(stockKind, item) {
   const base = buyPrice(item);
-  return stockKind === 'featured' ? Math.max(1, Math.round(base * featuredPriceMult(item.itemLevel))) : base;
+  if (stockKind === 'featured') return Math.max(1, Math.round(base * featuredPriceMult(item.itemLevel)));
+  if (stockKind === 'gear') return Math.max(1, Math.round(base * regularGearPriceMult(item.itemLevel)));
+  return base;
 }
 
 // ---------------------------------------------------------------------------
