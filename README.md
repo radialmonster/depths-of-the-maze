@@ -35,16 +35,20 @@ npm run preview   # serve the build locally at http://localhost:4321/
 Inventory: click = equip/use, right-click = drop, shift-click = salvage for gold. Walking into an enemy attacks it.
 
 ## Ideas / possible improvements
-- [ ] **Automated tests** for the pure-math modules (`character.js` stat formulas, `items.js` pricing/compareGear,
-      `shop.js` pricing) — cheap to test, and would have caught real bugs we hit by hand (the potion-stack
-      `sellValue` bug, the `dy || 1` rotation bug) instantly instead of by playtesting.
+- [x] **Automated tests** for the pure-math modules — done: `test/*.test.js` (skills, combat, items, unlock; run via
+      `npm test`), covering skill/slot resolution, cooldown math, two-handed itemization, compareGear, damage rows,
+      Bow Shot/Spark/Staff Sweep, and the unlock system's drop/rank math. Still worth extending as new pure logic
+      (e.g. shop pricing) gets touched.
 - [ ] **Audit for more "falsy zero" bugs** like the `someDir || 1` pattern found in `renderer.js` (a real `0`
       direction/angle/percentage component gets silently replaced by a non-zero fallback). Worth a full sweep of
       `public/js/*.js`, especially direction/velocity math in `enemies.js`/`main.js`.
-- [ ] **More build diversity for ranged/AoE.** Only one ranged skill (Arcane Bolt) and one AoE (Frost Nova) exist —
-      a second option in either category would give attribute investment (dex/int) more reason to diverge.
-- [ ] **Attribute respec.** Spent str/dex/int/vit/def points are currently permanent; a gold-cost respec (maybe via
-      the merchant, alongside Buyback) would make experimenting with builds less risky.
+- [x] **More build diversity for ranged/AoE.** Done via the weapon-kind/skill-loadout system (DESIGN.md §17.9/§17.10)
+      and unlocking (§17.11): Bow Shot, Spark, Staff Sweep, Volley, Fireball, Chain Lightning, Glob Burst and Bone
+      Charge all now exist, giving dex/int builds real divergent choices.
+- [ ] **Attribute *and* skill respec.** Attribute points (str/dex/int/vit/def) are still permanent; now that skill
+      ranks are also per-skill (not per-slot), trying an unlocked alternative skill has the same "committed choice"
+      risk. A gold-cost respec (maybe via the merchant, alongside Buyback) covering both would make experimenting
+      with builds — and with newly-unlocked skills — less risky.
 - [ ] **More shop depth.** No reroll/reforge on gear affixes yet — could pair well with the existing salvage-to-gold
       path now that Buyback gives selling more of a safety net.
 - [ ] **Magical weapon affixes** (e.g. a "Bow of Fire"), for any weapon kind, not just bows. Likely smaller than it
@@ -52,6 +56,19 @@ Inventory: click = equip/use, right-click = drop, shift-click = salvage for gold
       (DESIGN.md §17.6), so this is mostly "let a weapon affix grant/override the wielder's attack-skill element,"
       not a new system. Needs a decision on whether an elemental weapon hit stays physical (reduced by armor) or
       acts like a spell (bypasses armor) — see §17.12's armor-vs-spell rule.
+- [ ] **Balance playtesting pass** on everything Phases 4-6 shipped, verified by agents but not yet played through
+      for feel: Arcane Bolt's damage after losing its old dex contribution (biggest drop is early game, ~20% at
+      level 1); whether a bow archer can too-easily kite melee-only enemies now that Cleave's brush-past is gone;
+      staff vs. wand+orb in actual play (the ≥1.1x math checks out, the feel doesn't yet); and whether the unlock
+      pacing (boss books guaranteed, 45% hidden-room chance, 20%/3% repeat-kill odds) feels earned or too fast/slow.
+- [ ] **Spear weapon** (2H melee/str, the reserved `melee2h` class in `WEAPON_KIND_INFO` — DESIGN.md §17.9). Currently
+      empty; a spear's attack was floated as a 2-tile line thrust, distinct from Cleave's 3-tile arc.
+- [ ] **Minimap icons for chests and hidden-room doors.** Flagged by the phase that built them (DESIGN.md §17.11) —
+      currently invisible on the minimap even after a hidden door is revealed.
+- [ ] **Talent / branching skill upgrades**, beyond the current flat +15% dmg/-5% CD per rank — a deeper alternative
+      to (or pairing with) the respec idea above, letting a skill's rank-up choices diverge rather than just scale.
+- [ ] **More bosses.** Only Slime King (5, 15…) and Bone Tyrant (10, 20…) exist; a third would also unlock a third
+      boss-unique skill book.
 
 ## In-progress design discussion: bows, two-handed weapons, skill loadouts
 Not yet implemented — this is a running log of an ongoing design conversation (with an Opus research agent) so it
