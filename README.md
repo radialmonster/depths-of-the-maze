@@ -1,5 +1,11 @@
 # Depths of the Maze
 
+> **This game now runs the Godot port.** `public/` holds the Godot 4 web export from
+> [depthsofthemaze-godot](https://github.com/radialmonster/depthsofthemaze-godot) (exported there,
+> copied here, pushed; FlyWP deploys `main` as before). The original Three.js version is kept
+> in git history under the tag `threejs-final`.
+
+
 Top-down, real-time dungeon crawler in three.js. No build step. Each level is a dungeon of large
 hand-feeling rooms — some pillared, L-shaped, or cave-shaped — linked by doorways and short
 corridors, rendered with procedural flagstone/brick/wood textures, torches, and soft contact
